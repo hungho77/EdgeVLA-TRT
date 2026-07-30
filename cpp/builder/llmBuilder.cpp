@@ -71,6 +71,13 @@ std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize)
     appendLunowudFlag(lunowudFlags, "-mlir:autotune:num_threads=1");
     appendLunowudFlag(lunowudFlags, "-mlir:collective:fp4=off");
     appendLunowudFlag(lunowudFlags, "-cask_fusion:async_policy=1");
+#endif
+    // Horizontal fully-connected fusion miscompiles at batch size 1, corrupting the
+    // projections that share a layernorm output (q/k/v, and gate/up). On SM110 with
+    // TRT 10.13.3.9 this makes a non-quantized FP16 LLM engine emit garbage tokens;
+    // quantized engines are unaffected because Q/DQ nodes keep the pattern from
+    // matching. Previously gated to TRT >= 10.15, which left 10.13/10.14 broken.
+#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
     if (maxBatchSize == 1)
     {
         appendLunowudFlag(lunowudFlags, "-peep:fc_h_fusion=off");
