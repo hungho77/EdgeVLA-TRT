@@ -56,7 +56,35 @@ void appendLunowudFlag(std::string& flags, std::string const& flag)
     flags += flag;
 }
 
-std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize)
+//! \brief Does this ONNX graph dynamically quantize activations to NVFP4?
+//!
+//! Weights live in an external .data file, so the graph proto itself is a few MB and a
+//! substring scan for the op type costs nothing. This has to answer before the network is
+//! parsed, because __LUNOWUD must be set before Myelin compiles.
+bool onnxUsesNvFp4(std::filesystem::path const& onnxDir, int64_t maxLoraRank)
+{
+    std::filesystem::path const path = onnxDir / (maxLoraRank > 0 ? "lora_model.onnx" : "model.onnx");
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        return false;
+    }
+    static constexpr std::string_view kMarker{"TRT_FP4DynamicQuantize"};
+    std::string buffer(1U << 20, '\0');
+    std::string window; //!< trailing bytes of the previous chunk, so a straddling match still hits
+    while (file.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || file.gcount() > 0)
+    {
+        window.append(buffer, 0, static_cast<size_t>(file.gcount()));
+        if (window.find(kMarker) != std::string::npos)
+        {
+            return true;
+        }
+        window.erase(0, window.size() - std::min(window.size(), kMarker.size() - 1));
+    }
+    return false;
+}
+
+std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize, bool isNvFp4)
 {
     std::string lunowudFlags;
     char const* existingLunowud = std::getenv("__LUNOWUD");
@@ -74,6 +102,18 @@ std::string applyMyelinCompileWorkarounds(int32_t maxBatchSize)
     if (maxBatchSize == 1)
     {
         appendLunowudFlag(lunowudFlags, "-peep:fc_h_fusion=off");
+    }
+#endif
+    // NVFP4 engines are corrupted at batch size 1 by a different miscompile, one the flag
+    // above does not reach: fusing two or more epilogues into a single NVFP4 GEMM yields
+    // wrong results. Established by threshold — max_num_epilogues of 0 and 1 both produce
+    // correct output, 2 and 4 both produce garbage. Capping at one epilogue is the
+    // narrowest fix found; it costs roughly 38% prefill latency on SM110, so it is applied
+    // only where the corruption happens. Verified on 10.13.3.9.
+#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
+    if (maxBatchSize == 1 && isNvFp4)
+    {
+        appendLunowudFlag(lunowudFlags, "-cask_fusion:max_num_epilogues=1");
     }
 #endif
     if (existingLunowud || !lunowudFlags.empty())
@@ -169,7 +209,8 @@ bool LLMBuilder::build()
         + std::to_string(NV_TENSORRT_PATCH);
     LOG_INFO("Using TRT_VERSION=%s", trtVersion.c_str());
 #if NV_TENSORRT_MAJOR >= 11 || NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13
-    std::string const lunowudFlags = applyMyelinCompileWorkarounds(mBuilderConfig.maxBatchSize);
+    std::string const lunowudFlags = applyMyelinCompileWorkarounds(
+        mBuilderConfig.maxBatchSize, onnxUsesNvFp4(mOnnxDir, mBuilderConfig.maxLoraRank));
     if (!lunowudFlags.empty())
     {
         LOG_INFO("Using __LUNOWUD=%s", lunowudFlags.c_str());
