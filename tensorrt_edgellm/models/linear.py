@@ -494,6 +494,16 @@ class AWQLinear(LinearBase):
             torch.ones(in_features // group_size,
                        out_features,
                        dtype=torch.float16))
+        # (8 - qzero) * scale per group, filled in by the loader's repacking pass.
+        # The int4 GEMM kernel hard-codes a zero-point of 8, so an asymmetric AWQ
+        # checkpoint cannot be represented by shifting the nibbles; the difference
+        # is added back in forward() instead. Zeros for a symmetric checkpoint,
+        # where the correction is a no-op.
+        self.register_buffer(
+            "zero_correction",
+            torch.zeros(in_features // group_size,
+                        out_features,
+                        dtype=torch.float16))
         if bias:
             self.register_buffer("bias", torch.empty(out_features))
         else:
@@ -509,6 +519,18 @@ class AWQLinear(LinearBase):
             self.in_features,
             self.group_size,
         )
+        # The kernel computed sum_i x_i (q_i - 8) s_g from the unshifted nibbles.
+        # AWQ wants sum_i x_i (q_i - z_g) s_g; the two differ by
+        # sum_g (8 - z_g) s_g * sum_{i in g} x_i -- a reduction over each group of
+        # the input followed by a [num_groups, out] GEMV, about 0.8% of the layer's
+        # FLOPs. Exact, unlike folding the zero-point into 4-bit weights.
+        correction = self.zero_correction
+        if correction is not None and correction.numel():
+            group_sums = hidden_states.reshape(
+                *hidden_states.shape[:-1],
+                self.in_features // self.group_size, self.group_size).sum(-1)
+            out = out + torch.matmul(group_sums.to(torch.float16),
+                                     correction.to(torch.float16))
         if self.bias is not None:
             out = out + self.bias
         return out
