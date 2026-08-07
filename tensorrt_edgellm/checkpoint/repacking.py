@@ -44,8 +44,11 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def repack_awq_to_plugin(qweight: torch.Tensor,
-                         qzeros: torch.Tensor) -> torch.Tensor:
+def repack_awq_to_plugin(
+        qweight: torch.Tensor,
+        qzeros: torch.Tensor,
+        scales: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Repack AWQ qweight from [in, out//8] int32 to [out//2, in] int8.
 
     AWQ packs 8 int4 nibbles per int32 along the output axis::
@@ -53,13 +56,39 @@ def repack_awq_to_plugin(qweight: torch.Tensor,
         int32 = (n7 << 28) | (n6 << 24) | ... | (n0 << 0)
         where n_k = output channel (8*col + k), value in [0, 15]
 
-    The int4 GEMM kernel uses ``(nibble - 8) * scale``.
-    AWQ dequantizes as ``(nibble - qzero) * scale``.
-    So we adjust each nibble: ``adjusted = nibble - qzero + 8``, baking the
-    per-group zero-point into the weights before packing.
+    The int4 GEMM kernel uses ``(nibble - 8) * scale`` while AWQ dequantizes as
+    ``(nibble - qzero) * scale``. The zero-point cannot be folded into the nibbles:
+    within one group ``nibble - qzero`` spans the 16 values ``[-qzero, 15-qzero]``,
+    but the kernel's fixed zero-point pins the representable window to ``[-8, 7]``,
+    and the two coincide only at ``qzero == 8``. Shifting and clamping (the previous
+    approach) silently truncated whichever end fell outside — on
+    Qwen2.5-3B-Instruct-AWQ that is 0.63% of weights, always the largest-magnitude
+    ones in their group, moving a projection's output by 4-6%.
 
-    Output ``[out//2, in]`` int8: K-block permute, even/odd shuffle within 8,
-    N-row interleave, then four nibbles per int16 (viewed as two int8 rows).
+    Instead the zero-point is split out of the GEMM exactly::
+
+        sum_i x_i (q_i - z_g) s_g  =  sum_i x_i (q_i - 8) s_g
+                                    + sum_g (8 - z_g) s_g * sum_{i in g} x_i
+
+    The first term is what the kernel already computes from the *unshifted*
+    nibbles. The second is a per-group correction that :class:`AWQLinear` applies
+    at run time from the group-wise sums of its input; this function returns its
+    constant factor ``(8 - zeros) * scales``. It costs one reduction plus a
+    ``[G, out]`` GEMV — about 0.8% of the layer's FLOPs — and is exact.
+
+    Args:
+        qweight: ``[in, out//8]`` int32, AWQ column-packed.
+        qzeros:  ``[in//g, out//8]`` int32, AWQ column-packed zero-points.
+        scales:  ``[in//g, out]`` dequantization scales. When given, the
+            zero-point correction is returned; when ``None`` only the packed
+            weights are returned (correction is ``None``), which is correct only
+            for a symmetric checkpoint.
+
+    Returns:
+        ``(qweight_out, zero_correction)`` — ``[out//2, in]`` int8 in the plugin
+        layout (K-block permute, even/odd shuffle within 8, N-row interleave,
+        four nibbles per int16 viewed as two int8 rows), and ``[in//g, out]``
+        float16 ``(8 - zeros) * scales`` or ``None``.
     """
     in_features, out_div8 = qweight.shape
     out_features = out_div8 * 8
@@ -88,12 +117,18 @@ def repack_awq_to_plugin(qweight: torch.Tensor,
     for k in range(8):
         zeros[:, _AWQ_BIT_TO_CH[k]::8] = (qz >> (4 * k)) & 0xF
 
-    # Expand zeros from [in//g, out] -> [in, out] by repeating each row group_size times
-    zeros_expanded = zeros.repeat_interleave(group_size, dim=0)  # [in, out]
-
-    # Adjust nibbles: kernel does (nibble - 8) * scale; AWQ does (nibble - qzero) * scale
-    # So adjusted = nibble - qzero + 8 -> kernel result = (adjusted - 8) = (nibble - qzero)
-    nibbles = (nibbles - zeros_expanded + 8).clamp(0, 15)
+    # The nibbles go to the kernel unshifted, so it computes (nibble - 8) * scale and
+    # the (8 - qzero) * scale remainder becomes the run-time correction below.
+    zero_correction = None
+    if scales is not None:
+        zero_correction = ((8 - zeros).to(torch.float32) *
+                           scales.detach().cpu().to(torch.float32)).to(
+                               torch.float16).to(scales.device)
+    elif not bool(torch.all(zeros == 8)):
+        logger.warning(
+            "AWQ checkpoint has asymmetric zero-points but repack_awq_to_plugin "
+            "was called without scales, so no zero-point correction can be built. "
+            "The dequantized weights will be wrong.")
 
     # Transpose [in, out] -> [out, in] = [N, K] for pack_intweights
     nibbles_nk = nibbles.t().contiguous().numpy().astype(np.int16)  # [N, K]
@@ -102,7 +137,8 @@ def repack_awq_to_plugin(qweight: torch.Tensor,
     packed_int8 = packed_int16.view(np.int8).reshape(
         packed_int16.shape[0] * 2, packed_int16.shape[1])  # [N//2, K]
 
-    return torch.tensor(packed_int8, dtype=torch.int8).to(qweight.device)
+    return (torch.tensor(packed_int8,
+                         dtype=torch.int8).to(qweight.device), zero_correction)
 
 
 def _pack_intweights(unpacked_qweight: np.ndarray) -> np.ndarray:
@@ -352,22 +388,27 @@ def _cast_nvfp4_weights(model: nn.Module) -> None:
 
 
 def _repack_awq_weights(model: nn.Module) -> None:
-    """Swizzle ``AWQLinear.qweight`` after load (fold zeros; pack to int8 layout).
+    """Swizzle ``AWQLinear.qweight`` after load and build the zero-point correction.
 
-    Scales should already be ``[K//g, N]``; cast to float16 if needed.
+    Scales should already be ``[K//g, N]``; cast to float16 if needed. The
+    zero-point is not folded into the nibbles (see :func:`repack_awq_to_plugin`);
+    it lands in ``zero_correction``, which :class:`AWQLinear` applies at run time.
     """
     from ..models.linear import AWQLinear  # local import to avoid circular dep
     for module in model.modules():
         if isinstance(module, AWQLinear):
+            sc = module._buffers.get("scales")
+            if sc is not None and sc.dtype != torch.float16:
+                sc = sc.to(torch.float16)
+                module._buffers["scales"] = sc
             qw = module._buffers.get("qweight")
             qz = module._buffers.get("qzeros")
             if qw is not None and qw.dtype == torch.int32 and qz is not None:
-                module._buffers["qweight"] = repack_awq_to_plugin(qw, qz)
+                packed, correction = repack_awq_to_plugin(qw, qz, sc)
+                module._buffers["qweight"] = packed
+                module._buffers["zero_correction"] = correction
                 logger.debug("Repacked AWQ qweight: %s -> %s", list(qw.shape),
-                             list(module._buffers["qweight"].shape))
-            sc = module._buffers.get("scales")
-            if sc is not None and sc.dtype != torch.float16:
-                module._buffers["scales"] = sc.to(torch.float16)
+                             list(packed.shape))
 
 
 def _repack_gptq_weights(model: nn.Module) -> None:
