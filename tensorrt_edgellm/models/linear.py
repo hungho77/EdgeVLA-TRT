@@ -605,8 +605,8 @@ class AWQLinear(LinearBase):
         correction = self.zero_correction
         if correction is not None and correction.numel():
             group_sums = hidden_states.reshape(
-                *hidden_states.shape[:-1],
-                self.in_features // self.group_size, self.group_size).sum(-1)
+                *hidden_states.shape[:-1], self.in_features // self.group_size,
+                self.group_size).sum(-1)
             out = out + torch.matmul(group_sums.to(torch.float16),
                                      correction.to(torch.float16))
         if self.bias is not None:

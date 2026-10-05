@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Convert an InternLM2-backed InternVL3 checkpoint to the naming the exporter expects.
 
 InternVL3 ships two text backbones. The 1B/2B/8B/14B sizes use Qwen2.5 and are
@@ -167,7 +181,8 @@ def main():
         help="delete each source shard once its converted copy is written. Peak "
         "usage becomes one shard rather than two full checkpoints, which is the "
         "difference between fitting and not fitting for the 9B (18 GB each). "
-        "Destroys the source checkpoint - only pass it if you can re-download.")
+        "Destroys the source checkpoint - only pass it if you can re-download."
+    )
     args = ap.parse_args()
 
     with open(os.path.join(args.src, "config.json")) as f:
@@ -208,8 +223,7 @@ def main():
         print(f"[shard] {shard}: {n_in} -> {n_out} tensors{freed}")
 
     if os.path.exists(index_path):
-        size = sum(
-            os.path.getsize(os.path.join(args.dst, s)) for s in shards)
+        size = sum(os.path.getsize(os.path.join(args.dst, s)) for s in shards)
         with open(os.path.join(args.dst, "model.safetensors.index.json"),
                   "w") as f:
             json.dump({
@@ -217,7 +231,9 @@ def main():
                     "total_size": size
                 },
                 "weight_map": new_map
-            }, f, indent=2)
+            },
+                      f,
+                      indent=2)
 
     with open(os.path.join(args.dst, "config.json"), "w") as f:
         json.dump(convert_config(config), f, indent=2)

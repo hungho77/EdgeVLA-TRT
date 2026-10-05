@@ -67,9 +67,9 @@ NVFP4_MOE_INTERMEDIATE_SIZE_ALIGNMENT = 128
 
 
 def repack_awq_to_plugin(
-        qweight: torch.Tensor,
-        qzeros: torch.Tensor,
-        scales: Optional[torch.Tensor] = None
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Repack AWQ qweight from [in, out//8] int32 to [out//2, in] int8.
 
