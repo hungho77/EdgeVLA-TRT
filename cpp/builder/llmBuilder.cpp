@@ -314,7 +314,7 @@ std::string resolveOnnxFilePath(std::filesystem::path const& onnxDir, LLMBuilder
 
 //! Weights live in an external .data file, so the graph proto is small enough to scan for the op
 //! type. This must answer before the network is parsed because __LUNOWUD is read at builder creation.
-bool onnxUsesNvFp4(std::string const& onnxFilePath)
+[[maybe_unused]] bool onnxUsesNvFp4(std::string const& onnxFilePath)
 {
     std::ifstream file(onnxFilePath, std::ios::binary);
     if (!file)
@@ -352,8 +352,12 @@ bool LLMBuilder::build()
         + std::to_string(NV_TENSORRT_PATCH);
     LOG_INFO("Using TRT_VERSION=%s", trtVersion.c_str());
     std::string const onnxFilePath = resolveOnnxFilePath(mOnnxDir, mBuilderConfig);
-    std::string const lunowudFlags
-        = applyCompileWorkarounds(mBuilderConfig.maxBatchSize == 1 && onnxUsesNvFp4(onnxFilePath));
+#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
+    bool const capNvFp4Epilogues = mBuilderConfig.maxBatchSize == 1 && onnxUsesNvFp4(onnxFilePath);
+#else
+    bool const capNvFp4Epilogues = false;
+#endif
+    std::string const lunowudFlags = applyCompileWorkarounds(capNvFp4Epilogues);
     if (!lunowudFlags.empty())
     {
         LOG_INFO("Using __LUNOWUD=%s", lunowudFlags.c_str());
