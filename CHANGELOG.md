@@ -1,5 +1,12 @@
 # Release Notes
 
+## Unreleased
+- Fixed asymmetric INT4 AWQ checkpoints: the zero-point is applied exactly as a per-group correction instead of being folded into the 4-bit weights and clamped
+- Fixed NVFP4 AWQ checkpoints dropping `pre_quant_scale`, which left the layer computing on unsmoothed activations
+- Capped CASK epilogue fusion for NVFP4 engines at batch size 1 on TensorRT 10.13/10.14
+- Added `convert_internlm2_internvl.py` to convert InternLM2-backed InternVL3 checkpoints to the supported layout
+- Added InternVLA-N1-DualVLN vision-language navigation support: direct export of the Qwen2.5-VL planner with the z_latents bridge folded into the graph, and an experimental System-1 runtime for the flow-matching trajectory head
+
 ## 0.11.0
 
 ### New features and models
