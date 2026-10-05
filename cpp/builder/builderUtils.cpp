@@ -49,7 +49,7 @@ namespace
 
 } // namespace
 
-std::string applyCompileWorkarounds()
+std::string applyCompileWorkarounds([[maybe_unused]] bool capNvFp4Epilogues)
 {
     std::string lunowudFlags;
     char const* existingLunowud = std::getenv("__LUNOWUD");
@@ -78,6 +78,15 @@ std::string applyCompileWorkarounds()
 #endif
 #if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 13)
     appendLunowudFlag(lunowudFlags, "-peep:fc_h_fusion=off");
+#endif
+#if NV_TENSORRT_MAJOR == 10 && (NV_TENSORRT_MINOR == 13 || NV_TENSORRT_MINOR == 14)
+    // Fusing two or more epilogues into one NVFP4 GEMM miscompiles at batch size 1 (0 or 1 epilogue is
+    // correct; 2 and 4 emit garbage). Capping costs ~38% prefill latency on SM110, so it is gated to
+    // NVFP4 engines at batch size 1. Verified on 10.13.3.9.
+    if (capNvFp4Epilogues)
+    {
+        appendLunowudFlag(lunowudFlags, "-cask_fusion:max_num_epilogues=1");
+    }
 #endif
     if (existingLunowud || !lunowudFlags.empty())
     {

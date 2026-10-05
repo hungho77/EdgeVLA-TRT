@@ -81,8 +81,9 @@ std::string printOptimizationProfile(nvinfer1::IOptimizationProfile const* profi
 
 //! Apply TensorRT compile workarounds via the __LUNOWUD environment variable.
 //! Must be called before createInferBuilder.
+//! @param capNvFp4Epilogues Limit NVFP4 GEMM epilogue fusion (pass true for NVFP4 engines at batch size 1).
 //! @return The applied __LUNOWUD flag string (empty if none)
-std::string applyCompileWorkarounds();
+std::string applyCompileWorkarounds(bool capNvFp4Epilogues = false);
 
 //! Create TensorRT builder and network definition with strongly typed flag.
 //! @return Pair of builder and network, or {nullptr, nullptr} on failure

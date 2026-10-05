@@ -299,6 +299,43 @@ std::string getOnnxFilePath(std::filesystem::path const& onnxDir, LLMBuilderConf
     return (onnxDir / parallel_artifacts::onnxFileName(context)).string();
 }
 
+std::string resolveOnnxFilePath(std::filesystem::path const& onnxDir, LLMBuilderConfig const& config)
+{
+    if (config.maxLoraRank > 0)
+    {
+        return (onnxDir / "lora_model.onnx").string();
+    }
+    if (config.tpSize > 1)
+    {
+        return getOnnxFilePath(onnxDir, config);
+    }
+    return (onnxDir / "model.onnx").string();
+}
+
+//! Weights live in an external .data file, so the graph proto is small enough to scan for the op
+//! type. This must answer before the network is parsed because __LUNOWUD is read at builder creation.
+bool onnxUsesNvFp4(std::string const& onnxFilePath)
+{
+    std::ifstream file(onnxFilePath, std::ios::binary);
+    if (!file)
+    {
+        return false;
+    }
+    static constexpr std::string_view kMarker{"TRT_FP4DynamicQuantize"};
+    std::string buffer(1U << 20, '\0');
+    std::string window; //!< trailing bytes of the previous chunk, so a straddling match still hits
+    while (file.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || file.gcount() > 0)
+    {
+        window.append(buffer, 0, static_cast<size_t>(file.gcount()));
+        if (window.find(kMarker) != std::string::npos)
+        {
+            return true;
+        }
+        window.erase(0, window.size() - std::min(window.size(), kMarker.size() - 1));
+    }
+    return false;
+}
+
 } // namespace
 
 LLMBuilder::LLMBuilder(
@@ -314,7 +351,9 @@ bool LLMBuilder::build()
     std::string trtVersion = std::to_string(NV_TENSORRT_MAJOR) + "." + std::to_string(NV_TENSORRT_MINOR) + "."
         + std::to_string(NV_TENSORRT_PATCH);
     LOG_INFO("Using TRT_VERSION=%s", trtVersion.c_str());
-    std::string const lunowudFlags = applyCompileWorkarounds();
+    std::string const onnxFilePath = resolveOnnxFilePath(mOnnxDir, mBuilderConfig);
+    std::string const lunowudFlags
+        = applyCompileWorkarounds(mBuilderConfig.maxBatchSize == 1 && onnxUsesNvFp4(onnxFilePath));
     if (!lunowudFlags.empty())
     {
         LOG_INFO("Using __LUNOWUD=%s", lunowudFlags.c_str());
@@ -355,21 +394,16 @@ bool LLMBuilder::build()
         return false;
     }
 
-    // Determine ONNX file path
-    std::string onnxFilePath;
     if (mBuilderConfig.maxLoraRank > 0)
     {
-        onnxFilePath = (mOnnxDir / "lora_model.onnx").string();
         LOG_INFO("Parsing LoRA-enabled ONNX model: %s", onnxFilePath.c_str());
     }
     else if (mBuilderConfig.tpSize > 1)
     {
-        onnxFilePath = getOnnxFilePath(mOnnxDir, mBuilderConfig);
         LOG_INFO("Parsing rank-local ONNX model: %s", onnxFilePath.c_str());
     }
     else
     {
-        onnxFilePath = (mOnnxDir / "model.onnx").string();
         LOG_INFO("Parsing ONNX model: %s", onnxFilePath.c_str());
     }
 
