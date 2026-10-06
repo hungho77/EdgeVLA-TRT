@@ -28,6 +28,7 @@ support for platforms upstream no longer targets.
 | Exact asymmetric INT4 AWQ | Engine output matches the exactly dequantized checkpoint token-for-token | [FIXES.md](FIXES.md) |
 | NVFP4 AWQ `pre_quant_scale`, NVFP4 CASK epilogue cap (TRT 10.13/10.14) | Fixed; needs Thor to verify | [FIXES.md](FIXES.md) |
 | InternLM2-backed InternVL3 checkpoints | Converter | `tensorrt_edgellm/scripts/convert_internlm2_internvl.py` |
+| GR00T N1.7 policy | Backbone through Edge-LLM, action head with cross-attention K/V cached per call; 114.5 ms per action chunk on Orin, matching the official model | [below](#gr00t-n17) |
 | VLA replan caching | Encoder-cache partial hits and KV prefix reuse with tail-only hidden capture; ~2× faster InternVLA-N1 replans | [below](#kv-cache-reuse-for-vla-control-loops) |
 
 Upstream VLA support (experimental pi0.5, Alpamayo, Cosmos3-Edge policy) is unchanged and documented under
@@ -89,10 +90,51 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 ### Roadmap
 
 1. **InternVLA-N1 pilot**: done (above), measured on synthetic and real rendered navigation episodes.
-2. **Shared `vla/` layer**: observation encoder, causal backbone on the core runtime, action head
-   (flow matching / diffusion / autoregressive), and a dual-rate scheduler; port GR00T N1.6/N1.7 onto it.
+2. **GR00T N1.7**: done ([above](#gr00t-n17)). Next: INT8 DiT weights, CUDA graphs, RTC chunking and SO101
+   pre/post-processing; then a shared `vla/` layer (observation encoder, causal backbone on the core runtime, action
+   head, dual-rate scheduler) extracted from InternVLA-N1 and GR00T.
 3. **Bidirectional-prefix VLAs** (pi0.5, SmolVLA): encoder cache, persistent CUDA graphs, prefix KV pool in
    the core runtime.
+
+## GR00T N1.7
+
+NVIDIA GR00T N1.7 (SO101 fine-tune) runs as Edge-LLM backbone plus a vendored action head
+([`experimental_models/gr00t`](experimental_models/gr00t)):
+
+- **Backbone**: GR00T's Cosmos-Reason2 (Qwen3-VL) truncated to `select_layer` = 16 layers, exported through the
+  regular Qwen3-VL path with `emit_hidden_states: "post_norm"`, so the engine returns every position's layer-16
+  output after the final norm. Under transformers 4.57, the version GR00T N1.7 was saved with, `hidden_states[-1]`
+  is that post-norm tensor; the pre-norm one has cosine 0.07 to it.
+- **Action head**, three engines for one embodiment: `vl_prep` (vlln, VL self-attention and the K/V of all 16 DiT
+  cross-attention blocks, once per call), `state_encoder`, and `denoise_step` (action encoder, DiT on the cached
+  K/V, action decoder, Euler update). The DiT's timestep conditioning is precomputed for the fixed schedule.
+  `export_gr00t_n1_7_action_head.py --check` confirms the split is bit-identical to the official `get_action`.
+
+AGX Orin, FP16, two real SO101 camera frames, fixed state and noise:
+
+| | Result |
+|---|---|
+| Backbone hidden states vs PyTorch | cosine 0.99963 |
+| Actions vs official GR00T (fp32 PyTorch) | cosine 1.000000, max \|Δ\| 0.0039 on values up to ±4.2 |
+| Policy step p50 | 114.5 ms (backbone 29 ms, action head 86 ms) |
+
+Another GPU job shared the board during the measurement.
+
+```bash
+# backbone
+python experimental_models/gr00t/scripts/extract_gr00t_n1_7_backbone.py --gr00t GR00T-N1.7-SO101-Multitask \
+    --base <Cosmos-Reason2-2B snapshot> --out gr00t_backbone
+tensorrt-edgellm-export gr00t_backbone gr00t_onnx
+llm_build --onnxDir gr00t_onnx/llm --engineDir engines/llm --maxBatchSize 1 --maxInputLen 512 --maxKVCacheCapacity 640
+visual_build --onnxDir gr00t_onnx/visual --engineDir engines --minImageTokens 16 --maxImageTokens 512 \
+    --maxImageTokensPerImage 256
+# action head (needs the GR00T N1.7 source and its dependencies, e.g. transformers 4.57 and diffusers)
+python experimental_models/gr00t/scripts/export_gr00t_n1_7_action_head.py --gr00t-src <dir holding gr00t/> \
+    --checkpoint GR00T-N1.7-SO101-Multitask --embodiment new_embodiment --out action_onnx
+# then trtexec --fp16 each of action_onnx/{vl_prep,state_encoder,denoise_step}.onnx into engines/action
+gr00t_policy_inference --llmEngineDir engines/llm --multimodalEngineDir engines --actionEngineDir engines/action \
+    --promptFile prompt.txt --images top.png,wrist.png --state state.f32 --noise noise.f32 --out actions.f32
+```
 
 ## Getting started
 
