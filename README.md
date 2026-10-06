@@ -90,9 +90,9 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 ### Roadmap
 
 1. **InternVLA-N1 pilot**: done (above), measured on synthetic and real rendered navigation episodes.
-2. **GR00T N1.7**: done ([above](#gr00t-n17)). Next: INT8 DiT weights, CUDA graphs, RTC chunking and SO101
-   pre/post-processing; then a shared `vla/` layer (observation encoder, causal backbone on the core runtime, action
-   head, dual-rate scheduler) extracted from InternVLA-N1 and GR00T.
+2. **GR00T N1.7**: done ([below](#gr00t-n17)): W8A8 DiT, CUDA-graph denoising, RTC chunking and SO101
+   pre/post-processing. Next: a shared `vla/` layer (observation encoder, causal backbone on the core runtime,
+   action head, dual-rate scheduler) extracted from InternVLA-N1 and GR00T.
 3. **Bidirectional-prefix VLAs** (pi0.5, SmolVLA): encoder cache, persistent CUDA graphs, prefix KV pool in
    the core runtime.
 
@@ -102,23 +102,34 @@ NVIDIA GR00T N1.7 (SO101 fine-tune) runs as Edge-LLM backbone plus a vendored ac
 ([`experimental_models/gr00t`](experimental_models/gr00t)):
 
 - **Backbone**: GR00T's Cosmos-Reason2 (Qwen3-VL) truncated to `select_layer` = 16 layers, exported through the
-  regular Qwen3-VL path with `emit_hidden_states: "post_norm"`, so the engine returns every position's layer-16
-  output after the final norm. Under transformers 4.57, the version GR00T N1.7 was saved with, `hidden_states[-1]`
-  is that post-norm tensor; the pre-norm one has cosine 0.07 to it.
+  regular Qwen3-VL path with `emit_hidden_states: "pre_norm"`, so the engine returns every position's layer-16
+  output before the final norm. GR00T pops the extra layers off a full-depth model, and under transformers 4.57
+  its `hidden_states[-1]` is then the unnormalized tensor; the post-norm one has cosine 0.08 to it.
 - **Action head**, three engines for one embodiment: `vl_prep` (vlln, VL self-attention and the K/V of all 16 DiT
   cross-attention blocks, once per call), `state_encoder`, and `denoise_step` (action encoder, DiT on the cached
-  K/V, action decoder, Euler update). The DiT's timestep conditioning is precomputed for the fixed schedule.
-  `export_gr00t_n1_7_action_head.py --check` confirms the split is bit-identical to the official `get_action`.
+  K/V, action decoder, Euler update). The DiT's timestep conditioning is precomputed for the fixed schedule, the
+  DiT linears can be exported as calibrated W8A8 (`--int8-weights`), and the four denoising steps replay as one
+  CUDA graph.
+- **Policy**: `processing.json` records the embodiment's state normalization and action decoding (percentile
+  bounds, per-step relative-action bounds, relative-to-absolute joints) from the official processor;
+  `gr00t_policy_server` takes camera frames, raw state and an instruction and returns absolute actions, with
+  optional real-time chunking (RTC: the next chunk is inpainted from the tail of the previous one). The tail is
+  kept in absolute joint space and re-encoded against the new state, so the frozen rows reproduce the actions
+  already committed even after the arm moved; seeding the previous normalized rows directly, as the model-level
+  API does, misses them by up to 2.8 on SO101 when the state moved 6.6 in 8 frames.
+  `gr00t_policy_client.py` applies GR00T's image and language preprocessing on the robot side.
 
-AGX Orin, FP16, two real SO101 camera frames, fixed state and noise:
+AGX Orin, two SO101 dataset frames from raw video and raw state, against the official `Gr00tPolicy` (fp32
+PyTorch) with the same noise:
 
-| | Result |
-|---|---|
-| Backbone hidden states vs PyTorch | cosine 0.99963 |
-| Actions vs official GR00T (fp32 PyTorch) | cosine 1.000000, max \|Δ\| 0.0039 on values up to ±4.2 |
-| Policy step p50 | 114.5 ms (backbone 29 ms, action head 86 ms) |
+| | FP16 head | W8A8 DiT |
+|---|---|---|
+| Backbone hidden states vs PyTorch | per-token cosine 0.99986 (min 0.998) | same |
+| Absolute SO101 actions, max \|Δ\| (joint range ±90) | 0.21 | 1.06 |
+| Absolute actions with RTC (overlap 8, frozen 2), max \|Δ\| | 0.25 | |
+| Policy step p50, CUDA graph (backbone 26.5 ms) | 96.4 ms | 73.1 ms |
 
-Another GPU job shared the board during the measurement.
+A VLA-OPT quantization job shared the board during the timing runs.
 
 ```bash
 # backbone
@@ -128,12 +139,15 @@ tensorrt-edgellm-export gr00t_backbone gr00t_onnx
 llm_build --onnxDir gr00t_onnx/llm --engineDir engines/llm --maxBatchSize 1 --maxInputLen 512 --maxKVCacheCapacity 640
 visual_build --onnxDir gr00t_onnx/visual --engineDir engines --minImageTokens 16 --maxImageTokens 512 \
     --maxImageTokensPerImage 256
-# action head (needs the GR00T N1.7 source and its dependencies, e.g. transformers 4.57 and diffusers)
+# action head and processing (need the GR00T N1.7 source and its dependencies, e.g. transformers 4.57 and diffusers)
 python experimental_models/gr00t/scripts/export_gr00t_n1_7_action_head.py --gr00t-src <dir holding gr00t/> \
-    --checkpoint GR00T-N1.7-SO101-Multitask --embodiment new_embodiment --out action_onnx
-# then trtexec --fp16 each of action_onnx/{vl_prep,state_encoder,denoise_step}.onnx into engines/action
-gr00t_policy_inference --llmEngineDir engines/llm --multimodalEngineDir engines --actionEngineDir engines/action \
-    --promptFile prompt.txt --images top.png,wrist.png --state state.f32 --noise noise.f32 --out actions.f32
+    --checkpoint GR00T-N1.7-SO101-Multitask --embodiment new_embodiment --out action_onnx \
+    [--int8-weights --features <pre-norm backbone features .npy> --input-ids <input ids .npy>]
+python experimental_models/gr00t/scripts/export_gr00t_n1_7_processing.py --gr00t-src <dir holding gr00t/> \
+    --checkpoint GR00T-N1.7-SO101-Multitask --embodiment new_embodiment --out engines/action/processing.json
+# then trtexec --fp16 (and --int8 for the W8A8 denoise_step) each of action_onnx/*.onnx into engines/action
+python experimental_models/gr00t/examples/gr00t_policy_client.py --server-cmd "gr00t_policy_server \
+    --llmEngineDir engines/llm --multimodalEngineDir engines --actionEngineDir engines/action" ...
 ```
 
 ## Getting started

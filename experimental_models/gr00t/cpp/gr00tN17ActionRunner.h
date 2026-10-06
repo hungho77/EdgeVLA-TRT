@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace trt_edgellm
@@ -52,6 +53,26 @@ public:
     };
 
     Gr00tN17ActionRunner(std::string const& engineDir, cudaStream_t stream);
+    ~Gr00tN17ActionRunner() noexcept;
+
+    Gr00tN17ActionRunner(Gr00tN17ActionRunner const&) = delete;
+    Gr00tN17ActionRunner& operator=(Gr00tN17ActionRunner const&) = delete;
+
+    //! Real-time chunking (GR00T RTC): the chunk's leading rows start from \p seed instead of noise, the first
+    //! frozenSteps keep it exactly and the rest up to overlapSteps ramp from it to free denoising.
+    struct RtcOptions
+    {
+        int32_t overlapSteps{}; //!< leading rows taken from seed
+        int32_t frozenSteps{};  //!< leading rows kept exactly (policy latency, in control steps)
+        float rampRate{6.0F};   //!< exponential ramp of the velocity between frozen and overlap rows
+        float const* seed{};    //!< host, [overlapSteps, actionDim] in this call's normalized action space
+    };
+
+    //! Replay the denoising loop as a CUDA graph, captured once per backbone token count (default on).
+    void setUseCudaGraph(bool enable) noexcept
+    {
+        mUseCudaGraph = enable;
+    }
 
     Config const& config() const noexcept
     {
@@ -67,7 +88,8 @@ public:
 
     //! Denoises \p noise ([actionHorizon, actionDim] FP32 on the GPU) into an action chunk of the same shape,
     //! returned in a runner-owned buffer valid until the next sample().
-    rt::Tensor const& sample(rt::Tensor const& noise, cudaStream_t stream);
+    //! With \p rtc, the start of the chunk is inpainted from its seed (see RtcOptions).
+    rt::Tensor const& sample(rt::Tensor const& noise, cudaStream_t stream, RtcOptions const* rtc = nullptr);
 
 private:
     struct Engine
@@ -79,6 +101,7 @@ private:
     void loadEngine(std::string const& path, Engine& engine, cudaStream_t stream);
     void bind(Engine& engine, char const* name, void const* address);
     void setShape(Engine& engine, char const* name, std::vector<int64_t> const& shape);
+    void enqueueDenoiseLoop(cudaStream_t stream);
 
     Config mConfig;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
@@ -103,6 +126,13 @@ private:
     rt::Tensor mVelStrength;
     rt::Tensor mTimesteps; //!< [numInferenceTimesteps] INT64, one bucket per step
     rt::Tensor mDt;        //!< scalar FP32
+
+    rt::Tensor mVelocityHost; //!< pinned staging for mVelStrength
+    rt::Tensor mSeedHost;     //!< pinned staging for the RTC seed rows
+    bool mVelocityIsOnes{true};
+
+    bool mUseCudaGraph{true};
+    std::unordered_map<int64_t, cudaGraphExec_t> mDenoiseGraphs; //!< keyed by backbone token count
 };
 
 } // namespace gr00t

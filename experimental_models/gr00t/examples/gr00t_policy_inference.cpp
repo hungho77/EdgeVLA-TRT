@@ -124,6 +124,7 @@ int main(int argc, char** argv)
     cudaStream_t stream;
     cudaStreamCreate(&stream);
     gr00t::Gr00tN17ActionRunner action(actionDir, stream);
+    action.setUseCudaGraph(argOf(argc, argv, "--cudaGraph", "1") != "0");
     auto const& cfg = action.config();
 
     std::vector<float> const state = readRaw<float>(stateFile);

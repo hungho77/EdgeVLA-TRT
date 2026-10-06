@@ -25,3 +25,10 @@ target_include_directories(
                                  ${ONNX_PARSER_INCLUDE_DIR})
 target_link_libraries(gr00t_policy_inference
                       PRIVATE gr00tExperimental edgellmCore commonLibraryExt)
+
+add_executable(gr00t_policy_server gr00t_policy_server.cpp)
+target_include_directories(
+  gr00t_policy_server PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
+                              ${ONNX_PARSER_INCLUDE_DIR})
+target_link_libraries(gr00t_policy_server PRIVATE gr00tExperimental edgellmCore
+                                                  commonLibraryExt)

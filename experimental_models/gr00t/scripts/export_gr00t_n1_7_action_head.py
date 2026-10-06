@@ -224,6 +224,114 @@ class DenoiseStep(nn.Module):
         return actions + dt * velocity * vel_strength
 
 
+class _DequantizeWeight(torch.autograd.Function):
+    """INT8 weight times per-output-channel scale; exported as ONNX DequantizeLinear on a constant."""
+
+    @staticmethod
+    def forward(ctx, weight_int8, scale):
+        return weight_int8.float() * scale[:, None]
+
+    @staticmethod
+    def symbolic(g, weight_int8, scale):
+        return g.op("DequantizeLinear", weight_int8, scale, axis_i=0)
+
+
+class _FakeQuantize(torch.autograd.Function):
+    """Symmetric per-tensor INT8 quantize-dequantize; exported as QuantizeLinear -> DequantizeLinear."""
+
+    @staticmethod
+    def forward(ctx, x, scale, zero_point):
+        return torch.clamp(torch.round(x / scale), -128, 127) * scale
+
+    @staticmethod
+    def symbolic(g, x, scale, zero_point):
+        q = g.op("QuantizeLinear", x, scale, zero_point)
+        return g.op("DequantizeLinear", q, scale, zero_point)
+
+
+class W8A8Linear(nn.Module):
+    """INT8 linear for TensorRT explicit quantization: per-output-channel weights, per-tensor input scale."""
+
+    def __init__(self, linear, input_amax):
+        super().__init__()
+        weight = linear.weight.data.float()
+        scale = weight.abs().amax(dim=1).clamp_min(1e-8) / 127.0
+        self.register_buffer(
+            "weight_int8",
+            torch.round(weight / scale[:, None]).clamp(-127,
+                                                       127).to(torch.int8))
+        self.register_buffer("weight_scale", scale)
+        self.register_buffer(
+            "input_scale", torch.tensor(max(float(input_amax), 1e-8) / 127.0))
+        self.register_buffer("zero_point", torch.tensor(0, dtype=torch.int8))
+        self.bias = linear.bias
+
+    def forward(self, x):
+        x = _FakeQuantize.apply(x, self.input_scale, self.zero_point)
+        return F.linear(
+            x, _DequantizeWeight.apply(self.weight_int8, self.weight_scale),
+            self.bias)
+
+
+def calibrate_linear_inputs(module, run):
+    """Largest |input| each nn.Linear under \p module sees while \p run() executes."""
+    amax = {}
+    handles = []
+    for name, child in module.named_modules():
+        if isinstance(child, nn.Linear):
+
+            def hook(mod, inputs, name=name):
+                amax[name] = max(amax.get(name, 0.0),
+                                 inputs[0].detach().abs().max().item())
+
+            handles.append(child.register_forward_pre_hook(hook))
+    with torch.no_grad():
+        run()
+    for h in handles:
+        h.remove()
+    return amax
+
+
+def quantize_w8a8(module, amax, prefix=""):
+    for name, child in list(module.named_children()):
+        full = f"{prefix}.{name}" if prefix else name
+        if isinstance(child, nn.Linear):
+            # Linears the step never runs (the precomputed AdaLN projections) stay as they are.
+            if full in amax:
+                setattr(module, name, W8A8Linear(child, amax[full]))
+        else:
+            quantize_w8a8(child, amax, full)
+
+
+def calibration_run(vl_prep,
+                    state_encoder,
+                    denoise,
+                    features,
+                    image_mask,
+                    config,
+                    samples=8):
+    """Denoise from several states and noises so every step's activation range is covered."""
+
+    def run():
+        attention_mask = torch.ones_like(image_mask)
+        for seed in range(samples):
+            generator = torch.Generator().manual_seed(100 + seed)
+            state = torch.randn(1,
+                                config.state_history_length,
+                                config.max_state_dim,
+                                generator=generator)
+            noise = torch.randn(1,
+                                config.action_horizon,
+                                config.max_action_dim,
+                                generator=generator)
+            run_split(vl_prep, state_encoder, denoise, features, image_mask,
+                      attention_mask, state, noise,
+                      config.num_inference_timesteps,
+                      config.num_timestep_buckets)
+
+    return run
+
+
 def split_modules(head, config):
     return (VLPrep(head), StateEncoder(head),
             DenoiseStep(head, config.attend_text_every_n_blocks))
@@ -244,7 +352,13 @@ def run_split(vl_prep, state_encoder, denoise, features, image_mask,
     return actions
 
 
-def check(head, config, index, features_path, input_ids_path, image_token_id):
+def check(head,
+          config,
+          index,
+          features_path,
+          input_ids_path,
+          image_token_id,
+          int8_weights=False):
     from transformers.feature_extraction_utils import BatchFeature
 
     features = torch.from_numpy(
@@ -270,6 +384,12 @@ def check(head, config, index, features_path, input_ids_path, image_token_id):
             }))["action_pred"]
         slice_embodiment(head, index)
         vl_prep, state_encoder, denoise = split_modules(head, config)
+        if int8_weights:
+            amax = calibrate_linear_inputs(
+                denoise.blocks,
+                calibration_run(vl_prep, state_encoder, denoise, features,
+                                image_mask, config))
+            quantize_w8a8(denoise.blocks, amax)
         torch.manual_seed(1)
         noise = torch.randn(1, config.action_horizon, config.max_action_dim)
         ours = run_split(vl_prep, state_encoder, denoise, features, image_mask,
@@ -277,8 +397,11 @@ def check(head, config, index, features_path, input_ids_path, image_token_id):
                          config.num_inference_timesteps,
                          config.num_timestep_buckets)
     err = (ours - reference).abs().max().item()
-    print(f"split vs official get_action: max|d| {err:.3e}, |ref| max "
-          f"{reference.abs().max().item():.3f}")
+    cosine = F.cosine_similarity(ours.flatten(), reference.flatten(),
+                                 dim=0).item()
+    print(
+        f"split vs official get_action: max|d| {err:.3e}, cosine {cosine:.6f}, |ref| max "
+        f"{reference.abs().max().item():.3f}")
     return err
 
 
@@ -302,9 +425,23 @@ def _export_onnx(module, args, out, name, **kwargs):
               location=f"{name}.onnx.data")
 
 
-def export(head, config, index, out, max_tokens):
+def export(head,
+           config,
+           index,
+           out,
+           max_tokens,
+           int8_weights=False,
+           calibration=None):
     slice_embodiment(head, index)
     vl_prep, state_encoder, denoise = split_modules(head, config)
+    if int8_weights:
+        # The DiT blocks dominate each denoising step; INT8 GEMMs halve their weight traffic.
+        features, image_mask = calibration
+        amax = calibrate_linear_inputs(
+            denoise.blocks,
+            calibration_run(vl_prep, state_encoder, denoise, features,
+                            image_mask, config))
+        quantize_w8a8(denoise.blocks, amax)
     os.makedirs(out, exist_ok=True)
     seq = 145
     num_cross = len(cross_blocks(head))
@@ -387,6 +524,7 @@ def export(head, config, index, out, max_tokens):
         "backbone_embedding_dim": config.backbone_embedding_dim,
         "max_backbone_tokens": max_tokens,
         "embodiment_index": index,
+        "denoise_quantization": "w8a8" if int8_weights else "none",
     }
     json.dump(meta, open(os.path.join(out, "config.json"), "w"), indent=2)
     print(f"exported vl_prep / state_encoder / denoise_step -> {out}")
@@ -402,6 +540,11 @@ def main():
     parser.add_argument("--out")
     parser.add_argument("--max-backbone-tokens", type=int, default=512)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--int8-weights",
+        action="store_true",
+        help="W8A8 INT8 for the DiT blocks (per-channel weights, per-tensor "
+        "activations calibrated on --features/--input-ids)")
     parser.add_argument("--features", help="[tokens, 2048] .npy for --check")
     parser.add_argument("--input-ids", help="[tokens] .npy for --check")
     parser.add_argument("--image-token-id", type=int, default=151655)
@@ -411,10 +554,18 @@ def main():
     index = embodiment_index(args.checkpoint, args.embodiment)
     if args.check:
         check(head, config, index, args.features, args.input_ids,
-              args.image_token_id)
+              args.image_token_id, args.int8_weights)
         head, config = load_action_head(args.gr00t_src, args.checkpoint)
     if args.out:
-        export(head, config, index, args.out, args.max_backbone_tokens)
+        calibration = None
+        if args.int8_weights:
+            import numpy as np
+            features = torch.from_numpy(np.load(args.features))[None].float()
+            image_mask = torch.from_numpy(np.load(
+                args.input_ids))[None] == args.image_token_id
+            calibration = (features, image_mask)
+        export(head, config, index, args.out, args.max_backbone_tokens,
+               args.int8_weights, calibration)
 
 
 if __name__ == "__main__":
