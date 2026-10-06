@@ -13,7 +13,8 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_library(gr00tExperimental STATIC gr00tN17ActionRunner.cpp gr00tKernels.cu)
+add_library(gr00tExperimental STATIC gr00tN17ActionRunner.cpp
+                                     gr00tProcessing.cpp gr00tKernels.cu)
 target_include_directories(
   gr00tExperimental
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}

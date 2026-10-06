@@ -58,6 +58,22 @@ public:
     Gr00tN17ActionRunner(Gr00tN17ActionRunner const&) = delete;
     Gr00tN17ActionRunner& operator=(Gr00tN17ActionRunner const&) = delete;
 
+    //! Real-time chunking (GR00T RTC): start the new chunk from the tail of the previous one so consecutive
+    //! chunks join smoothly while the robot keeps executing.
+    struct RtcOptions
+    {
+        int32_t horizon{};      //!< the embodiment's action horizon (rows of a chunk that are real actions)
+        int32_t overlapSteps{}; //!< leading rows seeded from the previous chunk's rows [horizon - overlap, horizon)
+        int32_t frozenSteps{};  //!< leading rows kept exactly (policy latency, in control steps)
+        float rampRate{6.0F};   //!< exponential ramp of the velocity between frozen and overlap rows
+    };
+
+    //! Forget the previous chunk, e.g. at the start of an episode.
+    void resetEpisode() noexcept
+    {
+        mHasPrevious = false;
+    }
+
     //! Replay the denoising loop as a CUDA graph, captured once per backbone token count (default on).
     void setUseCudaGraph(bool enable) noexcept
     {
@@ -78,7 +94,8 @@ public:
 
     //! Denoises \p noise ([actionHorizon, actionDim] FP32 on the GPU) into an action chunk of the same shape,
     //! returned in a runner-owned buffer valid until the next sample().
-    rt::Tensor const& sample(rt::Tensor const& noise, cudaStream_t stream);
+    //! With \p rtc and a previous chunk, the start of the new chunk is inpainted from it (see RtcOptions).
+    rt::Tensor const& sample(rt::Tensor const& noise, cudaStream_t stream, RtcOptions const* rtc = nullptr);
 
 private:
     struct Engine
@@ -115,6 +132,11 @@ private:
     rt::Tensor mVelStrength;
     rt::Tensor mTimesteps; //!< [numInferenceTimesteps] INT64, one bucket per step
     rt::Tensor mDt;        //!< scalar FP32
+
+    rt::Tensor mPrevious;     //!< last sampled chunk, for RTC
+    rt::Tensor mVelocityHost; //!< pinned staging for mVelStrength
+    bool mHasPrevious{false};
+    bool mVelocityIsOnes{true};
 
     bool mUseCudaGraph{true};
     std::unordered_map<int64_t, cudaGraphExec_t> mDenoiseGraphs; //!< keyed by backbone token count

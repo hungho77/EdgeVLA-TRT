@@ -25,6 +25,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 
@@ -96,6 +97,8 @@ Gr00tN17ActionRunner::Gr00tN17ActionRunner(std::string const& engineDir, cudaStr
     mActions[0] = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::actions0");
     mActions[1] = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::actions1");
     mVelStrength = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::velStrength");
+    mPrevious = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::previousActions");
+    mVelocityHost = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::velocityHost", rt::DeviceType::kCPU);
     mTimesteps = makeTensor({mConfig.numInferenceTimesteps}, DataType::kINT64, "gr00t::timesteps");
     mDt = makeTensor({1}, DataType::kFLOAT, "gr00t::dt");
 
@@ -233,13 +236,55 @@ void Gr00tN17ActionRunner::enqueueDenoiseLoop(cudaStream_t stream)
     }
 }
 
-rt::Tensor const& Gr00tN17ActionRunner::sample(rt::Tensor const& noise, cudaStream_t stream)
+rt::Tensor const& Gr00tN17ActionRunner::sample(rt::Tensor const& noise, cudaStream_t stream, RtcOptions const* rtc)
 {
     ELLM_CHECK(mTokens > 0, "Gr00tN17ActionRunner::sample: call prepare() first");
-    size_t const actionBytes = static_cast<size_t>(mConfig.actionHorizon) * mConfig.actionDim * sizeof(float);
-    // Outside the graph, so callers may pass any noise buffer.
+    int64_t const actionDim = mConfig.actionDim;
+    size_t const rowBytes = static_cast<size_t>(actionDim) * sizeof(float);
+    size_t const actionBytes = static_cast<size_t>(mConfig.actionHorizon) * rowBytes;
+    // Initial actions and the velocity mask are set outside the graph, so callers may pass any noise buffer and
+    // switch RTC on or off between calls.
     CUDA_CHECK(
         cudaMemcpyAsync(mActions[0].rawPointer(), noise.rawPointer(), actionBytes, cudaMemcpyDeviceToDevice, stream));
+    if (rtc != nullptr && mHasPrevious && rtc->overlapSteps > 0)
+    {
+        ELLM_CHECK(rtc->horizon <= mConfig.actionHorizon && rtc->overlapSteps <= rtc->horizon && rtc->frozenSteps >= 0
+                && rtc->frozenSteps <= rtc->overlapSteps,
+            "Gr00tN17ActionRunner::sample: inconsistent RTC options");
+        CUDA_CHECK(cudaMemcpyAsync(mActions[0].rawPointer(),
+            mPrevious.dataPointer<float>() + static_cast<int64_t>(rtc->horizon - rtc->overlapSteps) * actionDim,
+            static_cast<size_t>(rtc->overlapSteps) * rowBytes, cudaMemcpyDeviceToDevice, stream));
+        // GR00T: ramp = 1 - exp(-rate * linspace(0, 1, n + 2)), normalized by its last value, interior n points.
+        int32_t const ramped = rtc->overlapSteps - rtc->frozenSteps;
+        double const last = std::max(1.0 - std::exp(-static_cast<double>(rtc->rampRate)), 1e-8);
+        CUDA_CHECK(cudaStreamSynchronize(stream)); // the staging buffer may still feed the previous upload
+        float* velocity = mVelocityHost.dataPointer<float>();
+        for (int32_t row = 0; row < mConfig.actionHorizon; ++row)
+        {
+            float value = 1.0F;
+            if (row < rtc->frozenSteps)
+            {
+                value = 0.0F;
+            }
+            else if (row < rtc->overlapSteps)
+            {
+                double const t = static_cast<double>(row - rtc->frozenSteps + 1) / (ramped + 1);
+                value = static_cast<float>((1.0 - std::exp(-rtc->rampRate * t)) / last);
+            }
+            std::fill_n(velocity + static_cast<int64_t>(row) * actionDim, actionDim, value);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            mVelStrength.rawPointer(), mVelocityHost.rawPointer(), actionBytes, cudaMemcpyHostToDevice, stream));
+        mVelocityIsOnes = false;
+    }
+    else if (!mVelocityIsOnes)
+    {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::fill_n(mVelocityHost.dataPointer<float>(), mConfig.actionHorizon * actionDim, 1.0F);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mVelStrength.rawPointer(), mVelocityHost.rawPointer(), actionBytes, cudaMemcpyHostToDevice, stream));
+        mVelocityIsOnes = true;
+    }
 
     auto const cached = mDenoiseGraphs.find(mTokens);
     if (mUseCudaGraph && cached != mDenoiseGraphs.end())
@@ -262,7 +307,11 @@ rt::Tensor const& Gr00tN17ActionRunner::sample(rt::Tensor const& noise, cudaStre
             mDenoiseGraphs.emplace(mTokens, exec);
         }
     }
-    return mActions[mConfig.numInferenceTimesteps % 2];
+    rt::Tensor const& result = mActions[mConfig.numInferenceTimesteps % 2];
+    CUDA_CHECK(
+        cudaMemcpyAsync(mPrevious.rawPointer(), result.rawPointer(), actionBytes, cudaMemcpyDeviceToDevice, stream));
+    mHasPrevious = true;
+    return result;
 }
 
 } // namespace gr00t
