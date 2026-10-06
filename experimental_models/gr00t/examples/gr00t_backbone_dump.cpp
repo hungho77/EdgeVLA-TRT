@@ -23,6 +23,7 @@
 #include "common/trtUtils.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmInferenceRuntime.h"
+#include "vlaBackbone.h"
 
 #include <cuda_fp16.h>
 
@@ -100,34 +101,17 @@ int main(int argc, char** argv)
     std::unordered_map<std::string, std::string> const noLora;
     rt::LLMInferenceRuntime runtime(llmDir, visDir, noLora, stream);
 
-    rt::LLMGenerationRequest request;
-    request.requests.resize(1);
-    rt::Message msg;
-    msg.role = "user";
-    msg.contents.push_back({"text", prompt});
-    request.requests[0].messages.push_back(std::move(msg));
-    for (auto const& path : images)
-    {
-        request.requests[0].imageBuffers.push_back(rt::imageUtils::loadRgbImageFromFile(path));
-    }
-    request.applyChatTemplate = false;
-    request.maxGenerateLength = 1;
-    request.acceptHiddenLayer = kCaptureSlot;
-    request.temperature = 1.0F;
-    request.topP = 1.0F;
-    request.topK = 1;
+    rt::LLMGenerationRequest const request = vla::makeBackboneRequest(prompt, vla::loadImages(images), kCaptureSlot);
 
     std::vector<double> latencies;
     rt::Tensor const* hidden = nullptr;
     for (int32_t i = 0; i < iters; ++i)
     {
-        rt::LLMGenerationResponse response;
         auto const t0 = std::chrono::steady_clock::now();
-        bool const ok = runtime.handleRequest(request, response, stream, /*outputThinkerEmbeddings=*/true);
+        hidden = vla::runBackbone(runtime, request, stream);
         cudaStreamSynchronize(stream);
         latencies.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-        hidden = ok ? runtime.getBaseModelHiddenStates(kCaptureSlot) : nullptr;
-        if (hidden == nullptr || hidden->isEmpty())
+        if (hidden == nullptr)
         {
             std::fprintf(stderr, "backbone request failed\n");
             return 1;

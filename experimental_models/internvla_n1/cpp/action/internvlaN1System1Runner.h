@@ -19,6 +19,7 @@
 
 #include "action/internvlaN1Scheduler.h"
 #include "common/tensor.h"
+#include "vlaEngine.h"
 
 #include <NvInfer.h>
 #include <cstdint>
@@ -106,16 +107,11 @@ public:
     }
 
 private:
-    void loadEngine(std::string const& path, std::unique_ptr<nvinfer1::ICudaEngine>& engine,
-        std::unique_ptr<nvinfer1::IExecutionContext>& context, cudaStream_t stream);
-
     Config mConfig;
     InternVLAN1Scheduler mScheduler;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime{nullptr};
-    std::unique_ptr<nvinfer1::ICudaEngine> mMemoryEngine{nullptr};
-    std::unique_ptr<nvinfer1::IExecutionContext> mMemoryContext{nullptr};
-    std::unique_ptr<nvinfer1::ICudaEngine> mDitEngine{nullptr};
-    std::unique_ptr<nvinfer1::IExecutionContext> mDitContext{nullptr};
+    vla::TrtEngine mMemory;
+    vla::TrtEngine mDit;
 
     //! Scratch for both contexts. Owned here rather than drawn from the core runtime's shared
     //! pool: that pool is sized as a max() over components and so assumes they never overlap,

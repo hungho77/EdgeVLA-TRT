@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "vlaEngine.h"
 
 #include <NvInfer.h>
 #include <cstdint>
@@ -92,22 +93,13 @@ public:
     rt::Tensor const& sample(rt::Tensor const& noise, cudaStream_t stream, RtcOptions const* rtc = nullptr);
 
 private:
-    struct Engine
-    {
-        std::unique_ptr<nvinfer1::ICudaEngine> engine;
-        std::unique_ptr<nvinfer1::IExecutionContext> context;
-    };
-
-    void loadEngine(std::string const& path, Engine& engine, cudaStream_t stream);
-    void bind(Engine& engine, char const* name, void const* address);
-    void setShape(Engine& engine, char const* name, std::vector<int64_t> const& shape);
     void enqueueDenoiseLoop(cudaStream_t stream);
 
     Config mConfig;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
-    Engine mVlPrep;
-    Engine mStateEncoder;
-    Engine mDenoise;
+    vla::TrtEngine mVlPrep;
+    vla::TrtEngine mStateEncoder;
+    vla::TrtEngine mDenoise;
     rt::Tensor mContextMemory;
 
     int64_t mTokens{0};

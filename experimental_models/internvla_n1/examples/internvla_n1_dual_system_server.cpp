@@ -53,6 +53,7 @@
 #include "common/trtUtils.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmInferenceRuntime.h"
+#include "vlaBackbone.h"
 
 #include <cuda_fp16.h>
 #include <nlohmann/json.hpp>
@@ -145,6 +146,21 @@ struct PlanInput
     std::vector<std::string> imagePaths;
 };
 
+//! Images that failed to load are skipped.
+std::vector<rt::imageUtils::ImageData> loadValidImages(std::vector<std::string> const& imagePaths)
+{
+    std::vector<rt::imageUtils::ImageData> images;
+    for (auto const& p : imagePaths)
+    {
+        auto image = rt::imageUtils::loadRgbImageFromFile(p);
+        if (image.buffer != nullptr)
+        {
+            images.push_back(std::move(image));
+        }
+    }
+    return images;
+}
+
 void fillRequest(
     rt::LLMGenerationRequest& request, std::string const& rawText, std::vector<std::string> const& imagePaths)
 {
@@ -156,14 +172,7 @@ void fillRequest(
     // The caller has already templated the prompt; re-running the engine's template over it
     // would double the control tokens and change the prompt the model sees.
     request.applyChatTemplate = false;
-    for (auto const& p : imagePaths)
-    {
-        auto image = rt::imageUtils::loadRgbImageFromFile(p);
-        if (image.buffer != nullptr)
-        {
-            request.requests[0].imageBuffers.push_back(std::move(image));
-        }
-    }
+    request.requests[0].imageBuffers = loadValidImages(imagePaths);
     // None of these have default initialisers; leaving topK uninitialised makes the sampler
     // size its workspace from stack garbage, reported as an 18-exabyte allocation.
     request.temperature = 1.0F;
@@ -225,21 +234,11 @@ int main(int argc, char** argv)
             images = planInput.imagePaths;
         }
         InternVLAN1DualSystemState::Plan plan;
-        rt::LLMGenerationRequest request;
-        fillRequest(request, rawText, images);
-        // The bridge needs the prefill, not generated text; one token is enough.
-        request.maxGenerateLength = 1;
-        request.acceptHiddenLayer = kBridgeLayer;
         // Only the latent-query rows are read, so the context cache may restore the prompt before them.
-        request.hiddenCaptureTailTokens = kNumQuery;
-
-        rt::LLMGenerationResponse response;
-        if (!runtime.handleRequest(request, response, s2Stream, /*outputThinkerEmbeddings=*/true))
-        {
-            return plan;
-        }
-        rt::Tensor const* hidden = runtime.getBaseModelHiddenStates(kBridgeLayer);
-        if (hidden == nullptr || hidden->isEmpty())
+        rt::LLMGenerationRequest const request
+            = vla::makeBackboneRequest(rawText, loadValidImages(images), kBridgeLayer, kNumQuery);
+        rt::Tensor const* hidden = vla::runBackbone(runtime, request, s2Stream);
+        if (hidden == nullptr)
         {
             return plan;
         }

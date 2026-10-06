@@ -42,6 +42,7 @@
 #include "common/tensor.h"
 #include "common/trtUtils.h"
 #include "runtime/llmInferenceRuntime.h"
+#include "vlaBackbone.h"
 
 #include <cuda_fp16.h>
 
@@ -190,35 +191,11 @@ int main(int argc, char** argv)
     std::atomic<int32_t> planCount{0};
     internvla_n1::InternVLAN1DualSystemDriver driver(
         state, [&](int64_t observationIndex) -> internvla_n1::InternVLAN1DualSystemState::Plan {
-            rt::LLMGenerationRequest request;
-            request.requests.resize(1);
-            rt::Message message;
-            message.role = "user";
-            message.contents.push_back({"text", prompt});
-            request.requests[0].messages.push_back(message);
-            request.acceptHiddenLayer = kBridgeLayer;
             // Only the latent-query rows are read, so the context cache may restore the prompt before them.
-            request.hiddenCaptureTailTokens = kNumQuery;
-            request.applyChatTemplate = false;
-            // temperature, topP and topK have no default initializers in the struct. Leaving
-            // them uninitialized makes the sampler compute a workspace from garbage; the
-            // symptom is a size_t underflow reported as an 18-exabyte allocation.
-            request.temperature = 1.0F;
-            request.topP = 1.0F;
-            request.topK = 1;
-            // Also without a default initializer. The bridge needs the prefill, not the text, so
-            // one token is enough and anything larger only spends time generating what is thrown
-            // away.
-            request.maxGenerateLength = 1;
-
-            rt::LLMGenerationResponse response;
+            rt::LLMGenerationRequest const request = vla::makeBackboneRequest(prompt, {}, kBridgeLayer, kNumQuery);
             internvla_n1::InternVLAN1DualSystemState::Plan plan;
-            if (!runtime.handleRequest(request, response, s2Stream, /*outputThinkerEmbeddings=*/true))
-            {
-                return plan;
-            }
-            rt::Tensor const* hidden = runtime.getBaseModelHiddenStates(kBridgeLayer);
-            if (hidden == nullptr || hidden->isEmpty())
+            rt::Tensor const* hidden = vla::runBackbone(runtime, request, s2Stream);
+            if (hidden == nullptr)
             {
                 return plan;
             }

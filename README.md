@@ -91,9 +91,9 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 
 1. **InternVLA-N1 pilot**: done (above), measured on synthetic and real rendered navigation episodes.
 2. **GR00T N1.7**: done ([below](#gr00t-n17)): W8A8 DiT, CUDA-graph denoising, RTC chunking and SO101
-   pre/post-processing. Next: a shared `vla/` layer (observation encoder, causal backbone on the core runtime,
-   action head, dual-rate scheduler) extracted from InternVLA-N1 and GR00T.
-3. **Bidirectional-prefix VLAs** (pi0.5, SmolVLA): encoder cache, persistent CUDA graphs, prefix KV pool in
+   pre/post-processing.
+3. **Shared VLA layer**: done ([below](#shared-vla-layer)), extracted from InternVLA-N1 and GR00T.
+4. **Bidirectional-prefix VLAs** (pi0.5, SmolVLA): encoder cache, persistent CUDA graphs, prefix KV pool in
    the core runtime.
 
 ## GR00T N1.7
@@ -149,6 +149,30 @@ python experimental_models/gr00t/scripts/export_gr00t_n1_7_processing.py --gr00t
 python experimental_models/gr00t/examples/gr00t_policy_client.py --server-cmd "gr00t_policy_server \
     --llmEngineDir engines/llm --multimodalEngineDir engines --actionEngineDir engines/action" ...
 ```
+
+## Shared VLA layer
+
+[`experimental_models/vla`](experimental_models/vla) holds what InternVLA-N1 and GR00T have in common; both now
+build on it, with byte-identical outputs before and after the extraction:
+
+- `vlaEngine`: TensorRT engines with user-managed context memory, checked binding and shapes, and one scratch
+  allocation for engines that run one after another.
+- `vlaBackbone`: the VLM as a VLA backbone, a prefill over a pre-templated prompt and images that keeps one
+  layer's hidden states (optionally only the tail rows, so context reuse can restore the prefix).
+- `vlaDualRate`: the latest-plan handoff and coalescing planner thread between a slow planner and a fast loop
+  (InternVLA-N1's System 2 / System 1).
+- `vlaAsyncChunker`: asynchronous action chunking on top of it. The control loop executes one row per tick; at
+  `horizon - overlap` rows it snapshots the observation (on the control thread) and requests the next chunk,
+  then switches to it at the row the planner latency consumed.
+
+The flow-matching loops stay per model: their schedules, timestep encodings and guidance differ.
+
+`gr00t_async_control` drives GR00T through the chunker at 30 Hz on AGX Orin (horizon 16, overlap 8, frozen 5)
+with fixed frames and a drifting joint state: no stalls after the first chunk, planner latency 2 ticks with the
+W8A8 head (3 with FP16), and a switch jump of at most 0.006 joint units. The frozen rows have to exceed the
+worst-case latency in ticks: with 4 frozen rows, one FP16 switch landed 4 ticks in and jumped 11.3. Frozen rows are
+only reproduced inside the model's per-step action range; a seed outside it (SO101 joint 4 spans about 1.9) is
+clipped.
 
 ## Getting started
 

@@ -37,5 +37,5 @@ add_executable(internvla_n1_s2_bench internvla_n1_s2_bench.cpp)
 target_include_directories(
   internvla_n1_s2_bench PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
                                 ${ONNX_PARSER_INCLUDE_DIR})
-target_link_libraries(internvla_n1_s2_bench PRIVATE edgellmCore
+target_link_libraries(internvla_n1_s2_bench PRIVATE vlaExperimental edgellmCore
                                                     commonLibraryExt)

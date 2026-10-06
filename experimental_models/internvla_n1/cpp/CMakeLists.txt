@@ -15,7 +15,7 @@
 
 set(INTERNVLA_N1_CPP_SRCS
     action/internvlaN1Scheduler.cpp action/internvlaN1Kernels.cu
-    action/internvlaN1System1Runner.cpp runtime/internvlaN1DualSystem.cpp)
+    action/internvlaN1System1Runner.cpp)
 
 add_library(internvlaN1Experimental STATIC ${INTERNVLA_N1_CPP_SRCS})
 
@@ -26,5 +26,6 @@ target_include_directories(
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
           ${ONNX_PARSER_INCLUDE_DIR})
+target_link_libraries(internvlaN1Experimental PUBLIC vlaExperimental)
 set_property(TARGET internvlaN1Experimental PROPERTY POSITION_INDEPENDENT_CODE
                                                      ON)

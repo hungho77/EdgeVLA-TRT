@@ -37,14 +37,14 @@ namespace gr00t
 class Gr00tN17Policy
 {
 public:
-    //! Real-time chunking. The new chunk's first overlapSteps rows continue the previous chunk's rows
-    //! [horizon - overlapSteps, horizon), i.e. the robot is assumed to have executed horizon - overlapSteps actions
-    //! of the previous chunk when the new one starts.
+    //! Real-time chunking. The new chunk's first rows continue the previous chunk from row startRow, i.e. the
+    //! robot has executed startRow actions of the previous chunk when the new one starts.
     struct Rtc
     {
-        int32_t overlapSteps{};
-        int32_t frozenSteps{}; //!< rows reproduced exactly, covering the policy latency
+        int32_t overlapSteps{}; //!< rows seeded from the previous chunk (fewer if it ends sooner)
+        int32_t frozenSteps{};  //!< rows reproduced exactly, covering the policy latency
         float rampRate{6.0F};
+        int32_t startRow{-1}; //!< -1: horizon - overlapSteps, the official convention
     };
 
     //! \p engineDir holds the action engines, config.json and processing.json.
