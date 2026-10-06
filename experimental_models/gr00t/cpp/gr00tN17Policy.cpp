@@ -19,6 +19,8 @@
 
 #include "common/checkMacros.h"
 
+#include <algorithm>
+
 namespace trt_edgellm
 {
 namespace gr00t
@@ -51,12 +53,17 @@ std::vector<float> Gr00tN17Policy::act(rt::Tensor const& backboneFeatures, std::
     if (rtc != nullptr && !mPrevious.empty() && rtc->overlapSteps > 0)
     {
         ELLM_CHECK(rtc->overlapSteps <= horizon, "Gr00tN17Policy: RTC overlap exceeds the action horizon");
-        int64_t const start = static_cast<int64_t>(horizon - rtc->overlapSteps) * mProcessing.rawActionDim();
-        seed = mProcessing.encodeActions(mPrevious.data() + start, rtc->overlapSteps, rawState);
-        options.overlapSteps = rtc->overlapSteps;
-        options.frozenSteps = rtc->frozenSteps;
-        options.rampRate = rtc->rampRate;
-        options.seed = seed.data();
+        int32_t const startRow = rtc->startRow >= 0 ? rtc->startRow : horizon - rtc->overlapSteps;
+        int32_t const overlap = std::min(rtc->overlapSteps, horizon - startRow);
+        if (overlap > 0)
+        {
+            seed = mProcessing.encodeActions(
+                mPrevious.data() + static_cast<int64_t>(startRow) * mProcessing.rawActionDim(), overlap, rawState);
+            options.overlapSteps = overlap;
+            options.frozenSteps = std::min(rtc->frozenSteps, overlap);
+            options.rampRate = rtc->rampRate;
+            options.seed = seed.data();
+        }
     }
     rt::Tensor const& actions = mRunner.sample(noise, stream, options.seed != nullptr ? &options : nullptr);
     CUDA_CHECK(cudaMemcpyAsync(mModelActionsHost.rawPointer(), actions.rawPointer(),

@@ -17,6 +17,7 @@
 # the core edgellm libraries (edgellmCore, edgellmBuilder, edgellmKernels, ...).
 
 add_subdirectory(cosmos3)
+add_subdirectory(vla)
 add_subdirectory(gr00t)
 add_subdirectory(internvla_n1)
 add_subdirectory(nemotron3_5_asr)

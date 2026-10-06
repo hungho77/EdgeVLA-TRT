@@ -26,6 +26,7 @@
 #include "common/trtUtils.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmInferenceRuntime.h"
+#include "vlaBackbone.h"
 
 #include <cuda_fp16.h>
 
@@ -189,34 +190,22 @@ int main(int argc, char** argv)
     for (int32_t step = 0; step < steps; ++step)
     {
         std::vector<int32_t> const history = historyIds(step, numHistory);
-        rt::LLMGenerationRequest request;
-        request.requests.resize(1);
-        rt::Message msg;
-        msg.role = "user";
-        msg.contents.push_back({"text", buildPrompt(instruction, history.size())});
-        request.requests[0].messages.push_back(std::move(msg));
+        std::vector<rt::imageUtils::ImageData> images;
         for (int32_t id : history)
         {
-            request.requests[0].imageBuffers.push_back(frames[id]);
+            images.push_back(frames[id]);
         }
-        request.requests[0].imageBuffers.push_back(frames[step]);
-        request.applyChatTemplate = false;
-        request.maxGenerateLength = 1;
-        request.acceptHiddenLayer = kBridgeLayer;
+        images.push_back(frames[step]);
         // Only the latent-query rows are read, so the context cache may restore the prompt before them.
-        request.hiddenCaptureTailTokens = kNumQuery;
-        request.temperature = 1.0F;
-        request.topP = 1.0F;
-        request.topK = 1;
+        rt::LLMGenerationRequest const request = vla::makeBackboneRequest(
+            buildPrompt(instruction, history.size()), std::move(images), kBridgeLayer, kNumQuery);
 
         auto const run = [&](double& ms, std::vector<float>& z) {
-            rt::LLMGenerationResponse response;
             auto const t0 = std::chrono::steady_clock::now();
-            bool const ok = runtime.handleRequest(request, response, stream, /*outputThinkerEmbeddings=*/true);
+            rt::Tensor const* hidden = vla::runBackbone(runtime, request, stream);
             cudaStreamSynchronize(stream);
             ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            rt::Tensor const* hidden = ok ? runtime.getBaseModelHiddenStates(kBridgeLayer) : nullptr;
-            if (hidden == nullptr || hidden->isEmpty())
+            if (hidden == nullptr)
             {
                 return false;
             }

@@ -69,19 +69,12 @@ InternVLAN1System1Runner::InternVLAN1System1Runner(
     : mConfig(config)
     , mScheduler(config.numInferenceSteps)
 {
-    mRuntime = std::unique_ptr<IRuntime>(createInferRuntime(gLogger));
-    ELLM_CHECK(mRuntime, "InternVLAN1System1Runner: failed to create TensorRT runtime");
-
-    loadEngine(engineDir + "/" + kMemoryEngine, mMemoryEngine, mMemoryContext, stream);
-    loadEngine(engineDir + "/" + kDitEngine, mDitEngine, mDitContext, stream);
-
-    // Both contexts are USER_MANAGED, so the scratch has to be supplied before the first
-    // enqueue. One pool serves both: within a plan they run one after the other.
-    int64_t const contextBytes = getRequiredContextMemorySize();
-    mContextMemory = rt::Tensor(rt::Coords(std::vector<int64_t>{contextBytes}), rt::DeviceType::kGPU, DataType::kUINT8,
-        "internvla_n1::contextMemory");
-    mMemoryContext->setDeviceMemoryV2(mContextMemory.rawPointer(), contextBytes);
-    mDitContext->setDeviceMemoryV2(mContextMemory.rawPointer(), contextBytes);
+    mRuntime = vla::createTrtRuntime();
+    mMemory = vla::TrtEngine(*mRuntime, engineDir + "/" + kMemoryEngine, stream);
+    mDit = vla::TrtEngine(*mRuntime, engineDir + "/" + kDitEngine, stream);
+    // System 1 keeps its own pool rather than joining the LLM's shared one (see the class note); within a plan
+    // the two engines run one after the other, so they share it.
+    mContextMemory = vla::allocateSharedContextMemory({&mMemory, &mDit}, "internvla_n1::contextMemory");
 
     int64_t const batch = mConfig.numSampleTrajs;
     int64_t const doubled = 2 * batch;
@@ -98,27 +91,9 @@ InternVLAN1System1Runner::InternVLAN1System1Runner(
         rt::Coords(std::vector<int64_t>{doubled}), rt::DeviceType::kGPU, DataType::kINT64, "internvla_n1::timestep");
 }
 
-void InternVLAN1System1Runner::loadEngine(std::string const& path, std::unique_ptr<ICudaEngine>& engine,
-    std::unique_ptr<IExecutionContext>& context, cudaStream_t stream)
-{
-    engine = deserializeCudaEngineFromFile(*mRuntime, path);
-    ELLM_CHECK(engine, "InternVLAN1System1Runner: failed to load " + path);
-    // kUSER_MANAGED so the caller decides where the scratch lives. System 1 keeps its own pool
-    // rather than joining the LLM's shared one -- see the class note.
-    context = std::unique_ptr<IExecutionContext>(
-        engine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
-    ELLM_CHECK(context, "InternVLAN1System1Runner: failed to create context for " + path);
-    ELLM_CHECK(context->setOptimizationProfileAsync(0, stream),
-        "InternVLAN1System1Runner: failed to set the optimization profile for " + path);
-}
-
 int64_t InternVLAN1System1Runner::getRequiredContextMemorySize() const
 {
-    int64_t const memorySize = mMemoryEngine ? mMemoryEngine->getDeviceMemorySizeV2() : 0;
-    int64_t const ditSize = mDitEngine ? mDitEngine->getDeviceMemorySizeV2() : 0;
-    // The two engines run one after the other within a plan, so the pool only has to hold the
-    // larger of them.
-    return std::max(memorySize, ditSize);
+    return std::max(mMemory.deviceMemorySize(), mDit.deviceMemorySize());
 }
 
 rt::Tensor& InternVLAN1System1Runner::encodeMemory(rt::Tensor const& images, cudaStream_t stream)
@@ -126,28 +101,19 @@ rt::Tensor& InternVLAN1System1Runner::encodeMemory(rt::Tensor const& images, cud
     auto const shape = shapeOf(images);
     ELLM_CHECK(shape.size() == 4U, "InternVLAN1System1Runner::encodeMemory: expected [frames, 3, H, W]");
 
-    Dims imageDims{};
-    imageDims.nbDims = static_cast<int32_t>(shape.size());
-    for (size_t i = 0; i < shape.size(); ++i)
-    {
-        imageDims.d[i] = shape[i];
-    }
-    ELLM_CHECK(mMemoryContext->setInputShape(kImages, imageDims),
-        "InternVLAN1System1Runner::encodeMemory: failed to set the frame shape");
-    ELLM_CHECK(mMemoryContext->setTensorAddress(kImages, const_cast<void*>(images.rawPointer())),
-        "InternVLAN1System1Runner::encodeMemory: failed to bind images");
+    mMemory.setShape(kImages, shape);
+    mMemory.bind(kImages, images.rawPointer());
 
     // The token count is fixed by the resampler, but read it from the engine rather than the
     // config so the two cannot disagree.
-    auto const outShape = dimsToVector(mMemoryContext->getTensorShape(kMemoryTokens));
+    auto const outShape = dimsToVector(mMemory.context().getTensorShape(kMemoryTokens));
     if (shapeOf(mMemoryTokens) != outShape)
     {
         mMemoryTokens
             = rt::Tensor(rt::Coords(outShape), rt::DeviceType::kGPU, DataType::kFLOAT, "internvla_n1::memoryTokens");
     }
-    ELLM_CHECK(mMemoryContext->setTensorAddress(kMemoryTokens, mMemoryTokens.rawPointer()),
-        "InternVLAN1System1Runner::encodeMemory: failed to bind memory_tokens");
-    ELLM_CHECK(mMemoryContext->enqueueV3(stream), "InternVLAN1System1Runner::encodeMemory: enqueue failed");
+    mMemory.bind(kMemoryTokens, mMemoryTokens.rawPointer());
+    ELLM_CHECK(mMemory.enqueue(stream), "InternVLAN1System1Runner::encodeMemory: enqueue failed");
     return mMemoryTokens;
 }
 
@@ -157,14 +123,6 @@ rt::Tensor& InternVLAN1System1Runner::sampleTrajectory(
     auto const condShape = shapeOf(conditioning);
     ELLM_CHECK(condShape.size() == 3U && condShape[0] == 2,
         "InternVLAN1System1Runner::sampleTrajectory: conditioning must be [2, condLen, latentDim]");
-
-    // Both contexts are USER_MANAGED, so the scratch has to be supplied before the first
-    // enqueue. One pool serves both: within a plan they run one after the other.
-    int64_t const contextBytes = getRequiredContextMemorySize();
-    mContextMemory = rt::Tensor(rt::Coords(std::vector<int64_t>{contextBytes}), rt::DeviceType::kGPU, DataType::kUINT8,
-        "internvla_n1::contextMemory");
-    mMemoryContext->setDeviceMemoryV2(mContextMemory.rawPointer(), contextBytes);
-    mDitContext->setDeviceMemoryV2(mContextMemory.rawPointer(), contextBytes);
 
     int64_t const batch = mConfig.numSampleTrajs;
     int64_t const doubled = 2 * batch;
@@ -192,30 +150,16 @@ rt::Tensor& InternVLAN1System1Runner::sampleTrajectory(
     CUDA_CHECK(cudaMemcpyAsync(mLatents.rawPointer(), noise.rawPointer(), static_cast<size_t>(perBatch) * sizeof(float),
         cudaMemcpyDeviceToDevice, stream));
 
-    Dims condDims{};
-    condDims.nbDims = 3;
-    condDims.d[0] = doubled;
-    condDims.d[1] = condShape[1];
-    condDims.d[2] = condShape[2];
     // Every dynamic input needs its shape, not just z_latents: an engine built with a dynamic
     // batch leaves latents and timestep unresolved too, and enqueue fails rather than
     // defaulting to the profile's optimum.
-    Dims latentDims{};
-    latentDims.nbDims = 3;
-    latentDims.d[0] = doubled;
-    latentDims.d[1] = mConfig.predictStepNums;
-    latentDims.d[2] = mConfig.actionDim;
-    Dims timestepDims{};
-    timestepDims.nbDims = 1;
-    timestepDims.d[0] = doubled;
-    ELLM_CHECK(mDitContext->setInputShape(kZLatents, condDims) && mDitContext->setInputShape(kLatents, latentDims)
-            && mDitContext->setInputShape(kTimestep, timestepDims),
-        "InternVLAN1System1Runner::sampleTrajectory: failed to set the expert input shapes");
-    ELLM_CHECK(mDitContext->setTensorAddress(kZLatents, mDoubledCond.rawPointer())
-            && mDitContext->setTensorAddress(kLatents, mDoubledLatents.rawPointer())
-            && mDitContext->setTensorAddress(kTimestep, mTimesteps.rawPointer())
-            && mDitContext->setTensorAddress(kOutput, mModelOutput.rawPointer()),
-        "InternVLAN1System1Runner::sampleTrajectory: failed to bind the expert tensors");
+    mDit.setShape(kZLatents, {doubled, condShape[1], condShape[2]});
+    mDit.setShape(kLatents, {doubled, mConfig.predictStepNums, mConfig.actionDim});
+    mDit.setShape(kTimestep, {doubled});
+    mDit.bind(kZLatents, mDoubledCond.rawPointer());
+    mDit.bind(kLatents, mDoubledLatents.rawPointer());
+    mDit.bind(kTimestep, mTimesteps.rawPointer());
+    mDit.bind(kOutput, mModelOutput.rawPointer());
 
     for (int32_t step = 0; step < mScheduler.numInferenceSteps(); ++step)
     {
@@ -236,7 +180,7 @@ rt::Tensor& InternVLAN1System1Runner::sampleTrajectory(
             cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        ELLM_CHECK(mDitContext->enqueueV3(stream), "InternVLAN1System1Runner::sampleTrajectory: expert enqueue failed");
+        ELLM_CHECK(mDit.enqueue(stream), "InternVLAN1System1Runner::sampleTrajectory: expert enqueue failed");
 
         launchGuidedEulerStep(static_cast<float*>(mLatents.rawPointer()),
             static_cast<float const*>(mModelOutput.rawPointer()), perBatch, mConfig.guidanceScale,

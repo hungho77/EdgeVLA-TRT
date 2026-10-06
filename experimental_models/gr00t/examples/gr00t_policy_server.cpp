@@ -20,7 +20,9 @@
 //! Request:  {"images": ["top.png", "wrist.png"],   camera frames after GR00T's eval image transform
 //!            "state": [...],                        raw state, groups concatenated in modality order
 //!            "instruction": "pick the cube",        after GR00T's language formalization
-//!            "rtc": {"overlap": 8, "frozen": 2, "ramp_rate": 6.0},   optional, chunk inpainting
+//!            "rtc": {"overlap": 8, "frozen": 2,     optional, chunk inpainting from the previous reply;
+//!                    "ramp_rate": 6.0,              start_row: rows of it executed when this chunk starts
+//!                    "start_row": 8},               (default action_horizon - overlap)
 //!            "seed": 0, "noise_file": "noise.f32",  optional; noise_file holds [max_horizon, max_action_dim]
 //!            "reset": true,                         optional, start of an episode
 //!            "debug": true}                         optional, also return the normalized model actions
@@ -33,6 +35,7 @@
 #include "common/trtUtils.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmInferenceRuntime.h"
+#include "vlaBackbone.h"
 
 #include <nlohmann/json.hpp>
 
@@ -167,33 +170,15 @@ int main(int argc, char** argv)
             cudaMemcpyAsync(
                 noise.rawPointer(), noiseHost.rawPointer(), noiseCount * sizeof(float), cudaMemcpyHostToDevice, stream);
 
-            rt::LLMGenerationRequest request;
-            request.requests.resize(1);
-            rt::Message msg;
-            msg.role = "user";
-            msg.contents.push_back({"text", buildPrompt(in.at("instruction").get<std::string>(), images.size())});
-            request.requests[0].messages.push_back(std::move(msg));
-            for (auto const& path : images)
-            {
-                request.requests[0].imageBuffers.push_back(rt::imageUtils::loadRgbImageFromFile(path));
-            }
-            request.applyChatTemplate = false;
-            request.maxGenerateLength = 1;
-            request.acceptHiddenLayer = kCaptureSlot;
-            request.temperature = 1.0F;
-            request.topP = 1.0F;
-            request.topK = 1;
-            rt::LLMGenerationResponse response;
-            if (!backbone.handleRequest(request, response, stream, /*outputThinkerEmbeddings=*/true))
+            rt::LLMGenerationRequest const request
+                = vla::makeBackboneRequest(buildPrompt(in.at("instruction").get<std::string>(), images.size()),
+                    vla::loadImages(images), kCaptureSlot);
+            rt::Tensor const* features = vla::runBackbone(backbone, request, stream);
+            if (features == nullptr)
             {
                 throw std::runtime_error("backbone request failed");
             }
-            rt::Tensor const* features = backbone.getBaseModelHiddenStates(kCaptureSlot);
-            std::vector<uint8_t> imageMask;
-            for (int32_t id : backbone.getBaseModelInputTokenIds().at(0))
-            {
-                imageMask.push_back(id == imageTokenId ? 1 : 0);
-            }
+            std::vector<uint8_t> const imageMask = vla::tokenMask(backbone, imageTokenId);
             cudaStreamSynchronize(stream);
             double const backboneMs = msSince(t0);
 
@@ -206,6 +191,7 @@ int main(int argc, char** argv)
                 rtc.overlapSteps = r.at("overlap").get<int32_t>();
                 rtc.frozenSteps = r.value("frozen", 0);
                 rtc.rampRate = r.value("ramp_rate", 6.0F);
+                rtc.startRow = r.value("start_row", -1);
             }
             std::vector<float> const absolute
                 = policy.act(*features, imageMask, rawState, noise, stream, useRtc ? &rtc : nullptr);

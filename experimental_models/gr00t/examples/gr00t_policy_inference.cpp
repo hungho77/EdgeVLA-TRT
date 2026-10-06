@@ -26,6 +26,7 @@
 #include "common/trtUtils.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmInferenceRuntime.h"
+#include "vlaBackbone.h"
 
 #include <algorithm>
 #include <chrono>
@@ -143,21 +144,7 @@ int main(int argc, char** argv)
         backbone = std::make_unique<rt::LLMInferenceRuntime>(llmDir, visDir, noLora, stream);
         std::ifstream promptStream(promptFile);
         std::string const prompt((std::istreambuf_iterator<char>(promptStream)), std::istreambuf_iterator<char>());
-        request.requests.resize(1);
-        rt::Message msg;
-        msg.role = "user";
-        msg.contents.push_back({"text", prompt});
-        request.requests[0].messages.push_back(std::move(msg));
-        for (auto const& path : images)
-        {
-            request.requests[0].imageBuffers.push_back(rt::imageUtils::loadRgbImageFromFile(path));
-        }
-        request.applyChatTemplate = false;
-        request.maxGenerateLength = 1;
-        request.acceptHiddenLayer = kCaptureSlot;
-        request.temperature = 1.0F;
-        request.topP = 1.0F;
-        request.topK = 1;
+        request = vla::makeBackboneRequest(prompt, vla::loadImages(images), kCaptureSlot);
     }
     else
     {
@@ -185,19 +172,13 @@ int main(int argc, char** argv)
         std::vector<uint8_t> imageMask = fixedMask;
         if (useBackbone)
         {
-            rt::LLMGenerationResponse response;
-            if (!backbone->handleRequest(request, response, stream, /*outputThinkerEmbeddings=*/true))
+            features = vla::runBackbone(*backbone, request, stream);
+            if (features == nullptr)
             {
                 std::fprintf(stderr, "backbone request failed\n");
                 return 1;
             }
-            features = backbone->getBaseModelHiddenStates(kCaptureSlot);
-            auto const& ids = backbone->getBaseModelInputTokenIds().at(0);
-            imageMask.clear();
-            for (int32_t id : ids)
-            {
-                imageMask.push_back(id == imageTokenId ? 1 : 0);
-            }
+            imageMask = vla::tokenMask(*backbone, imageTokenId);
         }
         cudaStreamSynchronize(stream);
         auto const t1 = std::chrono::steady_clock::now();

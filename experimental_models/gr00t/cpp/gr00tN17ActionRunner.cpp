@@ -63,20 +63,13 @@ Gr00tN17ActionRunner::Gr00tN17ActionRunner(std::string const& engineDir, cudaStr
     mConfig.backboneEmbeddingDim = json.at("backbone_embedding_dim").get<int32_t>();
     mConfig.maxBackboneTokens = json.at("max_backbone_tokens").get<int32_t>();
 
-    mRuntime = std::unique_ptr<IRuntime>(createInferRuntime(gLogger));
-    ELLM_CHECK(mRuntime, "Gr00tN17ActionRunner: failed to create TensorRT runtime");
-    loadEngine(engineDir + "/vl_prep.engine", mVlPrep, stream);
-    loadEngine(engineDir + "/state_encoder.engine", mStateEncoder, stream);
-    loadEngine(engineDir + "/denoise_step.engine", mDenoise, stream);
+    mRuntime = vla::createTrtRuntime();
+    mVlPrep = vla::TrtEngine(*mRuntime, engineDir + "/vl_prep.engine", stream);
+    mStateEncoder = vla::TrtEngine(*mRuntime, engineDir + "/state_encoder.engine", stream);
+    mDenoise = vla::TrtEngine(*mRuntime, engineDir + "/denoise_step.engine", stream);
 
     // The three engines run back to back on one stream, so they can share one scratch allocation.
-    int64_t const contextBytes = std::max({mVlPrep.engine->getDeviceMemorySizeV2(),
-        mStateEncoder.engine->getDeviceMemorySizeV2(), mDenoise.engine->getDeviceMemorySizeV2()});
-    mContextMemory = makeTensor({contextBytes}, DataType::kUINT8, "gr00t::contextMemory");
-    for (Engine* e : {&mVlPrep, &mStateEncoder, &mDenoise})
-    {
-        e->context->setDeviceMemoryV2(mContextMemory.rawPointer(), contextBytes);
-    }
+    mContextMemory = vla::allocateSharedContextMemory({&mVlPrep, &mStateEncoder, &mDenoise}, "gr00t::contextMemory");
 
     int64_t const maxTokens = mConfig.maxBackboneTokens;
     int64_t const horizon = mConfig.actionHorizon;
@@ -128,32 +121,6 @@ Gr00tN17ActionRunner::Gr00tN17ActionRunner(std::string const& engineDir, cudaStr
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-void Gr00tN17ActionRunner::loadEngine(std::string const& path, Engine& engine, cudaStream_t stream)
-{
-    engine.engine = deserializeCudaEngineFromFile(*mRuntime, path);
-    ELLM_CHECK(engine.engine, "Gr00tN17ActionRunner: failed to load " + path);
-    engine.context = std::unique_ptr<IExecutionContext>(
-        engine.engine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
-    ELLM_CHECK(engine.context, "Gr00tN17ActionRunner: failed to create a context for " + path);
-    ELLM_CHECK(engine.context->setOptimizationProfileAsync(0, stream),
-        "Gr00tN17ActionRunner: failed to set the optimization profile for " + path);
-}
-
-void Gr00tN17ActionRunner::bind(Engine& engine, char const* name, void const* address)
-{
-    ELLM_CHECK(engine.context->setTensorAddress(name, const_cast<void*>(address)),
-        std::string("Gr00tN17ActionRunner: failed to bind ") + name);
-}
-
-void Gr00tN17ActionRunner::setShape(Engine& engine, char const* name, std::vector<int64_t> const& shape)
-{
-    Dims dims{};
-    dims.nbDims = static_cast<int32_t>(shape.size());
-    std::copy(shape.begin(), shape.end(), dims.d);
-    ELLM_CHECK(engine.context->setInputShape(name, dims),
-        std::string("Gr00tN17ActionRunner: failed to set the shape of ") + name);
-}
-
 void Gr00tN17ActionRunner::prepare(
     rt::Tensor const& backboneFeatures, std::vector<uint8_t> const& imageMask, cudaStream_t stream)
 {
@@ -178,17 +145,17 @@ void Gr00tN17ActionRunner::prepare(
     CUDA_CHECK(cudaMemcpyAsync(
         mImageMask.rawPointer(), mMaskHost.rawPointer(), static_cast<size_t>(tokens), cudaMemcpyHostToDevice, stream));
 
-    setShape(mVlPrep, "backbone_features", {1, tokens, embed});
-    setShape(mVlPrep, "image_mask", {1, tokens});
-    setShape(mVlPrep, "attention_mask", {1, tokens});
-    bind(mVlPrep, "backbone_features", mFeatures.rawPointer());
-    bind(mVlPrep, "image_mask", mImageMask.rawPointer());
-    bind(mVlPrep, "attention_mask", mAttentionMask.rawPointer());
-    bind(mVlPrep, "cross_keys", mCrossKeys.rawPointer());
-    bind(mVlPrep, "cross_values", mCrossValues.rawPointer());
-    bind(mVlPrep, "text_bias", mTextBias.rawPointer());
-    bind(mVlPrep, "image_bias", mImageBias.rawPointer());
-    ELLM_CHECK(mVlPrep.context->enqueueV3(stream), "Gr00tN17ActionRunner: vl_prep enqueue failed");
+    mVlPrep.setShape("backbone_features", {1, tokens, embed});
+    mVlPrep.setShape("image_mask", {1, tokens});
+    mVlPrep.setShape("attention_mask", {1, tokens});
+    mVlPrep.bind("backbone_features", mFeatures.rawPointer());
+    mVlPrep.bind("image_mask", mImageMask.rawPointer());
+    mVlPrep.bind("attention_mask", mAttentionMask.rawPointer());
+    mVlPrep.bind("cross_keys", mCrossKeys.rawPointer());
+    mVlPrep.bind("cross_values", mCrossValues.rawPointer());
+    mVlPrep.bind("text_bias", mTextBias.rawPointer());
+    mVlPrep.bind("image_bias", mImageBias.rawPointer());
+    ELLM_CHECK(mVlPrep.enqueue(stream), "Gr00tN17ActionRunner: vl_prep enqueue failed");
 }
 
 void Gr00tN17ActionRunner::encodeState(std::vector<float> const& state, cudaStream_t stream)
@@ -198,9 +165,9 @@ void Gr00tN17ActionRunner::encodeState(std::vector<float> const& state, cudaStre
     std::copy(state.begin(), state.end(), mStateHost.dataPointer<float>());
     CUDA_CHECK(cudaMemcpyAsync(
         mState.rawPointer(), mStateHost.rawPointer(), state.size() * sizeof(float), cudaMemcpyHostToDevice, stream));
-    bind(mStateEncoder, "state", mState.rawPointer());
-    bind(mStateEncoder, "state_features", mStateFeatures.rawPointer());
-    ELLM_CHECK(mStateEncoder.context->enqueueV3(stream), "Gr00tN17ActionRunner: state_encoder enqueue failed");
+    mStateEncoder.bind("state", mState.rawPointer());
+    mStateEncoder.bind("state_features", mStateFeatures.rawPointer());
+    ELLM_CHECK(mStateEncoder.enqueue(stream), "Gr00tN17ActionRunner: state_encoder enqueue failed");
 }
 
 Gr00tN17ActionRunner::~Gr00tN17ActionRunner() noexcept
@@ -214,24 +181,24 @@ Gr00tN17ActionRunner::~Gr00tN17ActionRunner() noexcept
 void Gr00tN17ActionRunner::enqueueDenoiseLoop(cudaStream_t stream)
 {
     int64_t const inner = mConfig.crossInnerDim;
-    setShape(mDenoise, "cross_keys", {mConfig.numCrossBlocks, 1, mTokens, inner});
-    setShape(mDenoise, "cross_values", {mConfig.numCrossBlocks, 1, mTokens, inner});
-    setShape(mDenoise, "text_bias", {1, 1, 1, mTokens});
-    setShape(mDenoise, "image_bias", {1, 1, 1, mTokens});
-    bind(mDenoise, "state_features", mStateFeatures.rawPointer());
-    bind(mDenoise, "cross_keys", mCrossKeys.rawPointer());
-    bind(mDenoise, "cross_values", mCrossValues.rawPointer());
-    bind(mDenoise, "text_bias", mTextBias.rawPointer());
-    bind(mDenoise, "image_bias", mImageBias.rawPointer());
-    bind(mDenoise, "vel_strength", mVelStrength.rawPointer());
-    bind(mDenoise, "dt", mDt.rawPointer());
+    mDenoise.setShape("cross_keys", {mConfig.numCrossBlocks, 1, mTokens, inner});
+    mDenoise.setShape("cross_values", {mConfig.numCrossBlocks, 1, mTokens, inner});
+    mDenoise.setShape("text_bias", {1, 1, 1, mTokens});
+    mDenoise.setShape("image_bias", {1, 1, 1, mTokens});
+    mDenoise.bind("state_features", mStateFeatures.rawPointer());
+    mDenoise.bind("cross_keys", mCrossKeys.rawPointer());
+    mDenoise.bind("cross_values", mCrossValues.rawPointer());
+    mDenoise.bind("text_bias", mTextBias.rawPointer());
+    mDenoise.bind("image_bias", mImageBias.rawPointer());
+    mDenoise.bind("vel_strength", mVelStrength.rawPointer());
+    mDenoise.bind("dt", mDt.rawPointer());
     int32_t current = 0;
     for (int32_t step = 0; step < mConfig.numInferenceTimesteps; ++step)
     {
-        bind(mDenoise, "actions", mActions[current].rawPointer());
-        bind(mDenoise, "timestep", mTimesteps.dataPointer<int64_t>() + step);
-        bind(mDenoise, "next_actions", mActions[1 - current].rawPointer());
-        ELLM_CHECK(mDenoise.context->enqueueV3(stream), "Gr00tN17ActionRunner: denoise_step enqueue failed");
+        mDenoise.bind("actions", mActions[current].rawPointer());
+        mDenoise.bind("timestep", mTimesteps.dataPointer<int64_t>() + step);
+        mDenoise.bind("next_actions", mActions[1 - current].rawPointer());
+        ELLM_CHECK(mDenoise.enqueue(stream), "Gr00tN17ActionRunner: denoise_step enqueue failed");
         current = 1 - current;
     }
 }

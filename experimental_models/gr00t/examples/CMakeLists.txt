@@ -17,7 +17,8 @@ add_executable(gr00t_backbone_dump gr00t_backbone_dump.cpp)
 target_include_directories(
   gr00t_backbone_dump PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
                               ${ONNX_PARSER_INCLUDE_DIR})
-target_link_libraries(gr00t_backbone_dump PRIVATE edgellmCore commonLibraryExt)
+target_link_libraries(gr00t_backbone_dump PRIVATE vlaExperimental edgellmCore
+                                                  commonLibraryExt)
 
 add_executable(gr00t_policy_inference gr00t_policy_inference.cpp)
 target_include_directories(
@@ -31,4 +32,11 @@ target_include_directories(
   gr00t_policy_server PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
                               ${ONNX_PARSER_INCLUDE_DIR})
 target_link_libraries(gr00t_policy_server PRIVATE gr00tExperimental edgellmCore
+                                                  commonLibraryExt)
+
+add_executable(gr00t_async_control gr00t_async_control.cpp)
+target_include_directories(
+  gr00t_async_control PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
+                              ${ONNX_PARSER_INCLUDE_DIR})
+target_link_libraries(gr00t_async_control PRIVATE gr00tExperimental edgellmCore
                                                   commonLibraryExt)

@@ -13,13 +13,12 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_library(
-  gr00tExperimental STATIC gr00tN17ActionRunner.cpp gr00tN17Policy.cpp
-                           gr00tProcessing.cpp gr00tKernels.cu)
+# Shared VLA layer: TensorRT engine helpers, the VLM-backbone prefill and the
+# dual-rate planner/control handoff, used by internvla_n1 and gr00t.
+add_library(vlaExperimental STATIC cpp/vlaEngine.cpp cpp/vlaBackbone.cpp)
 target_include_directories(
-  gr00tExperimental
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+  vlaExperimental
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp
   PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
           ${ONNX_PARSER_INCLUDE_DIR})
-target_link_libraries(gr00tExperimental PUBLIC vlaExperimental)
-set_property(TARGET gr00tExperimental PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET vlaExperimental PROPERTY POSITION_INDEPENDENT_CODE ON)
