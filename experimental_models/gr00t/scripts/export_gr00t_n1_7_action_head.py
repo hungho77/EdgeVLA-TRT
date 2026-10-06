@@ -133,20 +133,47 @@ class StateEncoder(nn.Module):
 
 
 class DenoiseStep(nn.Module):
+    """One Euler step. The timestep conditioning (every block's AdaLN scale/shift and the output
+    modulation) depends only on which of the num_inference_timesteps fixed timesteps this is, so it is
+    precomputed into tables and its projection weights stay out of the graph."""
 
     def __init__(self, head, attend_text_every_n_blocks):
         super().__init__()
         self.action_encoder = head.action_encoder
         self.action_decoder = head.action_decoder
         self.position_embedding = head.position_embedding if head.config.add_pos_embed else None
-        self.dit = head.model
+        self.blocks = head.model.transformer_blocks
+        self.norm_out = head.model.norm_out
+        self.proj_out_2 = head.model.proj_out_2
         self.action_horizon = head.action_horizon
         self.text_period = 2 * attend_text_every_n_blocks
+        self.steps = head.num_inference_timesteps
+        self.buckets = head.num_timestep_buckets
+        dit = head.model
+        block_mods, out_mods = [], []
+        with torch.no_grad():
+            for step in range(self.steps):
+                t = torch.tensor([int(step / self.steps * self.buckets)])
+                temb = F.silu(dit.timestep_encoder(t))
+                block_mods.append(
+                    torch.stack([b.norm1.linear(temb)[0]
+                                 for b in self.blocks]))
+                out_mods.append(dit.proj_out_1(temb)[0])
+        self.register_buffer(
+            "block_mods",
+            torch.stack(block_mods))  # [steps, blocks, 2 * inner]
+        self.register_buffer("out_mods",
+                             torch.stack(out_mods))  # [steps, 2 * inner]
 
     @staticmethod
-    def _cross_block(block, hidden, temb, keys, values, bias):
+    def _ada_norm(block, hidden, mod):
+        scale, shift = mod.chunk(2, dim=-1)
+        return block.norm1.norm(hidden) * (1 + scale) + shift
+
+    @staticmethod
+    def _attend(block, normed, keys, values, bias):
         attn = block.attn1
-        query = attn.to_q(block.norm1(hidden, temb))
+        query = attn.to_q(normed)
         batch, length, inner = query.shape
         head_dim = inner // attn.heads
 
@@ -157,9 +184,8 @@ class DenoiseStep(nn.Module):
                                              split(keys),
                                              split(values),
                                              attn_mask=bias)
-        out = attn.to_out[0](out.transpose(1, 2).reshape(batch, length, inner))
-        hidden = hidden + out
-        return hidden + block.ff(block.norm3(hidden))
+        return attn.to_out[0](out.transpose(1,
+                                            2).reshape(batch, length, inner))
 
     def forward(self, actions, timestep, state_features, keys, values,
                 text_bias, image_bias, vel_strength, dt):
@@ -167,26 +193,33 @@ class DenoiseStep(nn.Module):
                                dtype=torch.long,
                                device=actions.device)
         timesteps = timestep.expand(actions.shape[0])
+        # Exact for the fixed schedule int(step / steps * buckets).
+        step = torch.div(timestep * self.steps,
+                         self.buckets,
+                         rounding_mode="floor")[0]
+        block_mods = self.block_mods[step]
         action_features = self.action_encoder(actions, timesteps, category)
         if self.position_embedding is not None:
             action_features = action_features + self.position_embedding.weight[:actions.shape[
                 1]][None]
         hidden = torch.cat((state_features, action_features), dim=1)
-        temb = self.dit.timestep_encoder(timesteps)
         cross_index = 0
-        for index, block in enumerate(self.dit.transformer_blocks):
+        for index, block in enumerate(self.blocks):
+            normed = self._ada_norm(block, hidden, block_mods[index])
             if index % 2 == 1:
-                hidden = block(hidden, temb=temb)
+                attn = block.attn1
+                hidden = hidden + self._attend(
+                    block, normed, attn.to_k(normed), attn.to_v(normed), None)
             else:
                 bias = text_bias if index % self.text_period == 0 else image_bias
-                hidden = self._cross_block(block, hidden, temb,
-                                           keys[cross_index],
-                                           values[cross_index], bias)
+                hidden = hidden + self._attend(
+                    block, normed, keys[cross_index], values[cross_index],
+                    bias)
                 cross_index += 1
-        shift, scale = self.dit.proj_out_1(F.silu(temb)).chunk(2, dim=1)
-        hidden = self.dit.norm_out(hidden) * (1 + scale[:, None]) + shift[:,
-                                                                          None]
-        velocity = self.action_decoder(self.dit.proj_out_2(hidden),
+            hidden = hidden + block.ff(block.norm3(hidden))
+        shift, scale = self.out_mods[step].chunk(2, dim=-1)
+        hidden = self.norm_out(hidden) * (1 + scale) + shift
+        velocity = self.action_decoder(self.proj_out_2(hidden),
                                        category)[:, -self.action_horizon:]
         return actions + dt * velocity * vel_strength
 
