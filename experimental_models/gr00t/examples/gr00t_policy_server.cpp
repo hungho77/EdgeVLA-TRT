@@ -27,8 +27,7 @@
 //! Reply:    {"actions": [[...], ...],               absolute raw actions [action_horizon][raw action dim]
 //!            "timing_ms": {...}}  or {"error": "..."}
 
-#include "gr00tN17ActionRunner.h"
-#include "gr00tProcessing.h"
+#include "gr00tN17Policy.h"
 
 #include "common/tensor.h"
 #include "common/trtUtils.h"
@@ -105,10 +104,10 @@ int main(int argc, char** argv)
     cudaStreamCreate(&stream);
     std::unordered_map<std::string, std::string> const noLora;
     rt::LLMInferenceRuntime backbone(llmDir, visDir, noLora, stream);
-    gr00t::Gr00tN17ActionRunner action(actionDir, stream);
-    action.setUseCudaGraph(argOf(argc, argv, "--cudaGraph", "1") != "0");
-    gr00t::Gr00tProcessing const processing(actionDir + "/processing.json");
-    auto const& cfg = action.config();
+    gr00t::Gr00tN17Policy policy(actionDir, stream);
+    policy.runner().setUseCudaGraph(argOf(argc, argv, "--cudaGraph", "1") != "0");
+    gr00t::Gr00tProcessing const& processing = policy.processing();
+    auto const& cfg = policy.runner().config();
     int32_t const imageTokenId = std::stoi(argOf(argc, argv, "--imageTokenId", "151655"));
 
     size_t const noiseCount = static_cast<size_t>(cfg.actionHorizon) * cfg.actionDim;
@@ -116,8 +115,6 @@ int main(int argc, char** argv)
         nvinfer1::DataType::kFLOAT, "gr00t::noiseHost");
     rt::Tensor noise(rt::Coords(std::vector<int64_t>{cfg.actionHorizon, cfg.actionDim}), rt::DeviceType::kGPU,
         nvinfer1::DataType::kFLOAT, "gr00t::noise");
-    rt::Tensor actionsHost(rt::Coords(std::vector<int64_t>{cfg.actionHorizon, cfg.actionDim}), rt::DeviceType::kCPU,
-        nvinfer1::DataType::kFLOAT, "gr00t::actionsHost");
     std::mt19937_64 generator(0);
 
     std::printf("{\"ready\":true,\"raw_state_dim\":%d,\"raw_action_dim\":%d,\"action_horizon\":%d}\n",
@@ -138,7 +135,7 @@ int main(int argc, char** argv)
             auto const t0 = std::chrono::steady_clock::now();
             if (in.value("reset", false))
             {
-                action.resetEpisode();
+                policy.resetEpisode();
             }
             std::vector<std::string> const images = in.at("images").get<std::vector<std::string>>();
             std::vector<float> const rawState = in.at("state").get<std::vector<float>>();
@@ -201,25 +198,19 @@ int main(int argc, char** argv)
             double const backboneMs = msSince(t0);
 
             auto const t1 = std::chrono::steady_clock::now();
-            action.prepare(*features, imageMask, stream);
-            action.encodeState(processing.normalizeState(rawState), stream);
-            gr00t::Gr00tN17ActionRunner::RtcOptions rtc;
+            gr00t::Gr00tN17Policy::Rtc rtc;
             bool const useRtc = in.contains("rtc");
             if (useRtc)
             {
                 auto const& r = in.at("rtc");
-                rtc.horizon = processing.actionHorizon();
                 rtc.overlapSteps = r.at("overlap").get<int32_t>();
                 rtc.frozenSteps = r.value("frozen", 0);
                 rtc.rampRate = r.value("ramp_rate", 6.0F);
             }
-            rt::Tensor const& sampled = action.sample(noise, stream, useRtc ? &rtc : nullptr);
-            cudaMemcpyAsync(actionsHost.rawPointer(), sampled.rawPointer(), noiseCount * sizeof(float),
-                cudaMemcpyDeviceToHost, stream);
-            cudaStreamSynchronize(stream);
+            std::vector<float> const absolute
+                = policy.act(*features, imageMask, rawState, noise, stream, useRtc ? &rtc : nullptr);
             double const actionMs = msSince(t1);
 
-            std::vector<float> const absolute = processing.decodeActions(actionsHost.dataPointer<float>(), rawState);
             Json rows = Json::array();
             for (int32_t t = 0; t < processing.actionHorizon(); ++t)
             {
@@ -231,7 +222,7 @@ int main(int argc, char** argv)
             if (in.value("debug", false))
             {
                 // Normalized model output rows [0, action_horizon), every padded column.
-                float const* raw = actionsHost.dataPointer<float>();
+                float const* raw = policy.lastModelActions();
                 reply["model_actions"]
                     = std::vector<float>(raw, raw + static_cast<int64_t>(processing.actionHorizon()) * cfg.actionDim);
             }

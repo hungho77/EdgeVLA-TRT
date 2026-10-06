@@ -135,13 +135,79 @@ class Gr00tPolicyClient:
         self.proc.wait(timeout=30)
 
 
+def encode_actions(spec, absolute, raw_state):
+    """Inverse action decoding for chunk rows [0, len(absolute)), as Gr00tProcessing::encodeActions."""
+    out = np.zeros((len(absolute), spec["max_action_dim"]), dtype=np.float32)
+    state_offsets, offset = {}, 0
+    for g in spec["state"]:
+        state_offsets[g["name"]] = offset
+        offset += g["dim"]
+    offset = 0
+    for g in spec["action"]:
+        lo, hi = np.asarray(g["min"]), np.asarray(g["max"])
+        if lo.ndim == 2:
+            lo, hi = lo[:len(absolute)], hi[:len(absolute)]
+        v = absolute[:, offset:offset + g["dim"]].astype(np.float64)
+        if g["relative"]:
+            ref = state_offsets[g["reference_state"]]
+            v = v - raw_state[ref:ref + g["dim"]]
+        degenerate = np.isclose(hi, lo)
+        a = np.clip(2 * (v - lo) / np.where(degenerate, 1, hi - lo) - 1, -1, 1)
+        out[:, offset:offset + g["dim"]] = np.where(degenerate, 0.0, a)
+        offset += g["dim"]
+    return out
+
+
+def load_dataset_frame(args, frame):
+    import av
+    import pandas as pd
+    frames = {}
+    for key in args.video_keys:
+        container = av.open(
+            f"{args.dataset}/videos/observation.images.{key}/chunk-000/{args.video_file}"
+        )
+        for index, decoded in enumerate(container.decode(video=0)):
+            if index == frame:
+                frames[key] = decoded.to_ndarray(format="rgb24")
+                break
+    table = pd.read_parquet(f"{args.dataset}/data/chunk-000/{args.data_file}")
+    raw_state = np.asarray(table["observation.state"].iloc[frame],
+                           dtype=np.float32)
+    tasks = pd.read_parquet(f"{args.dataset}/meta/tasks.parquet")
+    return frames, raw_state, tasks.index[int(table["task_index"].iloc[frame])]
+
+
+def rtc_check(args):
+    """Frozen RTC rows must reproduce the previous chunk's committed absolute actions after the arm moved."""
+    rtc = {"overlap": 8, "frozen": 2, "ramp_rate": 6.0}
+    client = Gr00tPolicyClient(args.server_cmd.split(), args.video_keys)
+    previous = None
+    for i, frame in enumerate((args.frame, args.frame + args.rtc_stride)):
+        frames, raw_state, instruction = load_dataset_frame(args, frame)
+        actions = client.act(frames,
+                             raw_state,
+                             instruction,
+                             rtc=rtc if i else None,
+                             seed=i,
+                             reset=i == 0)
+        if previous is not None:
+            start = len(previous) - rtc["overlap"]
+            committed = previous[start:start + rtc["frozen"]]
+            diff = np.abs(actions[:rtc["frozen"]] - committed)
+            print(
+                f"frames {args.frame} -> {frame}, state moved by up to {np.abs(raw_state - state0).max():.2f}: "
+                f"frozen rows vs committed actions max |d| = {diff.max():.4f}")
+            print("  committed:", np.round(committed[0], 3).tolist())
+            print("  new      :", np.round(actions[0], 3).tolist())
+        previous, state0 = actions, raw_state
+    client.close()
+
+
 def golden(args):
     """Official Gr00tPolicy (fp32) vs the server on one raw dataset observation with the same noise."""
     import sys
     from unittest import mock
 
-    import av
-    import pandas as pd
     import torch
     sys.path.insert(0, args.gr00t_src)
     import gr00t.model.gr00t_n1d7.gr00t_n1d7  # noqa: F401
@@ -150,20 +216,7 @@ def golden(args):
         build_image_transformations_albumentations
     from gr00t.policy import gr00t_policy
 
-    frames = {}
-    for key in args.video_keys:
-        container = av.open(
-            f"{args.dataset}/videos/observation.images.{key}/chunk-000/{args.video_file}"
-        )
-        for index, frame in enumerate(container.decode(video=0)):
-            if index == args.frame:
-                frames[key] = frame.to_ndarray(format="rgb24")
-                break
-    table = pd.read_parquet(f"{args.dataset}/data/chunk-000/{args.data_file}")
-    raw_state = np.asarray(table["observation.state"].iloc[args.frame],
-                           dtype=np.float32)
-    tasks = pd.read_parquet(f"{args.dataset}/meta/tasks.parquet")
-    instruction = tasks.index[int(table["task_index"].iloc[args.frame])]
+    frames, raw_state, instruction = load_dataset_frame(args, args.frame)
 
     _, official_eval = build_image_transformations_albumentations([256, 256],
                                                                   [230, 230],
@@ -239,13 +292,19 @@ def golden(args):
     print(
         f"instruction: {instruction!r}; raw state {np.round(raw_state, 2).tolist()}"
     )
+    spec = json.load(open(args.processing))
     previous = None
     for i in range(2):
 
         def spy(**kwargs):
             if previous is not None:
-                # The official RTC path: the previous normalized chunk as action_input["action"].
-                kwargs["inputs"]["action"] = previous
+                # The official RTC path copies rows [horizon - overlap, horizon) of action_input["action"]; they
+                # hold the previous absolute chunk re-encoded for this call, as Gr00tN17Policy does.
+                seeded = torch.zeros(1, 40, 132)
+                seeded[0, horizon - rtc["overlap"]:horizon] = torch.from_numpy(
+                    encode_actions(spec, previous[horizon - rtc["overlap"]:],
+                                   raw_state))
+                kwargs["inputs"]["action"] = seeded
                 kwargs["options"] = {
                     "action_horizon": horizon,
                     "rtc_overlap_steps": rtc["overlap"],
@@ -261,12 +320,12 @@ def golden(args):
                 mock.patch.object(policy.model, "get_action", spy), \
                 mock.patch("torch.randn", side_effect=fixed_randn):
             official, _ = policy.get_action(observation)
-        previous = current["action_pred"]
         official = np.concatenate(
             [official["single_arm"][0], official["gripper"][0]], axis=-1)
+        previous = official
         diff = np.abs(ours[i] - official)
         model_diff = np.abs(ours_model[i].reshape(horizon, -1)[:, :dim] -
-                            previous[0, :horizon, :dim].numpy())
+                            current["action_pred"][0, :horizon, :dim].numpy())
         label = f"RTC {rtc}" if i else "fresh chunk"
         print(
             f"{label}: absolute actions {ours[i].shape} max |ours - official| = {diff.max():.4f}, "
@@ -293,9 +352,15 @@ def main():
     parser.add_argument("--data-file", default="file-000.parquet")
     parser.add_argument("--frame", type=int, default=0)
     parser.add_argument("--noise-seed", type=int, default=0)
+    parser.add_argument("--processing",
+                        help="processing.json, for the golden RTC round")
+    parser.add_argument("--rtc-check", action="store_true")
+    parser.add_argument("--rtc-stride", type=int, default=8)
     args = parser.parse_args()
     if args.golden:
         golden(args)
+    if args.rtc_check:
+        rtc_check(args)
 
 
 if __name__ == "__main__":

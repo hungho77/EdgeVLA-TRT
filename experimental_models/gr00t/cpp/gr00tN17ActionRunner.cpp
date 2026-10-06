@@ -97,7 +97,7 @@ Gr00tN17ActionRunner::Gr00tN17ActionRunner(std::string const& engineDir, cudaStr
     mActions[0] = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::actions0");
     mActions[1] = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::actions1");
     mVelStrength = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::velStrength");
-    mPrevious = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::previousActions");
+    mSeedHost = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::seedHost", rt::DeviceType::kCPU);
     mVelocityHost = makeTensor({1, horizon, actionDim}, DataType::kFLOAT, "gr00t::velocityHost", rt::DeviceType::kCPU);
     mTimesteps = makeTensor({mConfig.numInferenceTimesteps}, DataType::kINT64, "gr00t::timesteps");
     mDt = makeTensor({1}, DataType::kFLOAT, "gr00t::dt");
@@ -246,18 +246,19 @@ rt::Tensor const& Gr00tN17ActionRunner::sample(rt::Tensor const& noise, cudaStre
     // switch RTC on or off between calls.
     CUDA_CHECK(
         cudaMemcpyAsync(mActions[0].rawPointer(), noise.rawPointer(), actionBytes, cudaMemcpyDeviceToDevice, stream));
-    if (rtc != nullptr && mHasPrevious && rtc->overlapSteps > 0)
+    if (rtc != nullptr && rtc->overlapSteps > 0)
     {
-        ELLM_CHECK(rtc->horizon <= mConfig.actionHorizon && rtc->overlapSteps <= rtc->horizon && rtc->frozenSteps >= 0
+        ELLM_CHECK(rtc->seed != nullptr && rtc->overlapSteps <= mConfig.actionHorizon && rtc->frozenSteps >= 0
                 && rtc->frozenSteps <= rtc->overlapSteps,
             "Gr00tN17ActionRunner::sample: inconsistent RTC options");
-        CUDA_CHECK(cudaMemcpyAsync(mActions[0].rawPointer(),
-            mPrevious.dataPointer<float>() + static_cast<int64_t>(rtc->horizon - rtc->overlapSteps) * actionDim,
-            static_cast<size_t>(rtc->overlapSteps) * rowBytes, cudaMemcpyDeviceToDevice, stream));
+        size_t const seedBytes = static_cast<size_t>(rtc->overlapSteps) * rowBytes;
+        CUDA_CHECK(cudaStreamSynchronize(stream)); // the staging buffers may still feed the previous upload
+        std::memcpy(mSeedHost.rawPointer(), rtc->seed, seedBytes);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mActions[0].rawPointer(), mSeedHost.rawPointer(), seedBytes, cudaMemcpyHostToDevice, stream));
         // GR00T: ramp = 1 - exp(-rate * linspace(0, 1, n + 2)), normalized by its last value, interior n points.
         int32_t const ramped = rtc->overlapSteps - rtc->frozenSteps;
         double const last = std::max(1.0 - std::exp(-static_cast<double>(rtc->rampRate)), 1e-8);
-        CUDA_CHECK(cudaStreamSynchronize(stream)); // the staging buffer may still feed the previous upload
         float* velocity = mVelocityHost.dataPointer<float>();
         for (int32_t row = 0; row < mConfig.actionHorizon; ++row)
         {
@@ -307,11 +308,7 @@ rt::Tensor const& Gr00tN17ActionRunner::sample(rt::Tensor const& noise, cudaStre
             mDenoiseGraphs.emplace(mTokens, exec);
         }
     }
-    rt::Tensor const& result = mActions[mConfig.numInferenceTimesteps % 2];
-    CUDA_CHECK(
-        cudaMemcpyAsync(mPrevious.rawPointer(), result.rawPointer(), actionBytes, cudaMemcpyDeviceToDevice, stream));
-    mHasPrevious = true;
-    return result;
+    return mActions[mConfig.numInferenceTimesteps % 2];
 }
 
 } // namespace gr00t

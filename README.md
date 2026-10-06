@@ -113,7 +113,10 @@ NVIDIA GR00T N1.7 (SO101 fine-tune) runs as Edge-LLM backbone plus a vendored ac
 - **Policy**: `processing.json` records the embodiment's state normalization and action decoding (percentile
   bounds, per-step relative-action bounds, relative-to-absolute joints) from the official processor;
   `gr00t_policy_server` takes camera frames, raw state and an instruction and returns absolute actions, with
-  optional real-time chunking (RTC: the next chunk is inpainted from the tail of the previous one).
+  optional real-time chunking (RTC: the next chunk is inpainted from the tail of the previous one). The tail is
+  kept in absolute joint space and re-encoded against the new state, so the frozen rows reproduce the actions
+  already committed even after the arm moved; seeding the previous normalized rows directly, as the model-level
+  API does, misses them by up to 2.8 on SO101 when the state moved 6.6 in 8 frames.
   `gr00t_policy_client.py` applies GR00T's image and language preprocessing on the robot side.
 
 AGX Orin, two SO101 dataset frames from raw video and raw state, against the official `Gr00tPolicy` (fp32
@@ -123,7 +126,7 @@ PyTorch) with the same noise:
 |---|---|---|
 | Backbone hidden states vs PyTorch | per-token cosine 0.99986 (min 0.998) | same |
 | Absolute SO101 actions, max \|Δ\| (joint range ±90) | 0.21 | 1.06 |
-| Absolute actions with RTC (overlap 8, frozen 2), max \|Δ\| | 0.20 | |
+| Absolute actions with RTC (overlap 8, frozen 2), max \|Δ\| | 0.25 | |
 | Policy step p50, CUDA graph (backbone 26.5 ms) | 96.4 ms | 73.1 ms |
 
 A VLA-OPT quantization job shared the board during the timing runs.

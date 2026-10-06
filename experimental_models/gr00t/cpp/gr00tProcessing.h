@@ -60,6 +60,11 @@ public:
     //! Model output ([maxHorizon, maxActionDim], row-major) -> absolute raw actions [actionHorizon, rawActionDim].
     std::vector<float> decodeActions(float const* modelActions, std::vector<float> const& rawState) const;
 
+    //! Inverse of decodeActions for chunk rows [0, numRows): absolute raw actions [numRows, rawActionDim] ->
+    //! model actions [numRows, maxActionDim], relative to \p rawState, clipped to [-1, 1], zero-padded.
+    std::vector<float> encodeActions(
+        float const* absoluteActions, int32_t numRows, std::vector<float> const& rawState) const;
+
 private:
     struct Group
     {

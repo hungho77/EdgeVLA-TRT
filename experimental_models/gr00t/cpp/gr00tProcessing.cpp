@@ -165,5 +165,33 @@ std::vector<float> Gr00tProcessing::decodeActions(float const* modelActions, std
     return out;
 }
 
+std::vector<float> Gr00tProcessing::encodeActions(
+    float const* absoluteActions, int32_t numRows, std::vector<float> const& rawState) const
+{
+    ELLM_CHECK(static_cast<int32_t>(rawState.size()) == mRawStateDim, "Gr00tProcessing: raw state has the wrong width");
+    ELLM_CHECK(numRows >= 0 && numRows <= mActionHorizon, "Gr00tProcessing: more rows than the action horizon");
+    std::vector<float> out(static_cast<size_t>(numRows) * mMaxActionDim, 0.0F);
+    for (int32_t t = 0; t < numRows; ++t)
+    {
+        for (auto const& g : mAction)
+        {
+            size_t const row = g.steps == 1 ? 0 : static_cast<size_t>(t) * g.dim;
+            for (int32_t d = 0; d < g.dim; ++d)
+            {
+                double const lo = g.min[row + d];
+                double const hi = g.max[row + d];
+                double v = absoluteActions[static_cast<size_t>(t) * mRawActionDim + g.offset + d];
+                if (g.relative)
+                {
+                    v -= rawState[g.referenceOffset + d];
+                }
+                double const a = degenerate(lo, hi) ? 0.0 : std::clamp(2.0 * (v - lo) / (hi - lo) - 1.0, -1.0, 1.0);
+                out[static_cast<size_t>(t) * mMaxActionDim + g.offset + d] = static_cast<float>(a);
+            }
+        }
+    }
+    return out;
+}
+
 } // namespace gr00t
 } // namespace trt_edgellm
