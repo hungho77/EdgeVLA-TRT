@@ -28,6 +28,7 @@ support for platforms upstream no longer targets.
 | Exact asymmetric INT4 AWQ | Engine output matches the exactly dequantized checkpoint token-for-token | [FIXES.md](FIXES.md) |
 | NVFP4 AWQ `pre_quant_scale`, NVFP4 CASK epilogue cap (TRT 10.13/10.14) | Fixed; needs Thor to verify | [FIXES.md](FIXES.md) |
 | InternLM2-backed InternVL3 checkpoints | Converter | `tensorrt_edgellm/scripts/convert_internlm2_internvl.py` |
+| VLA replan caching | Encoder-cache partial hits and KV prefix reuse with tail-only hidden capture; ~2× faster InternVLA-N1 replans | [below](#kv-cache-reuse-for-vla-control-loops) |
 
 Upstream VLA support (experimental pi0.5, Alpamayo, Cosmos3-Edge policy) is unchanged and documented under
 [docs/source/user_guide/examples/vla](docs/source/user_guide/examples/vla/index.md).
@@ -43,16 +44,38 @@ InternVLA-N1-DualVLN, FP16 System 2 (Qwen2.5-VL-7B), BF16 System 1, `--ticks 40 
 
 The LLM engine was built with `--maxInputLen 2048 --maxKVCacheCapacity 2560` to fit beside the other engines.
 
-## Roadmap: KV-cache reuse for VLA control loops
+## KV-cache reuse for VLA control loops
 
-Edge-LLM 0.11 has page-granular context reuse (`--enableContextReuse`), an encoder embedding cache, cross-request
-KV retention and FP8 KV. None of the VLA paths reuse KV across control steps today: each replan or action chunk
-recomputes the full prefix. Reuse applies to VLAs with a **causal** VLM backbone (InternVLA-N1, GR00T, Alpamayo);
-models whose image+text prefix attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
+A VLA replans every few control steps with a prompt that mostly repeats: the same instruction, history frames it
+has already seen, and one new frame. Upstream 0.11 recomputed all of it: the encoder cache only restored when every
+image of a request was cached, and hidden-state capture bypassed the context cache. This fork adds:
 
-1. **InternVLA-N1 pilot**: allow hidden-state capture with the context cache, lay the prompt out
-   static-text → episode history → latent queries, enable the encoder cache for history frames, and measure
-   replan latency on Orin with real frames.
+- **Encoder-cache partial hits**: only uncached images go through the vision encoder; the rest are assembled from
+  the cache. On by default (`encoderEmbeddingCacheBudgetBytes`, 256 MiB).
+- **Tail-only hidden capture with context reuse**: a request that reads only its last N hidden states sets
+  `LLMGenerationRequest::hiddenCaptureTailTokens = N`; the context cache then restores matching prefix pages and
+  always recomputes those N positions. Enable the cache with `--enableContextReuse` (InternVLA-N1 server and
+  `internvla_n1_s2_bench`). Attention-only, non-speculative deployments; no engine rebuild needed.
+
+InternVLA-N1 System-2 replans on AGX Orin, simulated 30-step InternNav episode (8 `linspace` history frames plus the
+current frame, 384×384, about 1878 prompt tokens), measured with `internvla_n1_s2_bench`:
+
+| Configuration | Mean replan | vs. no cache |
+|---|---|---|
+| No cache | 1734 ms | — |
+| Encoder partial hits | 1205 ms | −30% |
+| Encoder partial hits + KV prefix reuse | 749 ms | −57% |
+
+KV reuse restores 41% of prompt tokens over the episode (256–768 per replan). `z_latents` are bit-identical to the
+no-cache run in every configuration. Another GPU job shared the board during part of the measurement, so absolute
+times vary between runs; the ordering held in every run.
+
+Reuse applies to VLAs with a **causal** VLM backbone (InternVLA-N1, GR00T, Alpamayo). Models whose image+text prefix
+attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
+
+### Roadmap
+
+1. **InternVLA-N1 pilot**: done (above). Remaining: measure with real habitat-sim frames.
 2. **Shared `vla/` layer**: observation encoder, causal backbone on the core runtime, action head
    (flow matching / diffusion / autoregressive), and a dual-rate scheduler; port GR00T N1.6/N1.7 onto it.
 3. **Bidirectional-prefix VLAs** (pi0.5, SmolVLA): encoder cache, persistent CUDA graphs, prefix KV pool in
