@@ -1,7 +1,8 @@
 # Running 0.11 on JetPack 6 (Orin, CUDA 12.6, TensorRT 10.3)
 
-Upstream 0.11 supports Orin only on JetPack 7.2. This branch (`orin-jp6-harness`) is a test
-harness that runs export → build → inference on a JetPack 6.2 AGX Orin. It is not meant for `main`.
+Upstream 0.11 supports Orin only on JetPack 7.2. This fork also runs export → build → inference on
+JetPack 6.2 AGX Orin. The two source changes below are inert on CUDA 13 / newer TensorRT; the CuTe DSL
+artifacts and the CUDA 12.9 runtime are per-machine setup.
 
 Three gaps, each reproduced on unmodified upstream 0.11:
 

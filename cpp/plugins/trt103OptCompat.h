@@ -27,8 +27,8 @@ namespace trt_edgellm
 namespace plugins
 {
 
-//! JetPack 6 test harness: TensorRT 10.3 leaves DynamicPluginTensorDesc::opt empty in configurePlugin.
-//! Substitute max so profile validation sees a concrete shape.
+//! TensorRT 10.3 (JetPack 6) leaves DynamicPluginTensorDesc::opt empty in configurePlugin. Substitute max so
+//! profile validation sees a concrete shape; later TensorRT versions always fill opt, so this is a no-op there.
 inline std::vector<nvinfer1::DynamicPluginTensorDesc> fillMissingOptProfile(
     nvinfer1::DynamicPluginTensorDesc const* desc, int32_t count)
 {
