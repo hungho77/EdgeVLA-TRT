@@ -70,12 +70,25 @@ KV reuse restores 41% of prompt tokens over the episode (256–768 per replan). 
 no-cache run in every configuration. Another GPU job shared the board during part of the measurement, so absolute
 times vary between runs; the ordering held in every run.
 
+The same comparison on real navigation input, R2R trajectory 1304 in Matterport3D scene `gZ6f7yhEvPG` rendered by
+VLN-PE (102 frames, its R2R instruction; prepared with
+[`prepare_vlnpe_episode.py`](experimental_models/internvla_n1/examples/prepare_vlnpe_episode.py)), averaged over the
+94 nine-frame replans:
+
+| Configuration | Mean replan | vs. no cache |
+|---|---|---|
+| No cache | 2009 ms | — |
+| Encoder partial hits | 1429 ms | −29% |
+| Encoder partial hits + KV prefix reuse | 938 ms | −53% |
+
+KV reuse restores 38% of the episode's prompt tokens; `z_latents` are again bit-identical to the no-cache run.
+
 Reuse applies to VLAs with a **causal** VLM backbone (InternVLA-N1, GR00T, Alpamayo). Models whose image+text prefix
 attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 
 ### Roadmap
 
-1. **InternVLA-N1 pilot**: done (above). Remaining: measure with real habitat-sim frames.
+1. **InternVLA-N1 pilot**: done (above), measured on synthetic and real rendered navigation episodes.
 2. **Shared `vla/` layer**: observation encoder, causal backbone on the core runtime, action head
    (flow matching / diffusion / autoregressive), and a dual-rate scheduler; port GR00T N1.6/N1.7 onto it.
 3. **Bidirectional-prefix VLAs** (pi0.5, SmolVLA): encoder cache, persistent CUDA graphs, prefix KV pool in
