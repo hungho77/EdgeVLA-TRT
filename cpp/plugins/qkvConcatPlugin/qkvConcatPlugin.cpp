@@ -16,6 +16,7 @@
  */
 
 #include "qkvConcatPlugin.h"
+#include "plugins/trt103OptCompat.h"
 #include "common/logger.h"
 
 #include <cstddef>
@@ -203,6 +204,13 @@ bool QkvConcatPlugin::supportsFormatCombination(
 int32_t QkvConcatPlugin::configurePlugin(
     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
+    auto const inWithOpt = plugins::fillMissingOptProfile(in, nbInputs);
+    auto const outWithOpt = plugins::fillMissingOptProfile(out, nbOutputs);
+    if (!inWithOpt.empty() && !outWithOpt.empty())
+    {
+        in = inWithOpt.data();
+        out = outWithOpt.data();
+    }
     if (in == nullptr || out == nullptr || nbInputs != kNUM_INPUTS || nbOutputs != kNUM_OUTPUTS)
     {
         LOG_ERROR("QkvConcatPlugin: expected three inputs and one output");
