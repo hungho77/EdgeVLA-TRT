@@ -13,15 +13,10 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_executable(gr00t_backbone_dump gr00t_backbone_dump.cpp)
+add_library(gr00tExperimental STATIC gr00tN17ActionRunner.cpp gr00tKernels.cu)
 target_include_directories(
-  gr00t_backbone_dump PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
-                              ${ONNX_PARSER_INCLUDE_DIR})
-target_link_libraries(gr00t_backbone_dump PRIVATE edgellmCore commonLibraryExt)
-
-add_executable(gr00t_policy_inference gr00t_policy_inference.cpp)
-target_include_directories(
-  gr00t_policy_inference PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
-                                 ${ONNX_PARSER_INCLUDE_DIR})
-target_link_libraries(gr00t_policy_inference
-                      PRIVATE gr00tExperimental edgellmCore commonLibraryExt)
+  gr00tExperimental
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+  PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
+          ${ONNX_PARSER_INCLUDE_DIR})
+set_property(TARGET gr00tExperimental PROPERTY POSITION_INDEPENDENT_CODE ON)
