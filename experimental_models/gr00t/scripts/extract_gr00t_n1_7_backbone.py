@@ -18,7 +18,7 @@ GR00T N1.7 stores its fine-tuned Cosmos-Reason2 (Qwen3-VL) backbone under
 ``backbone.model.*`` with only the first ``select_layer`` decoder layers. This
 writes those weights under Hugging Face Qwen3-VL names, next to the base
 model's config (decoder truncated to ``select_layer``) and processor files, and
-sets ``emit_hidden_states`` so the engine returns the full-sequence post-norm
+sets ``emit_hidden_states`` so the engine returns the full-sequence pre-norm
 hidden states the action head cross-attends to.
 
     python extract_gr00t_n1_7_backbone.py --gr00t MODEL_ZOO/GR00T-N1.7-SO101-Multitask \\
@@ -59,8 +59,11 @@ def main() -> None:
     if "layer_types" in config["text_config"]:
         config["text_config"]["layer_types"] = config["text_config"][
             "layer_types"][:select_layer]
-    # GR00T N1.7 reads hidden_states[-1] under transformers 4.57, which is the post-norm output.
-    config["emit_hidden_states"] = "post_norm"
+    # GR00T pops the extra layers off a full-depth model, and its hidden_states[-1] is then the last kept layer's
+    # output before the final norm (checked against the official Gr00tPolicy). A checkpoint that is truncated
+    # through num_hidden_layers instead returns the post-norm tensor from transformers, which the head was not
+    # trained on.
+    config["emit_hidden_states"] = "pre_norm"
     config["gr00t_select_layer"] = select_layer
     with open(os.path.join(args.out, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
