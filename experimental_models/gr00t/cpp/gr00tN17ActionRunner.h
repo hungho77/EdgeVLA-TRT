@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace trt_edgellm
@@ -52,6 +53,16 @@ public:
     };
 
     Gr00tN17ActionRunner(std::string const& engineDir, cudaStream_t stream);
+    ~Gr00tN17ActionRunner() noexcept;
+
+    Gr00tN17ActionRunner(Gr00tN17ActionRunner const&) = delete;
+    Gr00tN17ActionRunner& operator=(Gr00tN17ActionRunner const&) = delete;
+
+    //! Replay the denoising loop as a CUDA graph, captured once per backbone token count (default on).
+    void setUseCudaGraph(bool enable) noexcept
+    {
+        mUseCudaGraph = enable;
+    }
 
     Config const& config() const noexcept
     {
@@ -79,6 +90,7 @@ private:
     void loadEngine(std::string const& path, Engine& engine, cudaStream_t stream);
     void bind(Engine& engine, char const* name, void const* address);
     void setShape(Engine& engine, char const* name, std::vector<int64_t> const& shape);
+    void enqueueDenoiseLoop(cudaStream_t stream);
 
     Config mConfig;
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
@@ -103,6 +115,9 @@ private:
     rt::Tensor mVelStrength;
     rt::Tensor mTimesteps; //!< [numInferenceTimesteps] INT64, one bucket per step
     rt::Tensor mDt;        //!< scalar FP32
+
+    bool mUseCudaGraph{true};
+    std::unordered_map<int64_t, cudaGraphExec_t> mDenoiseGraphs; //!< keyed by backbone token count
 };
 
 } // namespace gr00t

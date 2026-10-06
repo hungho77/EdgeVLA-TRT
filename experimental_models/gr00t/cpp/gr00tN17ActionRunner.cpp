@@ -200,13 +200,16 @@ void Gr00tN17ActionRunner::encodeState(std::vector<float> const& state, cudaStre
     ELLM_CHECK(mStateEncoder.context->enqueueV3(stream), "Gr00tN17ActionRunner: state_encoder enqueue failed");
 }
 
-rt::Tensor const& Gr00tN17ActionRunner::sample(rt::Tensor const& noise, cudaStream_t stream)
+Gr00tN17ActionRunner::~Gr00tN17ActionRunner() noexcept
 {
-    ELLM_CHECK(mTokens > 0, "Gr00tN17ActionRunner::sample: call prepare() first");
-    size_t const actionBytes = static_cast<size_t>(mConfig.actionHorizon) * mConfig.actionDim * sizeof(float);
-    CUDA_CHECK(
-        cudaMemcpyAsync(mActions[0].rawPointer(), noise.rawPointer(), actionBytes, cudaMemcpyDeviceToDevice, stream));
+    for (auto& [tokens, graph] : mDenoiseGraphs)
+    {
+        cudaGraphExecDestroy(graph);
+    }
+}
 
+void Gr00tN17ActionRunner::enqueueDenoiseLoop(cudaStream_t stream)
+{
     int64_t const inner = mConfig.crossInnerDim;
     setShape(mDenoise, "cross_keys", {mConfig.numCrossBlocks, 1, mTokens, inner});
     setShape(mDenoise, "cross_values", {mConfig.numCrossBlocks, 1, mTokens, inner});
@@ -219,7 +222,6 @@ rt::Tensor const& Gr00tN17ActionRunner::sample(rt::Tensor const& noise, cudaStre
     bind(mDenoise, "image_bias", mImageBias.rawPointer());
     bind(mDenoise, "vel_strength", mVelStrength.rawPointer());
     bind(mDenoise, "dt", mDt.rawPointer());
-
     int32_t current = 0;
     for (int32_t step = 0; step < mConfig.numInferenceTimesteps; ++step)
     {
@@ -229,7 +231,38 @@ rt::Tensor const& Gr00tN17ActionRunner::sample(rt::Tensor const& noise, cudaStre
         ELLM_CHECK(mDenoise.context->enqueueV3(stream), "Gr00tN17ActionRunner: denoise_step enqueue failed");
         current = 1 - current;
     }
-    return mActions[current];
+}
+
+rt::Tensor const& Gr00tN17ActionRunner::sample(rt::Tensor const& noise, cudaStream_t stream)
+{
+    ELLM_CHECK(mTokens > 0, "Gr00tN17ActionRunner::sample: call prepare() first");
+    size_t const actionBytes = static_cast<size_t>(mConfig.actionHorizon) * mConfig.actionDim * sizeof(float);
+    // Outside the graph, so callers may pass any noise buffer.
+    CUDA_CHECK(
+        cudaMemcpyAsync(mActions[0].rawPointer(), noise.rawPointer(), actionBytes, cudaMemcpyDeviceToDevice, stream));
+
+    auto const cached = mDenoiseGraphs.find(mTokens);
+    if (mUseCudaGraph && cached != mDenoiseGraphs.end())
+    {
+        CUDA_CHECK(cudaGraphLaunch(cached->second, stream));
+    }
+    else
+    {
+        // TensorRT needs one regular enqueue for these shapes before its kernels can be captured.
+        enqueueDenoiseLoop(stream);
+        if (mUseCudaGraph)
+        {
+            cudaGraph_t graph{};
+            CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            enqueueDenoiseLoop(stream);
+            CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+            cudaGraphExec_t exec{};
+            CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+            mDenoiseGraphs.emplace(mTokens, exec);
+        }
+    }
+    return mActions[mConfig.numInferenceTimesteps % 2];
 }
 
 } // namespace gr00t
