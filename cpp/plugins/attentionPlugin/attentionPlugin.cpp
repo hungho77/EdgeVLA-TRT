@@ -16,6 +16,7 @@
  */
 
 #include "attentionPlugin.h"
+#include "plugins/trt103OptCompat.h"
 
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
@@ -1225,6 +1226,13 @@ bool AttentionPlugin::supportsFormatCombination(
 int32_t AttentionPlugin::configurePlugin(
     DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
 {
+    auto const inWithOpt = plugins::fillMissingOptProfile(in, nbInputs);
+    auto const outWithOpt = plugins::fillMissingOptProfile(out, nbOutputs);
+    if (!inWithOpt.empty() && !outWithOpt.empty())
+    {
+        in = inWithOpt.data();
+        out = outWithOpt.data();
+    }
     AttentionInputLayout const inputLayout = resolveAttentionInputLayout(mEnableQKNorm != 0,
         mEnableContextMaskSelector != 0, mEnableTreeAttention != 0, mEnableVisionBlockAttention != 0,
         mSkipSoftmaxScaleFactor > 0.F, mSupportsBoundedKVCache, mEnableAttentionSink != 0);
