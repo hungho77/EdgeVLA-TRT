@@ -1,154 +1,85 @@
 <div align="center">
 
-# TensorRT Edge-LLM
+# EdgeVLA
 
-**High-Performance Large Language Model Inference Framework for NVIDIA Edge Platforms**
+**Vision-Language-Action inference on NVIDIA Jetson, built on NVIDIA TensorRT Edge-LLM**
 
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/TensorRT-Edge-LLM/)
-[![version](https://img.shields.io/badge/release-0.11.0-green)](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/tensorrt_edgellm/_version.py)
-[![license](https://img.shields.io/badge/license-Apache%202-blue)](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/LICENSE)
+[![upstream](https://img.shields.io/badge/built%20on-TensorRT%20Edge--LLM%200.11.0-76b900)](https://github.com/NVIDIA/TensorRT-Edge-LLM)
+[![license](https://img.shields.io/badge/license-Apache%202-blue)](LICENSE)
+[![platform](https://img.shields.io/badge/tested-AGX%20Orin%20JetPack%206.2-lightgrey)](JETPACK6.md)
 
-[Overview](https://nvidia.github.io/TensorRT-Edge-LLM/latest/overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Support Matrix](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Quick Start](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Performance](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/performance/performance-benchmarks.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](https://nvidia.github.io/TensorRT-Edge-LLM/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3ARoadmap)
+</div>
 
----
-<div align="left">
+EdgeVLA is a fork of [NVIDIA TensorRT Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM) focused on
+Vision-Language-Action (VLA), vision-language navigation (VLN) and world-action models on edge devices. It keeps
+Edge-LLM's export → engine build → C++ runtime pipeline and adds VLA models, VLA-oriented runtime work, and
+support for platforms upstream no longer targets.
 
-## Latest News
+> EdgeVLA is an independent project. It is not an NVIDIA product and is not endorsed by NVIDIA. NVIDIA and
+> TensorRT are trademarks of NVIDIA Corporation. Code from upstream keeps its NVIDIA copyright headers and is
+> distributed under the Apache License 2.0.
 
-- **[2026/09]** [TensorRT Edge-LLM completes the MLPerf Edge Agentic benchmark 6.4x faster on Jetson AGX Thor](https://developer.nvidia.com/blog/tensorrt-edge-llm-completes-the-mlperf-edge-agentic-benchmark-6-4x-faster-on-jetson-agx-thor/).
-- **[2026/09]** Release **0.11.0** adds [published Python wheels](docs/source/user_guide/getting_started/installation.md#published-python-wheel), [Muse-Glimmer](https://huggingface.co/meta-models/Muse-Glimmer-30B), experimental [pi0.5](docs/source/user_guide/examples/vla/pi05.md), Hunyuan dense models, [guided decoding](docs/source/user_guide/examples/experimental-server.md#structured-output), opt-in [in-flight batching](docs/source/user_guide/features/in-flight-batching.md), native provider Jinja chat templates, and GPU-free CuTe DSL artifact generation.
-- **[2026/09]** Release **0.10.1** adds experimental [**TP=2 inference on Dual NVIDIA DGX Spark**](docs/source/user_guide/features/multi-device.md) and redesigns the experimental [OpenAI-compatible server](docs/source/user_guide/examples/experimental-server.md) for faster cold launches and lower memory usage.
-- **[2026/08]** TensorRT Edge-LLM **0.10.0** adds Day-0 support for [**Qwen3.8-27B**](https://huggingface.co/Qwen/Qwen3.8-27B).
-- **[2026/08]** Release **0.10.0** adds support for [**NVIDIA Nemotron-3.5 Lightning**](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4) with **MTP** and **DFlash**, [**Cosmos3-Edge**](https://huggingface.co/nvidia/Cosmos3-Edge), [**DiffusionGemma**](https://huggingface.co/nvidia/diffusiongemma-26B-A4B-it-NVFP4), [**Nemotron-3.5-ASR**](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b), and [**DSpark**](docs/source/user_guide/examples/speculative-decoding.md#dspark) speculative decoding, alongside an experimental [direct TensorRT engine builder](docs/source/user_guide/getting_started/direct-engine-builder.md) without ONNX export, multi-turn KV-cache reuse, and video input for the experimental OpenAI-compatible server.
-- **[2026/07]** Support for the full **Gemma 4** family (E2B / E4B / 12B / 26B-A4B / 31B — multimodal text + image + audio, with MTP), **Qwen3-Omni** and **Nemotron-3** NVFP4, and **DFlash** speculative decoding (with DDTree for Qwen3 / Qwen3.5) landed across releases 0.9.0 and 0.9.1.
+## What this fork adds
 
----
+| Area | Status | Details |
+|---|---|---|
+| InternVLA-N1-DualVLN (VLN) | Export → build → inference verified on AGX Orin (JetPack 6.2) | [Guide](docs/source/user_guide/examples/vla/internvla_n1.md) · [runtime](experimental_models/internvla_n1/README.md) |
+| JetPack 6 (CUDA 12.6, TensorRT 10.3) | Runs 0.11 on AGX Orin | [JETPACK6.md](JETPACK6.md) |
+| Exact asymmetric INT4 AWQ | Engine output matches the exactly dequantized checkpoint token-for-token | [FIXES.md](FIXES.md) |
+| NVFP4 AWQ `pre_quant_scale`, NVFP4 CASK epilogue cap (TRT 10.13/10.14) | Fixed; needs Thor to verify | [FIXES.md](FIXES.md) |
+| InternLM2-backed InternVL3 checkpoints | Converter | `tensorrt_edgellm/scripts/convert_internlm2_internvl.py` |
 
-## Overview
+Upstream VLA support (experimental pi0.5, Alpamayo, Cosmos3-Edge policy) is unchanged and documented under
+[docs/source/user_guide/examples/vla](docs/source/user_guide/examples/vla/index.md).
 
-TensorRT Edge-LLM is NVIDIA's C++ inference runtime for text, vision, audio, speech, and action models on NVIDIA Jetson, NVIDIA DRIVE, and NVIDIA DGX Spark. The supported frontend exports Hugging Face checkpoints to [ONNX](https://onnx.ai) for C++ engine building; an experimental direct frontend builds engines from checkpoints without ONNX. Both paths use the same C++ deployment runtimes.
+### Measured on AGX Orin 64 GB, JetPack 6.2
 
----
+InternVLA-N1-DualVLN, FP16 System 2 (Qwen2.5-VL-7B), BF16 System 1, `--ticks 40 --cadence 4`:
 
-## Getting Started
+| Metric | Value |
+|---|---|
+| First plan | 181 ms (System 2 text-only, as in the CLI example) |
+| System-1 tick, mean / worst | 188 ms (5.3 Hz) / 314 ms |
 
-Check the [**Official Support Matrix**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html), then follow the [**Quick Start Guide**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html). Checkpoint IDs are listed in [**Supported Models**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/supported-models.html).
+The LLM engine was built with `--maxInputLen 2048 --maxKVCacheCapacity 2560` to fit beside the other engines.
 
-For a supported target, install a [published Python wheel](docs/source/user_guide/getting_started/installation.md#published-python-wheel)
-without compiling Edge-LLM. Use `tensorrt-edgellm[server]` for the high-level
-Python API and HTTP serving; see the [extras guide](docs/source/user_guide/getting_started/installation.md#optional-python-dependencies)
-for export/tools dependencies and the minimal base workflow.
+## Roadmap: KV-cache reuse for VLA control loops
 
-Install the base package from PyPI (requires a supported CUDA/TensorRT stack):
+Edge-LLM 0.11 has page-granular context reuse (`--enableContextReuse`), an encoder embedding cache, cross-request
+KV retention and FP8 KV. None of the VLA paths reuse KV across control steps today: each replan or action chunk
+recomputes the full prefix. Reuse applies to VLAs with a **causal** VLM backbone (InternVLA-N1, GR00T, Alpamayo);
+models whose image+text prefix attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
+
+1. **InternVLA-N1 pilot**: allow hidden-state capture with the context cache, lay the prompt out
+   static-text → episode history → latent queries, enable the encoder cache for history frames, and measure
+   replan latency on Orin with real frames.
+2. **Shared `vla/` layer**: observation encoder, causal backbone on the core runtime, action head
+   (flow matching / diffusion / autoregressive), and a dual-rate scheduler; port GR00T N1.6/N1.7 onto it.
+3. **Bidirectional-prefix VLAs** (pi0.5, SmolVLA): encoder cache, persistent CUDA graphs, prefix KV pool in
+   the core runtime.
+
+## Getting started
+
+The build, export and runtime workflow is upstream's:
+[installation](docs/source/user_guide/getting_started/installation.md),
+[quick start](docs/source/user_guide/getting_started/quick-start-guide.md),
+[supported models](docs/source/user_guide/getting_started/supported-models.md).
+On JetPack 6 follow [JETPACK6.md](JETPACK6.md) instead of the JetPack 7 build line.
 
 ```bash
-pip install tensorrt-edgellm==0.11.0
+git clone --recurse-submodules https://github.com/hungho77/edge-vla.git
 ```
 
----
+Python packages, CLI names (`tensorrt-edgellm-*`) and C++ namespaces keep their upstream names so that
+upstream releases merge cleanly.
 
-## Documentation
+## Upstream sync
 
-### Introduction
-
-- **[Overview](https://nvidia.github.io/TensorRT-Edge-LLM/latest/overview.html)** - What is TensorRT Edge-LLM and key features
-- **[Official Support Matrix](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html)** - Platform, JetPack, DriveOS, CUDA, TensorRT, and TensorRT Edge-LLM compatibility
-- **[Supported Models](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/supported-models.html)** - Complete model compatibility matrix
-- **[Checkpoint Exporter](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/checkpoint-export.html)** - Recommended ONNX export pipeline
-- **[Experimental Direct Engine Builder](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/direct-engine-builder.html)** - Build all model components directly from a checkpoint
-
-### User Guide
-
-- **[Installation](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/installation.html)** - Set up quantization, `tensorrt_edgellm`, and the C++ runtime
-- **[Quick Start Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html)** - Run your first inference in ~15 minutes
-- **[Examples](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/examples/index.html)** - End-to-end workflows
-- **[Quantization](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/features/quantization.html)** - Create quantized checkpoints for `tensorrt_edgellm`
-- **[Experimental High-Level Python API and Server](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/examples/experimental-server.html)** - vLLM-style API and OpenAI-compatible server
-- **[Input Format Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/format/input-format.html)** - Request format and specifications
-- **[Chat Template Format](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/format/chat-template-format.html)** - Chat template configuration
-
-### Developer Guide
-
-#### Software Design
-
-- **[Quantization Package Design](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/quantization-design.html)** - Quantization package architecture
-- **[Engine Builder](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/engine-builder.html)** - Building TensorRT engines
-- **[C++ Runtime Overview](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/cpp-runtime-overview.html)** - Runtime system architecture
-  - [LLM Inference Runtime](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/software-design/llm-inference-runtime.html)
-
-#### Advanced Topics
-
-- **[Customization Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/customization/customization-guide.html)** - Customizing TensorRT Edge-LLM for your needs
-- **[TensorRT Plugins](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/customization/tensorrt-plugins.html)** - Custom plugin development
-- **[Tests](tests/)** - Comprehensive test suite for contributors
-
----
-
-## Performance
-
-See the [**Performance Benchmarks**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/performance/performance-benchmarks.html) page for released benchmark results covering LLM and VLM prefill, generation throughput, memory usage, and EAGLE speculative decoding speedups.
-
----
-
-## Use Cases
-
-**🚗 Automotive**
-- In-vehicle AI assistants
-- Voice-controlled interfaces
-- Scene understanding
-- Driver assistance systems
-
-**🤖 Robotics**
-- Natural language interaction
-- Task planning and reasoning
-- Visual question answering
-- Human-robot collaboration
-
-**🏭 Industrial IoT**
-- Equipment monitoring with NLP
-- Automated inspection
-- Predictive maintenance
-- Voice-controlled machinery
-
-**📱 Edge Devices**
-- On-device chatbots
-- Offline language processing
-- Privacy-preserving AI
-- Low-latency inference
-
----
-
-## Featured Websites
-
-- [TensorRT Edge-LLM Jetson AI Lab tutorial](https://www.jetson-ai-lab.com/tutorials/tensorrt-edge-llm/)
-- [Maximizing Memory Efficiency to Run Bigger Models on NVIDIA Jetson](https://developer.nvidia.com/blog/maximizing-memory-efficiency-to-run-bigger-models-on-nvidia-jetson/)
-- [Build Next-Gen Physical AI with Edge-First LLMs for Autonomous Vehicles and Robotics](https://developer.nvidia.com/blog/build-next-gen-physical-ai-with-edge%E2%80%91first-llms-for-autonomous-vehicles-and-robotics/)
-- [Accelerate AI Inference for Edge and Robotics with NVIDIA Jetson T4000 and NVIDIA JetPack 7.1](https://developer.nvidia.com/blog/accelerate-ai-inference-for-edge-and-robotics-with-nvidia-jetson-t4000-and-nvidia-jetpack-7-1/)
-- [Accelerating LLM and VLM Inference for Automotive and Robotics with NVIDIA TensorRT Edge-LLM](https://developer.nvidia.com/blog/accelerating-llm-and-vlm-inference-for-automotive-and-robotics-with-nvidia-tensorrt-edge-llm/)
-
-Follow our [GitHub repository](https://github.com/NVIDIA/TensorRT-Edge-LLM) for the latest updates, releases, and announcements.
-
----
-
-## Support
-
-- **Documentation**: [Full Documentation](https://nvidia.github.io/TensorRT-Edge-LLM/)
-- **Quick Start**: [Quick Start Guide](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/quick-start-guide.html)
-- **Roadmap**: [Developer Roadmap](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3ARoadmap)
-- **Issues**: [GitHub Issues](https://github.com/NVIDIA/TensorRT-Edge-LLM/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/NVIDIA/TensorRT-Edge-LLM/discussions)
-- **Forums**: [NVIDIA Developer Forums](https://forums.developer.nvidia.com/)
-
----
+`main` tracks NVIDIA TensorRT Edge-LLM releases by merging `upstream/main`
+(`https://github.com/NVIDIA/TensorRT-Edge-LLM`). Fixes that apply upstream are also proposed there; see
+[NVIDIA/TensorRT-Edge-LLM#193](https://github.com/NVIDIA/TensorRT-Edge-LLM/pull/193) for InternVLA-N1.
 
 ## License
 
-[Apache License 2.0](LICENSE)
-
----
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
-
----
+Apache License 2.0; see [LICENSE](LICENSE). Built on
+[NVIDIA TensorRT Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM), Copyright NVIDIA Corporation.
