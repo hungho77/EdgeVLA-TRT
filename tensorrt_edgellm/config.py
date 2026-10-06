@@ -745,6 +745,15 @@ class ModelConfig:
     # raw hidden states.  Default ``0`` leaves every other model untouched.
     n_query: int = 0
     latent_dim: int = 0
+    # ---------------------------------------------------- VLA backbone output
+    # Emit the last decoder layer's full-sequence output as the
+    # ``hidden_states`` engine output. VLA action heads that cross-attend to
+    # the backbone (GR00T) read every position. Set ``emit_hidden_states`` at
+    # the config root to ``true``/``"pre_norm"`` or ``"post_norm"`` (after the
+    # final norm); combine with a truncated ``num_hidden_layers`` to read an
+    # intermediate layer.
+    emit_hidden_states: bool = False
+    emit_hidden_states_post_norm: bool = False
     # -------------------------------------------------- quantization config
     quant: QuantConfig = field(default_factory=QuantConfig)
     # ------------------------------------------ mamba / hybrid config
@@ -1400,6 +1409,10 @@ class ModelConfig:
             # InternVLA-N1 keeps these at the config root, not under a sub-config.
             n_query=int(root.get("n_query") or 0),
             latent_dim=int(root.get("latent_dim") or 0),
+            emit_hidden_states=root.get("emit_hidden_states")
+            in (True, "pre_norm", "post_norm"),
+            emit_hidden_states_post_norm=root.get(
+                "emit_hidden_states") == "post_norm",
             draft_vocab_size=draft_vocab_size,
             target_hidden_size=target_hidden_size,
             is_eagle3_draft_flag=is_eagle3_draft_flag,
