@@ -16,8 +16,8 @@
  */
 
 #include "qkvConcatPlugin.h"
-#include "plugins/trt103OptCompat.h"
 #include "common/logger.h"
+#include "plugins/trt103OptCompat.h"
 
 #include <cstddef>
 #include <cstdint>
