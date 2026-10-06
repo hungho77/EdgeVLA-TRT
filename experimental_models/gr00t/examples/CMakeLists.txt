@@ -1,5 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# All rights reserved. SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
 # use this file except in compliance with the License. You may obtain a copy of
@@ -13,11 +13,8 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-# Experimental models. Each subdirectory is a self-contained model that links
-# the core edgellm libraries (edgellmCore, edgellmBuilder, edgellmKernels, ...).
-
-add_subdirectory(cosmos3)
-add_subdirectory(gr00t)
-add_subdirectory(internvla_n1)
-add_subdirectory(nemotron3_5_asr)
-add_subdirectory(pi05)
+add_executable(gr00t_backbone_dump gr00t_backbone_dump.cpp)
+target_include_directories(
+  gr00t_backbone_dump PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
+                              ${ONNX_PARSER_INCLUDE_DIR})
+target_link_libraries(gr00t_backbone_dump PRIVATE edgellmCore commonLibraryExt)

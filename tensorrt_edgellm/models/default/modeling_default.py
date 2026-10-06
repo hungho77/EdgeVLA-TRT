@@ -929,6 +929,8 @@ class CausalLM(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
+        if getattr(config, "emit_hidden_states", False):
+            self.emit_hidden_states = True
 
         self.model = type(self).transformer_cls(config)
 
@@ -1256,9 +1258,15 @@ class CausalLM(nn.Module):
                 dim=-1).to(torch.float16)
             return hidden_states.reshape(-1, hidden_states.shape[-1])
         if self.emit_hidden_states:
-            hidden_states = self.model.last_pre_norm_hidden_states
+            hidden_states = self._emitted_hidden_states()
             return hidden_states.reshape(-1, hidden_states.shape[-1])
         return None
+
+    def _emitted_hidden_states(self) -> torch.Tensor:
+        hidden_states = self.model.last_pre_norm_hidden_states
+        if getattr(self.config, "emit_hidden_states_post_norm", False):
+            hidden_states = self.model.norm(hidden_states)
+        return hidden_states
 
     def forward(
         self,
@@ -1345,7 +1353,6 @@ class CausalLM(nn.Module):
             # Full-sequence last-layer pre-norm residual, populated by
             # :meth:`Transformer.forward` (see its docstring for the HF
             # hidden_states hook-point alignment).
-            return logits, self.model.last_pre_norm_hidden_states, \
-                present_key_values
+            return logits, self._emitted_hidden_states(), present_key_values
 
         return logits, present_key_values
