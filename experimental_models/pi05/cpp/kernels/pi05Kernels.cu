@@ -45,7 +45,34 @@ __global__ void eulerStepKernel(float* __restrict__ x, float const* __restrict__
     }
 }
 
+__global__ void inpaintStepKernel(float* __restrict__ x, float const* __restrict__ noise,
+    float const* __restrict__ seed, float const* __restrict__ weight, float t, int64_t count, int32_t horizon,
+    int32_t actionDim)
+{
+    int64_t const idx = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+    if (idx >= count)
+    {
+        return;
+    }
+    int64_t const inRequest = idx % (static_cast<int64_t>(horizon) * actionDim);
+    float const w = weight[inRequest / actionDim];
+    if (w > 0.0F)
+    {
+        float const target = t * noise[idx] + (1.0F - t) * seed[inRequest];
+        x[idx] += w * (target - x[idx]);
+    }
+}
+
 } // namespace
+
+void launchInpaintStep(float* x, float const* noise, float const* seed, float const* weight, float t, int32_t batch,
+    int32_t horizon, int32_t actionDim, cudaStream_t stream)
+{
+    constexpr int32_t kBlock = 256;
+    int64_t const count = static_cast<int64_t>(batch) * horizon * actionDim;
+    auto const grid = static_cast<int32_t>((count + kBlock - 1) / kBlock);
+    inpaintStepKernel<<<grid, kBlock, 0, stream>>>(x, noise, seed, weight, t, count, horizon, actionDim);
+}
 
 void launchEulerStep(
     float* x, float const* v, float dt, int64_t count, float* timestep, float nextT, int32_t batch, cudaStream_t stream)

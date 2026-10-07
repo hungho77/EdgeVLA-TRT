@@ -666,7 +666,43 @@ Pi05ActionChunk Pi05Policy::inferTensors(
     return chunk;
 }
 
+std::vector<float> Pi05Policy::encodeActions(
+    std::vector<float> const& robotRows, int32_t rows, std::vector<float> const& adapted) const
+{
+    if (mContract.adapter == Pi05Adapter::kAloha)
+    {
+        throw std::invalid_argument("pi0.5 RTC does not invert the ALOHA output conversion");
+    }
+    int32_t const robotDim = mContract.robotActionDim;
+    requireStateDim(adapted.size(), mContract.stateDim);
+    if (static_cast<int64_t>(robotRows.size()) != static_cast<int64_t>(rows) * robotDim)
+    {
+        throw std::invalid_argument("pi0.5 robot rows do not match rows * robotActionDim");
+    }
+    std::vector<float> out(robotRows.size());
+    for (int32_t t = 0; t < rows; ++t)
+    {
+        for (int32_t d = 0; d < robotDim; ++d)
+        {
+            float x = robotRows[static_cast<size_t>(t) * robotDim + d];
+            if (mContract.adapter == Pi05Adapter::kSo101 && d < kSo101DeltaDims)
+            {
+                x -= adapted[static_cast<size_t>(d)];
+            }
+            float const q01 = mActionStats.q01[static_cast<size_t>(d)];
+            float const q99 = mActionStats.q99[static_cast<size_t>(d)];
+            out[static_cast<size_t>(t) * robotDim + d] = 2.0F * (x - q01) / (q99 - q01 + kQuantileEpsilon) - 1.0F;
+        }
+    }
+    return out;
+}
+
 Pi05ActionChunk Pi05Policy::infer(Pi05Observation const& observation)
+{
+    return infer(observation, nullptr);
+}
+
+Pi05ActionChunk Pi05Policy::infer(Pi05Observation const& observation, Pi05Rtc const* rtc)
 {
     (void) runtime(); // fail before any of the observation work when there are no engines
     using Clock = std::chrono::steady_clock;
@@ -697,11 +733,58 @@ Pi05ActionChunk Pi05Policy::infer(Pi05Observation const& observation)
     auto const observationEnd = Clock::now();
     times.totalMs = std::chrono::duration<double, std::milli>(observationEnd - observationStart).count();
 
+    Pi05PolicyConfig const& cfg = runtime().getConfig();
+    int32_t const horizon = cfg.actionHorizon;
+    int32_t const modelDim = cfg.actionDim;
+    std::vector<float> seed;
+    std::vector<float> weights;
+    if (rtc != nullptr && !mPreviousRobot.empty() && rtc->overlapSteps > 0)
+    {
+        if (observation.batch != 1)
+        {
+            throw std::invalid_argument("pi0.5 RTC continues one episode; it needs batch 1");
+        }
+        int32_t const startRow = rtc->startRow >= 0 ? rtc->startRow : horizon - rtc->overlapSteps;
+        int32_t const overlap = std::min(rtc->overlapSteps, horizon - startRow);
+        if (overlap > 0)
+        {
+            int32_t const robotDim = mContract.robotActionDim;
+            seed.assign(mPreviousNormalized.begin() + static_cast<ptrdiff_t>(startRow) * modelDim,
+                mPreviousNormalized.begin() + static_cast<ptrdiff_t>(startRow + overlap) * modelDim);
+            std::vector<float> const robotRows(mPreviousRobot.begin() + static_cast<ptrdiff_t>(startRow) * robotDim,
+                mPreviousRobot.begin() + static_cast<ptrdiff_t>(startRow + overlap) * robotDim);
+            std::vector<float> const encoded = encodeActions(robotRows, overlap, adapted);
+            for (int32_t t = 0; t < overlap; ++t)
+            {
+                std::copy_n(encoded.begin() + static_cast<ptrdiff_t>(t) * robotDim, robotDim,
+                    seed.begin() + static_cast<ptrdiff_t>(t) * modelDim);
+            }
+            // weight = 1 - ramp, with GR00T's ramp: 1 - exp(-rate * linspace(0, 1, n + 2)), normalized, interior.
+            int32_t const frozen = std::min(rtc->frozenSteps, overlap);
+            int32_t const ramped = overlap - frozen;
+            double const last = std::max(1.0 - std::exp(-static_cast<double>(rtc->rampRate)), 1e-8);
+            for (int32_t t = 0; t < overlap; ++t)
+            {
+                double ramp = 0.0;
+                if (t >= frozen)
+                {
+                    double const u = static_cast<double>(t - frozen + 1) / (ramped + 1);
+                    ramp = (1.0 - std::exp(-rtc->rampRate * u)) / last;
+                }
+                weights.push_back(static_cast<float>(1.0 - ramp));
+            }
+        }
+    }
+    runtime().setInpainting(seed, weights);
+
     Pi05ActionChunk chunk = inferTensors(mPixelValues, tokenIds, observation.batch);
     auto const chunkElems = static_cast<size_t>(chunk.horizon) * chunk.modelActionDim;
     chunk.robotActions = postprocessActions(std::vector<float>(chunk.normalizedActions.begin(),
                                                 chunk.normalizedActions.begin() + static_cast<ptrdiff_t>(chunkElems)),
         chunk.horizon, chunk.modelActionDim, adapted);
+    mPreviousNormalized.assign(
+        chunk.normalizedActions.begin(), chunk.normalizedActions.begin() + static_cast<ptrdiff_t>(chunkElems));
+    mPreviousRobot = chunk.robotActions;
     chunk.prompt = std::move(prompt);
     chunk.timings.observation = times;
     // Widen inferTensors' window to the front end this call also paid for.

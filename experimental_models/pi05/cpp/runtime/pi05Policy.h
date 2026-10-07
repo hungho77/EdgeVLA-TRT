@@ -170,6 +170,19 @@ struct Pi05Timings
     double policyMs{0.0};
 };
 
+//! \brief Real-time chunking: the new chunk's first rows continue the previous chunk from row startRow
+//! (the robot executed startRow of its actions when this one starts). openpi defines no such mode; this is the
+//! runtime's: the previous chunk is kept in robot units and re-encoded against the new request's state, then the
+//! denoise loop inpaints it (see Pi05ActionRunner::setInpainting) with weight 1 on the frozen rows and an
+//! exponential ramp down to free denoising over the rest of the overlap.
+struct Pi05Rtc
+{
+    int32_t overlapSteps{};
+    int32_t frozenSteps{}; //!< rows reproduced exactly, covering the policy latency
+    float rampRate{6.0F};
+    int32_t startRow{-1}; //!< -1: horizon - overlapSteps
+};
+
 //! \brief One policy call's output, with the request record that produced it.
 struct Pi05ActionChunk
 {
@@ -223,6 +236,16 @@ public:
     //! \throws std::runtime_error If this policy was built without engines.
     //! \throws std::invalid_argument If the observation does not fit the contract.
     Pi05ActionChunk infer(Pi05Observation const& observation);
+
+    //! \brief infer() with real-time chunking against the previous chunk of this episode (batch 1 only).
+    Pi05ActionChunk infer(Pi05Observation const& observation, Pi05Rtc const* rtc);
+
+    //! \brief Forget the previous chunk, e.g. at the start of an episode.
+    void resetEpisode() noexcept
+    {
+        mPreviousNormalized.clear();
+        mPreviousRobot.clear();
+    }
 
     //! \brief Run already-canonical tensors, skipping the observation adapters.
     //! For accuracy comparison and profiling: the chunk carries the normalized actions
@@ -305,6 +328,12 @@ public:
     std::vector<float> postprocessActions(std::vector<float> const& normalized, int32_t horizon, int32_t actionDim,
         std::vector<float> const& adapted) const;
 
+    //! \brief Inverse of postprocessActions for \p rows chunk rows: robot actions [rows, robotActionDim()] ->
+    //! normalized [rows, robotActionDim()], relative to \p adapted where the embodiment trains deltas.
+    //! \throws std::invalid_argument For an adapter whose output conversion has no inverse here (ALOHA).
+    std::vector<float> encodeActions(
+        std::vector<float> const& robotRows, int32_t rows, std::vector<float> const& adapted) const;
+
     int32_t robotActionDim() const noexcept
     {
         return mContract.robotActionDim;
@@ -334,8 +363,10 @@ private:
     cudaStream_t mStream{nullptr};
     //! Sized once for every slot the contract declares; a request using fewer reshapes it down.
     rt::Tensor mPixelValues;
-    rt::Tensor mPixelValuesHost;    //!< pinned staging for mPixelValues
-    std::vector<float> mPlanarView; //!< one view's resized CHW float buffer, reused per request
+    rt::Tensor mPixelValuesHost;            //!< pinned staging for mPixelValues
+    std::vector<float> mPlanarView;         //!< one view's resized CHW float buffer, reused per request
+    std::vector<float> mPreviousNormalized; //!< last chunk, [horizon, modelActionDim], for RTC
+    std::vector<float> mPreviousRobot;      //!< last chunk in robot units, [horizon, robotActionDim]
 };
 
 //! \brief The contract's camera order on one line, for help text and diagnostics.

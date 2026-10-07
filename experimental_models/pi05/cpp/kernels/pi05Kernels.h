@@ -34,5 +34,11 @@ namespace pi05
 void launchEulerStep(float* x, float const* v, float dt, int64_t count, float* timestep, float nextT, int32_t batch,
     cudaStream_t stream);
 
+//! Real-time-chunking inpainting on the flow path: x <- x + w[row] * (t * noise + (1 - t) * seed[row] - x) for
+//! every request in the batch. x and noise are [batch, horizon, actionDim]; seed is [horizon, actionDim] and
+//! weight [horizon] (0 leaves a row free). At t = 0 a row with weight 1 equals its seed.
+void launchInpaintStep(float* x, float const* noise, float const* seed, float const* weight, float t, int32_t batch,
+    int32_t horizon, int32_t actionDim, cudaStream_t stream);
+
 } // namespace pi05
 } // namespace trt_edgellm
