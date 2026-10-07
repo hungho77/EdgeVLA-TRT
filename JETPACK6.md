@@ -1,15 +1,17 @@
 # Running 0.11 on JetPack 6 (Orin, CUDA 12.6, TensorRT 10.3)
 
 Upstream 0.11 supports Orin only on JetPack 7.2. This fork also runs export → build → inference on
-JetPack 6.2 AGX Orin. The two source changes below are inert on CUDA 13 / newer TensorRT; the CuTe DSL
-artifacts and the CUDA 12.9 runtime are per-machine setup.
+JetPack 6.2 AGX Orin. The source changes below are inert on CUDA 13 / newer TensorRT (the last one is opt-in at
+export); the CuTe DSL artifacts and the CUDA 12.9 runtime are per-machine setup.
 
-Three gaps, each reproduced on unmodified upstream 0.11:
+Five gaps, each reproduced on unmodified upstream 0.11:
 
 | Gap | Symptom | Handled by |
 |---|---|---|
 | NVRTC 12.6 has no built-in `vector_types.h` etc. | `Failed to NVRTC compile XQA kernel` | `gen_cpp_header.py` embeds the CUDA 12 runtime headers when `CUDART_VERSION < 13000` |
 | TRT 10.3 passes an empty `opt` profile to `configurePlugin` | `QkvConcatPlugin: ... must match for every profile` | `cpp/plugins/trt103OptCompat.h`, applied in Attention and QkvConcat |
+| TRT 10.3's parser predates the TensorRT-native `trt::Attention` / `trt::RotaryEmbedding` ops (pi0.5 vision tower and prefix) | `onnxOpCheckers.cpp ... checkFallbackPluginImporter` on `Attention` nodes | Export with `EDGELLM_PORTABLE_ATTENTION=1`: both ops are lowered to standard ONNX (MatMul, FP32 scale and Softmax, MatMul; Gather + rotate-half). Mask-free, non-causal attention only |
+| pi0.5's action expert fed the AttentionPlugin a Concat of three separate q/k/v projections, and on TRT 10.3 the plugin received the K/V heads ahead of the Q heads (it appended query heads 6 and 7 as K and V). The Qwen-family decoder attention, packed the same way, is unaffected | actions plausible but wrong (first-step velocity cosine 0.976, 10-step chunk cosine -0.22 vs openpi) | `modeling_pi05_action.py` projects QKV with one GEMM over the concatenated weights. Check a new model's per-stage K/V against its reference before trusting end-to-end scores |
 | SM87 prefill attention is CuTe DSL only; the shipped sm_87 archive is CUDA 13 (cubins fail with `CUDA_ERROR_INVALID_IMAGE` on the 12.6 driver) and needs CUDA ≥ 12.8 runtime APIs (`cudaLibrary*`) | `selected prefill kernel is unavailable (... SM=87)` | Generate sm_87 FMHA with the CuTe DSL cu12 toolchain and link the CUDA 12.9 runtime (minor-version compatible with the 12.6 driver) |
 
 ## One-time setup
