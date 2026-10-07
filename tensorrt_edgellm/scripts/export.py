@@ -4145,6 +4145,27 @@ def main() -> None:
          "unless the feature contract names one on its own."),
     )
     p.add_argument(
+        "--pi05-prefix-int8",
+        default=None,
+        help=
+        ("pi0.5 only: export the prefix projections as W8A8 SmoothQuant "
+         "from this activation-statistics file (calibrate_pi05_prefix_int8.py), "
+         "or 'uncalibrated' for placeholder scales (structure and speed only)."
+         ),
+    )
+    p.add_argument("--pi05-prefix-int8-alpha",
+                   type=float,
+                   default=0.5,
+                   help="pi0.5 only: SmoothQuant migration strength.")
+    p.add_argument(
+        "--pi05-prefix-fp16-projections",
+        default="",
+        help=
+        ("pi0.5 only: comma-separated prefix projections kept in FP16, as full module names "
+         "(model.layers.0.mlp.down_proj) or per-layer names (o_proj,down_proj); a whole "
+         "shared-input group stays FP16."),
+    )
+    p.add_argument(
         "--pi05-denoise-steps",
         type=int,
         default=None,
@@ -4633,13 +4654,19 @@ def main() -> None:
     if _is_pi05_checkpoint(model_dir):
         from ..models.pi05.export import export_pi05_components
         requested = [c for c in args.components.split(",") if c] or None
-        export_pi05_components(model_dir,
-                               args.output_dir,
-                               components=requested,
-                               dtype=dtype,
-                               policy_config=args.pi05_policy_config,
-                               num_denoise_steps=args.pi05_denoise_steps,
-                               hoist_adarms_cond=args.pi05_hoist_adarms_cond)
+        export_pi05_components(
+            model_dir,
+            args.output_dir,
+            components=requested,
+            dtype=dtype,
+            policy_config=args.pi05_policy_config,
+            num_denoise_steps=args.pi05_denoise_steps,
+            hoist_adarms_cond=args.pi05_hoist_adarms_cond,
+            prefix_int8=args.pi05_prefix_int8,
+            prefix_int8_alpha=args.pi05_prefix_int8_alpha,
+            prefix_fp16_projections=[
+                p for p in args.pi05_prefix_fp16_projections.split(",") if p
+            ])
         return
 
     has_mtp_draft = _has_mtp(config)

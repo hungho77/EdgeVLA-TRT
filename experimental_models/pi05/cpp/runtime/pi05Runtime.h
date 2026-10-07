@@ -98,6 +98,12 @@ public:
         mActionRunner->setNumDenoiseSteps(steps);
     }
 
+    //! \brief Real-time-chunking inpainting for the next generate() calls; see Pi05ActionRunner::setInpainting.
+    void setInpainting(std::vector<float> const& seed, std::vector<float> const& weights)
+    {
+        mActionRunner->setInpainting(seed, weights);
+    }
+
     //! \brief Build the prefix the graph expects: image features followed by token
     //! embeddings scaled by sqrt(hidden_size), replicated across \p batch.
     //!

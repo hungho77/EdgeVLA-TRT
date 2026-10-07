@@ -77,6 +77,12 @@ public:
     //! addresses; only buffer *contents* change, updated in place on device.
     void setUseCudaGraph(bool enable) noexcept;
 
+    //! \brief Real-time chunking for the following generate() calls: after every Euler step, row r of each
+    //! request's chunk moves towards t * x_0 + (1 - t) * seed[r] by weights[r] (see launchInpaintStep), so rows
+    //! with weight 1 end on their seed. \p seed is [rows, actionDim] in the normalized model space and
+    //! \p weights [rows], rows <= actionHorizon; empty vectors turn it off.
+    void setInpainting(std::vector<float> const& seed, std::vector<float> const& weights);
+
     //! \brief Override the denoise step count for this process (default: contract value).
     void setNumDenoiseSteps(int32_t steps);
 
@@ -127,6 +133,8 @@ private:
     std::vector<float> mExternalNoise;
     bool mUseCudaGraph{false};
     bool mGraphReady{false};
+    bool mInpaint{false};
+    bool mGraphInpaint{false}; //!< whether the captured graph carries the inpainting launches
     cudaGraph_t mGraph{nullptr};
     cudaGraphExec_t mGraphExec{nullptr};
     //! The K/V addresses mGraph baked in; empty while no graph is captured.
@@ -165,7 +173,12 @@ private:
     rt::Tensor mActionPosIds;
     rt::Tensor mActionPosIdsHost;
 
-    rt::Tensor mNoiseDevice; //!< current x_t, FLOAT32 [B, H, actionDim]
+    rt::Tensor mNoiseInit;         //!< x_0 for inpainting, FLOAT32 [B, H, actionDim]
+    rt::Tensor mInpaintSeed;       //!< [H, actionDim]
+    rt::Tensor mInpaintWeight;     //!< [H]
+    rt::Tensor mInpaintSeedHost;   //!< pinned staging
+    rt::Tensor mInpaintWeightHost; //!< pinned staging
+    rt::Tensor mNoiseDevice;       //!< current x_t, FLOAT32 [B, H, actionDim]
     rt::Tensor mNoiseHost;
     rt::Tensor mPredDevice; //!< velocity v_t from the action engine
     rt::Tensor mTimestepDevice;

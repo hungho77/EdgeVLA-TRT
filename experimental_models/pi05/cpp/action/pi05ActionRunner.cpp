@@ -114,6 +114,14 @@ void Pi05ActionRunner::allocateTensors()
     mActionPosIdsHost = rt::Tensor({maxBatch, horizon}, rt::DeviceType::kCPU, DataType::kINT32, "pi05::actionPosHost");
 
     mNoiseDevice = rt::Tensor({maxBatch, horizon, actionDim}, rt::DeviceType::kGPU, DataType::kFLOAT, "pi05::noise");
+    mNoiseInit = rt::Tensor({maxBatch, horizon, actionDim}, rt::DeviceType::kGPU, DataType::kFLOAT, "pi05::noiseInit");
+    mInpaintSeed = rt::Tensor({horizon, actionDim}, rt::DeviceType::kGPU, DataType::kFLOAT, "pi05::inpaintSeed");
+    mInpaintWeight
+        = rt::Tensor(std::vector<int64_t>{horizon}, rt::DeviceType::kGPU, DataType::kFLOAT, "pi05::inpaintWeight");
+    mInpaintSeedHost
+        = rt::Tensor({horizon, actionDim}, rt::DeviceType::kCPU, DataType::kFLOAT, "pi05::inpaintSeedHost");
+    mInpaintWeightHost
+        = rt::Tensor(std::vector<int64_t>{horizon}, rt::DeviceType::kCPU, DataType::kFLOAT, "pi05::inpaintWeightHost");
     mNoiseHost = rt::Tensor({maxBatch, horizon, actionDim}, rt::DeviceType::kCPU, DataType::kFLOAT, "pi05::noiseHost");
     mPredDevice = rt::Tensor({maxBatch, horizon, actionDim}, rt::DeviceType::kGPU, DataType::kFLOAT, "pi05::pred");
     mTimestepDevice
@@ -315,6 +323,26 @@ bool Pi05ActionRunner::capturedKVCacheMoved(std::vector<rt::Tensor> const& kvCac
     return false;
 }
 
+void Pi05ActionRunner::setInpainting(std::vector<float> const& seed, std::vector<float> const& weights)
+{
+    int32_t const horizon = mConfig.actionHorizon;
+    int32_t const actionDim = mConfig.actionDim;
+    auto const rows = static_cast<int64_t>(weights.size());
+    if (rows > horizon || static_cast<int64_t>(seed.size()) != rows * actionDim)
+    {
+        throw std::invalid_argument("pi0.5 inpainting needs seed [rows, " + std::to_string(actionDim)
+            + "] and weights [rows] with rows <= " + std::to_string(horizon));
+    }
+    // generate() drains the stream before returning, so no earlier upload still reads these.
+    float* seedHost = mInpaintSeedHost.dataPointer<float>();
+    float* weightHost = mInpaintWeightHost.dataPointer<float>();
+    std::fill_n(seedHost, static_cast<size_t>(horizon) * actionDim, 0.0F);
+    std::fill_n(weightHost, horizon, 0.0F);
+    std::copy(seed.begin(), seed.end(), seedHost);
+    std::copy(weights.begin(), weights.end(), weightHost);
+    mInpaint = rows > 0;
+}
+
 void Pi05ActionRunner::setInitialNoise(std::vector<float> noise)
 {
     mExternalNoise = std::move(noise);
@@ -378,7 +406,7 @@ std::vector<float> Pi05ActionRunner::generate(std::vector<rt::Tensor>& kvCache, 
     }
 
     cudaEventRecord(mBegin, mStream);
-    if (batch != mActiveBatch || capturedKVCacheMoved(kvCache))
+    if (batch != mActiveBatch || capturedKVCacheMoved(kvCache) || mInpaint != mGraphInpaint)
     {
         // A capture bakes in the batch-dependent shapes, the cache addresses and the
         // modulation stride, but not prefixLen: it reaches only buffers that keep their
@@ -402,6 +430,15 @@ std::vector<float> Pi05ActionRunner::generate(std::vector<rt::Tensor>& kvCache, 
     auto resetLoopState = [&] {
         CUDA_CHECK(cudaMemcpyAsync(mNoiseDevice.rawPointer(), mNoiseHost.rawPointer(), elems * sizeof(float),
             cudaMemcpyHostToDevice, mStream));
+        if (mInpaint)
+        {
+            CUDA_CHECK(cudaMemcpyAsync(mNoiseInit.rawPointer(), mNoiseHost.rawPointer(), elems * sizeof(float),
+                cudaMemcpyHostToDevice, mStream));
+            CUDA_CHECK(cudaMemcpyAsync(mInpaintSeed.rawPointer(), mInpaintSeedHost.rawPointer(),
+                mInpaintSeedHost.getMemoryCapacity(), cudaMemcpyHostToDevice, mStream));
+            CUDA_CHECK(cudaMemcpyAsync(mInpaintWeight.rawPointer(), mInpaintWeightHost.rawPointer(),
+                mInpaintWeightHost.getMemoryCapacity(), cudaMemcpyHostToDevice, mStream));
+        }
         if (!mConfig.hoistedAdarmsCond)
         {
             for (int32_t i = 0; i < activeBatch; ++i)
@@ -526,6 +563,12 @@ std::vector<float> Pi05ActionRunner::generate(std::vector<rt::Tensor>& kvCache, 
             launchEulerStep(mNoiseDevice.dataPointer<float>(), mPredDevice.dataPointer<float>(), dt,
                 static_cast<int64_t>(elems), mConfig.hoistedAdarmsCond ? nullptr : mTimestepDevice.dataPointer<float>(),
                 nextT, activeBatch, mStream);
+            if (mInpaint)
+            {
+                launchInpaintStep(mNoiseDevice.dataPointer<float>(), mNoiseInit.dataPointer<float>(),
+                    mInpaintSeed.dataPointer<float>(), mInpaintWeight.dataPointer<float>(), nextT, activeBatch, horizon,
+                    actionDim, mStream);
+            }
         }
         return true;
     };
@@ -597,6 +640,7 @@ std::vector<float> Pi05ActionRunner::generate(std::vector<rt::Tensor>& kvCache, 
                         mGraphKVCache[i] = kvCache[i].rawPointer();
                     }
                     mGraphReady = true;
+                    mGraphInpaint = mInpaint;
                     LOG_INFO("Captured the pi0.5 denoise loop (%d steps) into one CUDA graph", mNumDenoiseSteps);
                 }
             }

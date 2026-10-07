@@ -31,3 +31,11 @@ target_include_directories(
   pi05_policy_inference PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
                                 ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(pi05_policy_inference)
+
+add_executable(pi05_async_control pi05_async_control.cpp)
+target_link_libraries(
+  pi05_async_control PRIVATE pi05Experimental vlaExperimental edgellmCore
+                             commonLibraryExt)
+target_include_directories(pi05_async_control PRIVATE ${CMAKE_SOURCE_DIR}/cpp
+                                                      ${COMMON_INCLUDE_DIRS})
+add_cross_build_link_options(pi05_async_control)

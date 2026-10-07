@@ -20,6 +20,7 @@
 #include "runtime/pi05Policy.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -429,6 +430,36 @@ TEST_F(Pi05PolicyTest, So101ArmJointsAreDeltasFromTheRequestState)
     std::vector<float> const shifted = policy.postprocessActions(normalized, kHorizon, 32, moved);
     EXPECT_NEAR(shifted[0], robot[0] + 2.0F, 1e-4F);
     EXPECT_NEAR(shifted[5], robot[5], 1e-4F);
+}
+
+//! The RTC seed: robot actions re-encoded against a later state must decode back to the same robot actions.
+TEST_F(Pi05PolicyTest, So101RtcSeedRoundTripsThroughAMovedState)
+{
+    pi05::Pi05Policy const policy = makePolicy(contractCase("pi05_so101"));
+    std::vector<float> normalized(32, 0.0F);
+    std::vector<float> const row{0.2502F, 0.7944F, 0.5514F, -0.5496F, -0.3997F, 0.7471F};
+    std::copy(row.begin(), row.end(), normalized.begin());
+    std::vector<float> const state = policy.adaptInputState(contractCase("pi05_so101").state);
+    std::vector<float> const robot = policy.postprocessActions(normalized, 1, 32, state);
+
+    std::vector<float> moved = state;
+    for (float& v : moved)
+    {
+        v += 3.0F;
+    }
+    std::vector<float> const seed = policy.encodeActions(robot, 1, moved);
+    std::vector<float> padded(32, 0.0F);
+    std::copy(seed.begin(), seed.end(), padded.begin());
+    std::vector<float> const decoded = policy.postprocessActions(padded, 1, 32, moved);
+    for (size_t d = 0; d < robot.size(); ++d)
+    {
+        EXPECT_NEAR(decoded[d], robot[d], 1e-3F) << "dim " << d;
+    }
+    // Relative to the moved state the arm joints encode differently; the absolute gripper does not.
+    EXPECT_GT(std::fabs(seed[0] - row[0]), 1e-3F);
+    EXPECT_NEAR(seed[5], row[5], 1e-5F);
+    EXPECT_THROW(makePolicy(contractCase("pi05_aloha")).encodeActions({}, 0, std::vector<float>(14, 0.0F)),
+        std::invalid_argument);
 }
 
 //! 8x8 -> 7x7 is LIBERO's 256 -> 224 ratio. Only a real downscale widens the filter
