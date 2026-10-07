@@ -33,11 +33,26 @@ as for pi0.5.
   with the newline step; RTC as for pi0.5 but with no delta re-encoding (absolute actions), async through
   `vla::AsyncChunker`.
 
+## Status
+
+Export done (`python -m tensorrt_edgellm.models.smolvla.export <checkpoint> <out_dir>`): plain PyTorch
+modules with explicit masks, standard ONNX ops only, so the same code runs eagerly and builds on
+TensorRT 10.3 (`trtexec --stronglyTyped`). On `smolvla-so101-multitask`, AGX Orin, frame 300 of the
+dataset, against LeRobot FP32 with the same x_0:
+
+| Stage | Result |
+|---|---|
+| PyTorch modules (FP32) vs LeRobot | normalized chunk cosine 1.000000, max \|d\| 2e-6 |
+| TensorRT engines (FP16) vs LeRobot | cosine 0.999999, max \|d\| 0.0053 |
+| Engine time, 2 cameras (Python driver) | visual 36 ms, prefix 13 ms, 10 denoise steps 68 ms; 116 ms |
+
+The vision tower multiplies Q and K in FP16 (scale and softmax FP32), which halves it against LeRobot's
+FP32 upcast; the text attention keeps the upcast.
+
 ## Order of work
 
 1. Reference capture script (LeRobot policy, fixed noise; dumps preprocessed images, tokens, prefix K/V,
    per-step velocity, actions).
-2. Export (`tensorrt_edgellm/models/smolvla`): visual, prefix, cross-KV, denoise step; per-stage parity in
-   PyTorch before ONNX.
+2. Export (`tensorrt_edgellm/models/smolvla`): visual, prefix (cross K/V folded in), denoise step. Done.
 3. C++ runtime (`experimental_models/smolvla`), golden test end to end, timing.
 4. RTC / async, INT8 where the timing says it pays.
