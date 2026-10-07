@@ -46,6 +46,12 @@ dataset, against LeRobot FP32 with the same x_0:
 | TensorRT engines (FP16) vs LeRobot | cosine 0.999999, max \|d\| 0.0053 |
 | Engine time, 2 cameras (Python driver) | visual 36 ms, prefix 13 ms, 10 denoise steps 68 ms; 116 ms |
 
+C++ runtime (`smolvla_policy_inference`, `SmolvlaPolicy`): LeRobot's resize with top-left padding,
+task + newline tokens (Edge-LLM tokenizer on SmolVLM2's tokenizer.json), mean/std normalization, the
+CUDA-graphed denoise loop. Raw frame-300 request against LeRobot end to end: identical token ids,
+normalized chunk cosine 0.999999 (max \|d\| 0.0053), robot actions cosine 0.999999 (max \|d\| 0.146 on a
+±90 joint range); engines 83 ms per call (visual 33.5, prefix 9.6, 10 denoise steps 40.4).
+
 The vision tower multiplies Q and K in FP16 (scale and softmax FP32), which halves it against LeRobot's
 FP32 upcast; the text attention keeps the upcast.
 
@@ -54,5 +60,5 @@ FP32 upcast; the text attention keeps the upcast.
 1. Reference capture script (LeRobot policy, fixed noise; dumps preprocessed images, tokens, prefix K/V,
    per-step velocity, actions).
 2. Export (`tensorrt_edgellm/models/smolvla`): visual, prefix (cross K/V folded in), denoise step. Done.
-3. C++ runtime (`experimental_models/smolvla`), golden test end to end, timing.
+3. C++ runtime (`experimental_models/smolvla`), golden test end to end, timing. Done.
 4. RTC / async, INT8 where the timing says it pays.

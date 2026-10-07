@@ -129,40 +129,101 @@ def export_smolvla(checkpoint: str, out_dir: str, vlm_dir: str) -> None:
                        (None, None, None, tuple({1: prefix_len}
                                                 for _ in names)))
 
+    stage_runtime_assets(checkpoint, out_dir, vlm_dir, cfg, policy, names)
+    logger.info("SmolVLA export complete: %s", out_dir)
+
+
+def stage_runtime_assets(checkpoint: str, out_dir: str, vlm_dir: str,
+                         cfg: SmolVLAConfig, policy: dict, names) -> None:
+    """config.json plus assets/ (tokenizer, normalization.json) -- everything the runtime reads."""
     assets = os.path.join(out_dir, "assets")
     os.makedirs(assets, exist_ok=True)
-    for path in glob.glob(os.path.join(checkpoint, "policy_*processor*")):
-        shutil.copy(path, assets)
     for name in ("tokenizer.json", "tokenizer_config.json",
                  "special_tokens_map.json"):
         if os.path.exists(os.path.join(vlm_dir, name)):
             shutil.copy(os.path.join(vlm_dir, name), assets)
+
+    def processor_step(file_name: str, registry_name: str) -> dict:
+        steps = json.load(open(os.path.join(checkpoint, file_name)))["steps"]
+        return next(step for step in steps
+                    if step["registry_name"] == registry_name)
+
+    normalizer = processor_step("policy_preprocessor.json",
+                                "normalizer_processor")
+    unnormalizer = processor_step("policy_postprocessor.json",
+                                  "unnormalizer_processor")
+    pre = load_file(os.path.join(checkpoint, normalizer["state_file"]))
+    post = load_file(os.path.join(checkpoint, unnormalizer["state_file"]))
+    mapping = policy["normalization_mapping"]
+    if mapping.get("STATE") != "MEAN_STD" or mapping.get(
+            "ACTION") != "MEAN_STD":
+        raise ValueError(
+            f"only MEAN_STD state/action normalization is supported, got {mapping}"
+        )
     json.dump(
         {
-            "model_family": "smolvla",
-            "image_size": cfg.image_size,
-            "image_tokens_per_view": cfg.image_tokens,
-            "max_views": MAX_CAMERAS,
-            "max_tokens": MAX_TOKENS,
-            "max_prefix_len": MAX_PREFIX,
-            "chunk_size": cfg.chunk_size,
-            "max_action_dim": cfg.max_action_dim,
-            "max_state_dim": cfg.max_state_dim,
-            "num_steps": int(policy.get("num_steps", 10)),
-            "kv_names": names,
-            "kv_heads": cfg.text_kv_heads,
-            "head_dim": cfg.head_dim,
-            "camera_rename": {},
-            "policy": {
-                k: policy[k]
-                for k in ("input_features", "output_features",
-                          "normalization_mapping", "resize_imgs_with_padding",
-                          "tokenizer_max_length")
-            },
+            "state_mean": pre["observation.state.mean"].tolist(),
+            "state_std": pre["observation.state.std"].tolist(),
+            "state_eps": normalizer["config"]["eps"],
+            "action_mean": post["action.mean"].tolist(),
+            "action_std": post["action.std"].tolist(),
+            "action_eps": unnormalizer["config"]["eps"],
+        },
+        open(os.path.join(assets, "normalization.json"), "w"),
+        indent=1)
+
+    rename = processor_step(
+        "policy_preprocessor.json",
+        "rename_observations_processor")["config"]["rename_map"]
+    # LeRobot feeds the cameras in the order its config lists image features.
+    camera_features = [
+        k for k, v in policy["input_features"].items() if v["type"] == "VISUAL"
+    ]
+    cameras = []
+    for feature in camera_features:
+        source = next((k for k, v in rename.items() if v == feature), feature)
+        cameras.append(source.replace("observation.images.", ""))
+    json.dump(
+        {
+            "model_family":
+            "smolvla",
+            "image_size":
+            cfg.image_size,
+            "image_tokens_per_view":
+            cfg.image_tokens,
+            "max_views":
+            MAX_CAMERAS,
+            "max_tokens":
+            MAX_TOKENS,
+            "max_prefix_len":
+            MAX_PREFIX,
+            "chunk_size":
+            cfg.chunk_size,
+            "max_action_dim":
+            cfg.max_action_dim,
+            "max_state_dim":
+            cfg.max_state_dim,
+            "state_dim":
+            int(policy["input_features"]["observation.state"]["shape"][0]),
+            "action_dim":
+            int(policy["output_features"]["action"]["shape"][0]),
+            "num_steps":
+            int(policy.get("num_steps", 10)),
+            "kv_names":
+            names,
+            "kv_heads":
+            cfg.text_kv_heads,
+            "head_dim":
+            cfg.head_dim,
+            "cameras":
+            cameras,
+            "image_pad_value":
+            0.0,
+            "prompt_suffix":
+            "\n",
         },
         open(os.path.join(out_dir, "config.json"), "w"),
         indent=1)
-    logger.info("SmolVLA export complete: %s", out_dir)
 
 
 def main():
@@ -171,6 +232,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("checkpoint")
     parser.add_argument("out_dir")
+    parser.add_argument(
+        "--assets-only",
+        action="store_true",
+        help="rewrite config.json and assets/ without re-exporting the ONNX")
     parser.add_argument(
         "--vlm",
         default=None,
@@ -184,7 +249,13 @@ def main():
             os.path.expanduser(
                 "~/.cache/huggingface/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct/snapshots/*"
             )))[-1]
-    export_smolvla(args.checkpoint, args.out_dir, vlm)
+    if args.assets_only:
+        cfg = SmolVLAConfig()
+        policy = json.load(open(os.path.join(args.checkpoint, "config.json")))
+        stage_runtime_assets(args.checkpoint, args.out_dir, vlm, cfg, policy,
+                             kv_names(cfg))
+    else:
+        export_smolvla(args.checkpoint, args.out_dir, vlm)
 
 
 if __name__ == "__main__":
