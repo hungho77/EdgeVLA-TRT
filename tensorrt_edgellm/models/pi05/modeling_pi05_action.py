@@ -231,12 +231,17 @@ class Pi05ActionAttention(nn.Module):
         # exported at that rank already and need no reshape node.
         tokens = hidden_states.reshape(bsz * q_len, -1)
 
-        qkv = torch.cat([
-            self.q_proj(tokens),
-            self.k_proj(tokens),
-            self.v_proj(tokens),
-        ],
-                        dim=-1)
+        # One GEMM over the concatenated weights, so the packed [Q | K | V] order the plugin
+        # reads is fixed by the weight layout. With three projections and a Concat, TensorRT 10.3
+        # handed this plugin the K/V heads ahead of the Q heads.
+        qkv = F.linear(
+            tokens,
+            torch.cat([
+                self.q_proj.weight,
+                self.k_proj.weight,
+                self.v_proj.weight,
+            ],
+                      dim=0))
 
         # Tree decoding with an all-ones mask and relative position ids over a
         # cos/sin table the runtime already sliced to the action span: the query

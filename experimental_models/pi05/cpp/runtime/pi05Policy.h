@@ -60,7 +60,8 @@ enum class Pi05Adapter
 {
     kLibero,
     kDroid,
-    kAloha
+    kAloha,
+    kSo101
 };
 
 //! \brief One image slot, as the prefix consumes it.

@@ -57,3 +57,30 @@ runtime re-evaluates it only when the denoise-step count or the batch changes. I
 [pi0.5 example](../../docs/source/user_guide/examples/vla/pi05.md) has the statistics download, the
 request format and the correctness check; [pi0.5 Design](../../docs/source/developer_guide/models/pi05.md)
 has the component contracts.
+
+## SO101 (`pi05_so101`)
+
+`pi05_so101` serves [`hungho77/pi05-SO101-Multitask`](https://huggingface.co/hungho77/pi05-SO101-Multitask),
+an openpi PyTorch fine-tune: the overhead and wrist cameras in the `observation/image` and
+`observation/wrist_image` slots, a 6-dim state discretized into the prompt, a 50-step horizon, and the
+five arm joints as deltas from the request's state (the gripper is absolute), which the policy adds
+back so `robot_actions` are absolute joint targets.
+
+That release's `config.json` carries only `discrete_state_input`; export it through a directory that
+adds the openpi model fields next to the weights and assets:
+
+```json
+{"action_dim": 32, "action_horizon": 50, "paligemma_variant": "gemma_2b",
+ "action_expert_variant": "gemma_300m", "precision": "bfloat16", "discrete_state_input": true}
+```
+
+On JetPack 6 (TensorRT 10.3) export with `EDGELLM_PORTABLE_ATTENTION=1`; see
+[JETPACK6.md](../../JETPACK6.md).
+
+`scripts/openpi_reference.py` runs openpi's own `create_trained_policy` on a
+`pi05_policy_inference` request in FP32 and writes the chunk, the x_0 it drew and, with
+`--inputs-dir`, the model inputs for the canonical-tensor mode; `compare_pi05_actions.py` then
+scores either field. On AGX Orin (JetPack 6.2) against two raw SO101 dataset frames the robot actions
+match at cosine 0.999999 (max |d| 0.31 on joint ranges of about ±100); the normalized chunk is at
+cosine 0.99999 with max |d| 0.008, just outside the comparator's 5e-3 ceiling. pi05_libero passes
+it (cosine 0.999991, max |d| 4.8e-3).
