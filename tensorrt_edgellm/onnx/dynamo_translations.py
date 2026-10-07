@@ -30,6 +30,7 @@ optional ONNX inputs; ``qkv_scales`` defaults to ``[1.0, 1.0, 1.0]`` in the op
 schema so it is always a valid FLOATS attribute.
 """
 
+import os
 from typing import Sequence
 
 import onnx
@@ -1303,6 +1304,67 @@ def _attention_onnx_translation(
 
 
 # ---------------------------------------------------------------------------
+# Portable lowering of the TRT-native Attention / RotaryEmbedding ops, for
+# TensorRT releases whose parser predates them (TensorRT 10.3 on JetPack 6).
+# Selected with EDGELLM_PORTABLE_ATTENTION=1 at export time.
+# ---------------------------------------------------------------------------
+
+PORTABLE_ATTENTION_ENV = "EDGELLM_PORTABLE_ATTENTION"
+
+
+@script()
+def _portable_rope_translation(
+    x: onnxscript.FLOAT16,
+    cos: onnxscript.FLOAT16,
+    sin: onnxscript.FLOAT16,
+    position_ids: onnxscript.INT32,
+) -> onnxscript.FLOAT16:
+    """Non-interleaved RotaryEmbedding: x [B, H, S, D], cos/sin [P, D/2], position_ids [B, S]."""
+    head_axis = _op21.Constant(value_ints=[1])
+    c = _op21.Unsqueeze(_op21.Gather(cos, position_ids, axis=0), head_axis)
+    s = _op21.Unsqueeze(_op21.Gather(sin, position_ids, axis=0), head_axis)
+    x1, x2 = _op21.Split(x, axis=-1, num_outputs=2)
+    return _op21.Concat(_op21.Sub(_op21.Mul(x1, c), _op21.Mul(x2, s)),
+                        _op21.Add(_op21.Mul(x2, c), _op21.Mul(x1, s)),
+                        axis=-1)
+
+
+@script()
+def _portable_unmasked_attention_translation(
+    query: onnxscript.FLOAT16,
+    key: onnxscript.FLOAT16,
+    value: onnxscript.FLOAT16,
+    scale: float,
+) -> onnxscript.FLOAT16:
+    """softmax(scale * Q K^T) V over [B, H, S, D] query and [B, H_kv, S_kv, D] key/value.
+
+    Query heads are grouped onto their KV head by a reshape (heads are contiguous
+    per group), so GQA/MQA needs no K/V repeat. The scale multiplies the FP32
+    scores rather than Q, whose FP16 rounding it would otherwise change.
+    """
+    batch = _op21.Shape(query, start=0, end=1)
+    kv_heads = _op21.Shape(key, start=1, end=2)
+    head_dim = _op21.Shape(query, start=3, end=4)
+    rows = _op21.Constant(value_ints=[-1])
+    grouped = _op21.Reshape(
+        query, _op21.Concat(batch, kv_heads, rows, head_dim, axis=0))
+    scores = _op21.MatMul(grouped, _op21.Transpose(key, perm=[0, 1, 3, 2]))
+    scaled = _op21.Mul(_op21.Cast(scores, to=1),
+                       _op21.Constant(value_float=scale))
+    probs = _op21.Cast(_op21.Softmax(scaled, axis=-1), to=10)
+    return _op21.Reshape(_op21.MatMul(probs, value), _op21.Shape(query))
+
+
+def _portable_attention_dispatch(query, key, value, attn_mask, is_causal,
+                                 scale):
+    if attn_mask is not None or is_causal:
+        raise NotImplementedError(
+            f"{PORTABLE_ATTENTION_ENV}=1 lowers only mask-free, non-causal attention "
+            "(vision towers, bidirectional prefixes)")
+    return _portable_unmasked_attention_translation(query, key, value, scale)
+
+
+# ---------------------------------------------------------------------------
 # INT4 MoE plugin
 # ---------------------------------------------------------------------------
 
@@ -1775,6 +1837,15 @@ def build_custom_translation_table() -> dict:
     from ..models import \
         ops  # noqa: F401 - side-effect: registers all custom_ops
 
+    table = _custom_translation_table()
+    if os.environ.get(PORTABLE_ATTENTION_ENV) == "1":
+        table[torch.ops.trt.attention_onnx.
+              default] = _portable_attention_dispatch
+        table[torch.ops.trt.rope_onnx.default] = _portable_rope_translation
+    return table
+
+
+def _custom_translation_table() -> dict:
     return {
         torch.ops.trt.attention_plugin.default:
         _attention_plugin_dispatch,
