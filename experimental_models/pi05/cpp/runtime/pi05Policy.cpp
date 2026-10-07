@@ -189,6 +189,7 @@ constexpr PolicyConfigShape kPolicyConfigs[]{
     {"pi05_libero", "libero", Pi05Adapter::kLibero, false},
     {"pi05_droid", "droid", Pi05Adapter::kDroid, true},
     {"pi05_aloha", "aloha", Pi05Adapter::kAloha, true},
+    {"pi05_so101", "so101", Pi05Adapter::kSo101, true},
 };
 
 std::string knownPolicyConfigs()
@@ -249,6 +250,10 @@ std::vector<Pi05CameraSlot> readCameraSlots(nlohmann::json const& cameras)
     }
     return slots;
 }
+
+//! SO101's arm joints, trained as deltas from the chunk's first state (openpi's
+//! ``make_bool_mask(5, -1)``); the gripper after them is absolute.
+constexpr int32_t kSo101DeltaDims = 5;
 
 //! openpi's Aloha conversions, transcribed from ``policies/aloha_policy.py``. The
 //! constants are the Aloha runtime's own gripper limits and the Interbotix linkage's.
@@ -817,6 +822,19 @@ std::vector<float> Pi05Policy::postprocessActions(
     std::vector<float> const& normalized, int32_t horizon, int32_t actionDim, std::vector<float> const& adapted) const
 {
     std::vector<float> out = unnormalizeActions(normalized, horizon, actionDim);
+    if (mContract.adapter == Pi05Adapter::kSo101)
+    {
+        requireStateDim(adapted.size(), mContract.stateDim);
+        int32_t const robotDim = mContract.robotActionDim;
+        for (int32_t t = 0; t < horizon; ++t)
+        {
+            for (int32_t d = 0; d < std::min(kSo101DeltaDims, robotDim); ++d)
+            {
+                out[static_cast<size_t>(t) * robotDim + d] += adapted[static_cast<size_t>(d)];
+            }
+        }
+        return out;
+    }
     if (mContract.adapter != Pi05Adapter::kAloha)
     {
         return out;

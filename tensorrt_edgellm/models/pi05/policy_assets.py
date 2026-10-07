@@ -106,6 +106,20 @@ OPENPI_POLICY_CONTRACTS = {
         "opt_views":
         2,
     },
+    "pi05_so101": {
+        # hungho77/so101-multitask's TrainConfig: Pi0Config(pi05=True) defaults, the
+        # overhead and wrist views in the LIBERO slots (right wrist padded and masked),
+        # and the five arm joints trained as deltas from the chunk's first state.
+        "adapter": "so101",
+        "state_dim": 6,
+        "action_dim": 6,
+        "action_horizon": 50,
+        "discrete_state_input": True,
+        "cameras":
+        (("observation/image", True), ("observation/wrist_image", True)),
+        "ignored_cameras": (),
+        "opt_views": 2,
+    },
     "pi05_aloha": {
         "adapter":
         "aloha",

@@ -73,6 +73,20 @@ constexpr char const* kEvenNormStats = R"JSON({
   }
 })JSON";
 
+//! hungho77/so101-multitask's norm_stats.json (quantiles only; the mean/std are unused).
+constexpr char const* kSo101NormStats = R"JSON({
+  "norm_stats": {
+    "state": {
+      "q01": [-47.98016661376953, -79.67880579833985, -53.42663958740234, -9.20550386505127, -0.22407034915685653, 2.0573404650211335],
+      "q99": [34.56383338623047, 57.88983049926756, 85.11533171997073, 96.69957197265626, 2.856509924352169, 47.19010197081566]
+    },
+    "actions": {
+      "q01": [-20.89654637908935, -44.62182160797119, -33.769424993896486, -31.189095764160157, -0.6166154036045074, 1.0494327437430622],
+      "q99": [20.897581863403317, 31.63713228302001, 38.97810744476318, 31.931784362792953, 0.6145055134296418, 47.228525542140005]
+    }
+  }
+})JSON";
+
 //! One openpi configuration as the exporter transcribes it, with what a test needs to
 //! drive it: the statistics it normalizes against and a state in the robot's own units.
 struct ContractCase
@@ -117,8 +131,27 @@ std::vector<ContractCase> const& contractCases()
             {0.998F, -0.0701F, -0.7932F, -0.4675F, 0.5225F, -0.7262F, 0.35F, -0.5043F, -0.8981F, 0.135F, -0.9007F,
                 -0.1727F, -0.4471F, 0.72F},
             "fold_the towel", "Task: fold the towel, State: 255 202 255 84 236 14 63 25 243 60 -1 29 -1 60;\nAction: "},
+        {"so101", "pi05_so101", kSo101NormStats, 6, 6, 50, true,
+            R"JSON({"slots": [{"name": "observation/image", "required": true},
+                              {"name": "observation/wrist_image", "required": true}], "ignored": []})JSON",
+            {"observation/image", "observation/wrist_image"}, {}, {}, {-4.13F, -5.23F, -5.89F, 89.01F, -0.04F, 43.36F},
+            "Pick up the banana and place it in the bot, then close the lid",
+            "Task: Pick up the banana and place it in the bot, then close the lid, State: 135 138 87 237 15 "
+            "234;\nAction: "},
     };
     return cases;
+}
+
+ContractCase const& contractCase(std::string const& policyConfig)
+{
+    for (ContractCase const& c : contractCases())
+    {
+        if (policyConfig == c.policyConfig)
+        {
+            return c;
+        }
+    }
+    throw std::invalid_argument("no contract case " + policyConfig);
 }
 
 //! Stage one engine directory's worth of contract files and hand back its path.
@@ -315,7 +348,7 @@ TEST_F(Pi05PolicyTest, QuantileActionsUnnormalizeToRobotUnits)
 //! below, never from recomputing the same formula here.
 TEST_F(Pi05PolicyTest, AlohaActionsMatchTheOpenpiTransforms)
 {
-    ContractCase const& aloha = contractCases().back();
+    ContractCase const& aloha = contractCase("pi05_aloha");
     pi05::Pi05Policy const policy = makePolicy(aloha);
 
     constexpr int32_t kHorizon = 3;
@@ -362,6 +395,40 @@ TEST_F(Pi05PolicyTest, AlohaActionsMatchTheOpenpiTransforms)
     std::vector<float> const shifted = policy.postprocessActions(normalized, kHorizon, 32, moved);
     EXPECT_NEAR(shifted[0], robot[0] + 0.25F, 1e-5F);
     EXPECT_NEAR(shifted[6], robot[6], 1e-5F);
+}
+
+//! Expected values come from openpi's Unnormalize and AbsoluteActions(make_bool_mask(5, -1)).
+TEST_F(Pi05PolicyTest, So101ArmJointsAreDeltasFromTheRequestState)
+{
+    ContractCase const& so101 = contractCase("pi05_so101");
+    pi05::Pi05Policy const policy = makePolicy(so101);
+    constexpr int32_t kHorizon = 3;
+    std::vector<float> const rows{0.2502F, 0.7944F, 0.5514F, -0.5496F, -0.3997F, 0.7471F, -0.9764F, -0.6152F, 0.3841F,
+        -0.5988F, -0.2609F, -0.9925F, -0.1194F, -0.5209F, -0.1950F, -0.8066F, 0.9357F, -0.5700F};
+    std::vector<float> normalized(static_cast<size_t>(kHorizon) * 32, 0.0F);
+    for (int32_t t = 0; t < kHorizon; ++t)
+    {
+        std::copy_n(rows.begin() + t * 6, 6, normalized.begin() + t * 32);
+    }
+
+    std::vector<float> const adapted = policy.adaptInputState(so101.state);
+    std::vector<float> const robot = policy.postprocessActions(normalized, kHorizon, 32, adapted);
+    std::vector<float> const expected{1.09896439F, 18.5677118F, 16.7708349F, 72.0357286F, -0.287094151F, 41.38918F,
+        -24.5333761F, -35.1795981F, 10.6855042F, 70.482955F, -0.201654311F, 1.22260418F, -6.6245919F, -31.5839894F,
+        -10.3785424F, 63.9246964F, 0.534925908F, 10.9779381F};
+    ASSERT_EQ(robot.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i)
+    {
+        EXPECT_NEAR(robot[i], expected[i], 1e-3F) << "element " << i;
+    }
+
+    // A different state moves the five arm joints and leaves the gripper where it was.
+    std::vector<float> moved = adapted;
+    moved[0] += 2.0F;
+    moved[5] += 2.0F;
+    std::vector<float> const shifted = policy.postprocessActions(normalized, kHorizon, 32, moved);
+    EXPECT_NEAR(shifted[0], robot[0] + 2.0F, 1e-4F);
+    EXPECT_NEAR(shifted[5], robot[5], 1e-4F);
 }
 
 //! 8x8 -> 7x7 is LIBERO's 256 -> 224 ratio. Only a real downscale widens the filter
