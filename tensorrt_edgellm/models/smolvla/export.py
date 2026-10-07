@@ -34,7 +34,7 @@ from torch import nn
 
 from ...onnx.export_encoder import _run_dynamo_export
 from .modeling_smolvla import (SmolVLAConfig, SmolVLADenoise, SmolVLAPrefix,
-                               SmolVLAVisual, load_smolvla_weights)
+                               SmolVLAVisual, inpaint, load_smolvla_weights)
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +44,15 @@ MAX_PREFIX = MAX_CAMERAS * 64 + MAX_TOKENS + 1
 
 
 class _DenoiseExport(nn.Module):
-    """Named K/V inputs, so the ONNX graph has one input per tensor."""
+    """One Euler step plus RTC inpainting; named K/V inputs, one graph input per tensor."""
 
     def __init__(self, denoise: SmolVLADenoise) -> None:
         super().__init__()
         self.denoise = denoise
 
-    def forward(self, x_t, timestep, dt, kv):
-        return self.denoise(x_t, timestep, dt, *kv)
+    def forward(self, x_t, timestep, dt, x_0, rtc_seed, rtc_weight, kv):
+        x_next = self.denoise(x_t, timestep, dt, *kv)
+        return inpaint(x_next, timestep + dt, x_0, rtc_seed, rtc_weight)
 
 
 def kv_names(cfg: SmolVLAConfig):
@@ -121,13 +122,18 @@ def export_smolvla(checkpoint: str, out_dir: str, vlm_dir: str) -> None:
                     cfg.text_kv_heads,
                     cfg.head_dim,
                     dtype=torch.float16) for _ in names)
-    _run_dynamo_export(_DenoiseExport(denoise),
-                       (torch.zeros(1, cfg.chunk_size, cfg.max_action_dim),
-                        torch.ones(1), torch.tensor(-0.1), kv),
-                       os.path.join(out_dir, "denoise", "model.onnx"),
-                       ["x_t", "timestep", "dt"] + names, ["x_next"],
-                       (None, None, None, tuple({1: prefix_len}
-                                                for _ in names)))
+    # Distinct tensors: the exporter merges inputs that are the same object.
+    chunks = [
+        torch.zeros(1, cfg.chunk_size, cfg.max_action_dim) for _ in range(3)
+    ]
+    _run_dynamo_export(
+        _DenoiseExport(denoise),
+        (chunks[0], torch.ones(1), torch.tensor(-0.1), chunks[1], chunks[2],
+         torch.zeros(1, cfg.chunk_size, 1), kv),
+        os.path.join(out_dir, "denoise", "model.onnx"),
+        ["x_t", "timestep", "dt", "x_0", "rtc_seed", "rtc_weight"] + names,
+        ["x_next"], (None, None, None, None, None, None,
+                     tuple({1: prefix_len} for _ in names)))
 
     stage_runtime_assets(checkpoint, out_dir, vlm_dir, cfg, policy, names)
     logger.info("SmolVLA export complete: %s", out_dir)

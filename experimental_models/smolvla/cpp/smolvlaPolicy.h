@@ -61,6 +61,18 @@ struct SmolvlaChunk
     float denoiseMs{0.0F};
 };
 
+//! Real-time chunking. The new chunk continues the previous one from row startRow (the robot executed startRow
+//! of its actions when this one starts): its first inferenceDelay rows reproduce the previous chunk's remaining
+//! rows and the weight then falls linearly to 0 at executionHorizon, LeRobot's LINEAR prefix schedule. LeRobot
+//! applies those weights through autograd guidance; this runtime, which has no gradients, inpaints on the flow
+//! path instead (see tensorrt_edgellm.models.smolvla.modeling_smolvla.inpaint).
+struct SmolvlaRtc
+{
+    int32_t inferenceDelay{};
+    int32_t executionHorizon{};
+    int32_t startRow{-1}; //!< -1: chunk - executionHorizon
+};
+
 //! SmolVLA (LeRobot 0.6.1) on the visual / prefix / denoise engines written by
 //! ``tensorrt_edgellm.models.smolvla.export``, with LeRobot's pre- and post-processing: resize with
 //! top-left padding to the model's square size, [-1, 1] pixels, task + newline tokens, mean/std
@@ -77,7 +89,17 @@ public:
     SmolvlaPolicy& operator=(SmolvlaPolicy const&) = delete;
 
     //! \p noise is x_0, [chunk, maxActionDim]; when empty one is drawn from the seeded generator.
-    SmolvlaChunk act(SmolvlaObservation const& observation, std::vector<float> const& noise = {});
+    SmolvlaChunk act(
+        SmolvlaObservation const& observation, std::vector<float> const& noise = {}, SmolvlaRtc const* rtc = nullptr);
+
+    //! Forget the previous chunk, e.g. at the start of an episode.
+    void resetEpisode() noexcept
+    {
+        mPrevious.clear();
+    }
+
+    //! LeRobot's get_prefix_weights (LINEAR): 1 on [0, delay), linspace(1, 0) inside [delay, horizon), 0 after.
+    static std::vector<float> prefixWeights(int32_t delay, int32_t horizon, int32_t total);
 
     void setNoiseSeed(uint64_t seed) noexcept
     {
@@ -142,12 +164,18 @@ private:
     rt::Tensor mTokens;
     rt::Tensor mStateHost; //!< pinned fp32 [maxStateDim]
     rt::Tensor mState;
-    std::vector<rt::Tensor> mKV; //!< [1, maxPrefix, kvHeads, headDim] fp16 each
-    rt::Tensor mX[2];            //!< x_t ping-pong, fp32 [1, chunk, maxActionDim]
-    rt::Tensor mNoiseHost;       //!< pinned
-    rt::Tensor mTimesteps;       //!< fp32 [numSteps], one per step
-    rt::Tensor mDt;              //!< fp32 scalar
-    rt::Tensor mOutHost;         //!< pinned fp32 [chunk, maxActionDim]
+    std::vector<rt::Tensor> mKV;  //!< [1, maxPrefix, kvHeads, headDim] fp16 each
+    rt::Tensor mX[2];             //!< x_t ping-pong, fp32 [1, chunk, maxActionDim]
+    rt::Tensor mNoiseHost;        //!< pinned
+    rt::Tensor mTimesteps;        //!< fp32 [numSteps], one per step
+    rt::Tensor mDt;               //!< fp32 scalar
+    rt::Tensor mOutHost;          //!< pinned fp32 [chunk, maxActionDim]
+    rt::Tensor mX0;               //!< x_0 for inpainting, fp32 [1, chunk, maxActionDim]
+    rt::Tensor mRtcSeed;          //!< fp32 [1, chunk, maxActionDim]
+    rt::Tensor mRtcWeight;        //!< fp32 [1, chunk, 1]
+    rt::Tensor mRtcSeedHost;      //!< pinned
+    rt::Tensor mRtcWeightHost;    //!< pinned
+    std::vector<float> mPrevious; //!< last normalized chunk, for RTC
 
     std::mt19937_64 mNoiseGen{0};
     bool mUseCudaGraph{true};

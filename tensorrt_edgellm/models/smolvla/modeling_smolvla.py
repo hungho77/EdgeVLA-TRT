@@ -411,6 +411,16 @@ class SmolVLADenoise(nn.Module):
         return x_t + dt * self.velocity(x_t, timestep, prefix_kv)
 
 
+def inpaint(x_next: torch.Tensor, next_t: torch.Tensor, x_0: torch.Tensor,
+            seed: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Real-time chunking on the flow path: rows move towards next_t * x_0 + (1 - next_t) * seed.
+
+    weight [B, H, 1] is 1 on rows to reproduce, 0 on free rows (an exact identity there).
+    """
+    target = next_t * x_0 + (1.0 - next_t) * seed
+    return x_next + weight * (target - x_next)
+
+
 # --------------------------------------------------------------------------------------------
 # Weights
 # --------------------------------------------------------------------------------------------

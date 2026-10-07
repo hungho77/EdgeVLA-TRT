@@ -115,6 +115,11 @@ SmolvlaPolicy::SmolvlaPolicy(std::string const& engineDir, cudaStream_t stream)
     mX[1] = makeTensor({1, mChunk, mMaxActionDim}, DataType::kFLOAT, "smolvla::x1");
     mNoiseHost = makeTensor({chunkElems}, DataType::kFLOAT, "smolvla::noiseHost", rt::DeviceType::kCPU);
     mOutHost = makeTensor({chunkElems}, DataType::kFLOAT, "smolvla::outHost", rt::DeviceType::kCPU);
+    mX0 = makeTensor({1, mChunk, mMaxActionDim}, DataType::kFLOAT, "smolvla::x0Init");
+    mRtcSeed = makeTensor({1, mChunk, mMaxActionDim}, DataType::kFLOAT, "smolvla::rtcSeed");
+    mRtcWeight = makeTensor({1, mChunk, 1}, DataType::kFLOAT, "smolvla::rtcWeight");
+    mRtcSeedHost = makeTensor({chunkElems}, DataType::kFLOAT, "smolvla::rtcSeedHost", rt::DeviceType::kCPU);
+    mRtcWeightHost = makeTensor({mChunk}, DataType::kFLOAT, "smolvla::rtcWeightHost", rt::DeviceType::kCPU);
     mTimesteps = makeTensor({mNumSteps}, DataType::kFLOAT, "smolvla::timesteps");
     mDt = makeTensor({1}, DataType::kFLOAT, "smolvla::dt");
 
@@ -189,6 +194,20 @@ std::vector<float> SmolvlaPolicy::preprocessView(unsigned char const* rgb, int32
     return out;
 }
 
+std::vector<float> SmolvlaPolicy::prefixWeights(int32_t delay, int32_t horizon, int32_t total)
+{
+    int32_t const start = std::min(delay, horizon);
+    std::vector<float> weights(static_cast<size_t>(total), 0.0F);
+    std::fill_n(weights.begin(), std::min(start, total), 1.0F);
+    int32_t const steps = std::min(horizon, total) - start;
+    for (int32_t i = 0; i < steps; ++i)
+    {
+        // torch.linspace(1, 0, steps + 2)[1:-1]
+        weights[static_cast<size_t>(start + i)] = 1.0F - static_cast<float>(i + 1) / static_cast<float>(steps + 1);
+    }
+    return weights;
+}
+
 std::vector<int64_t> SmolvlaPolicy::tokenize(std::string const& task) const
 {
     auto const ids = mTokenizer->encode(task + mPromptSuffix, /*addBos=*/false, /*addEos=*/false);
@@ -223,6 +242,12 @@ void SmolvlaPolicy::enqueueDenoiseLoop(int64_t prefixLen)
     mDenoise.setShape("timestep", {1});
     mDenoise.setShape("dt", {});
     mDenoise.bind("dt", mDt.rawPointer());
+    mDenoise.setShape("x_0", {1, mChunk, mMaxActionDim});
+    mDenoise.setShape("rtc_seed", {1, mChunk, mMaxActionDim});
+    mDenoise.setShape("rtc_weight", {1, mChunk, 1});
+    mDenoise.bind("x_0", mX0.rawPointer());
+    mDenoise.bind("rtc_seed", mRtcSeed.rawPointer());
+    mDenoise.bind("rtc_weight", mRtcWeight.rawPointer());
     for (int32_t step = 0; step < mNumSteps; ++step)
     {
         mDenoise.bind("x_t", mX[step % 2].rawPointer());
@@ -232,7 +257,8 @@ void SmolvlaPolicy::enqueueDenoiseLoop(int64_t prefixLen)
     }
 }
 
-SmolvlaChunk SmolvlaPolicy::act(SmolvlaObservation const& observation, std::vector<float> const& noise)
+SmolvlaChunk SmolvlaPolicy::act(
+    SmolvlaObservation const& observation, std::vector<float> const& noise, SmolvlaRtc const* rtc)
 {
     // Cameras in the order LeRobot feeds them; a configured camera the request lacks is skipped.
     std::vector<SmolvlaView const*> ordered;
@@ -288,8 +314,29 @@ SmolvlaChunk SmolvlaPolicy::act(SmolvlaObservation const& observation, std::vect
         static_cast<size_t>(tokens) * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(
         mState.rawPointer(), mStateHost.rawPointer(), mMaxStateDim * sizeof(float), cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mX[0].rawPointer(), mNoiseHost.rawPointer(),
-        static_cast<size_t>(mChunk) * mMaxActionDim * sizeof(float), cudaMemcpyHostToDevice, mStream));
+    size_t const chunkBytes = static_cast<size_t>(mChunk) * mMaxActionDim * sizeof(float);
+    CUDA_CHECK(
+        cudaMemcpyAsync(mX[0].rawPointer(), mNoiseHost.rawPointer(), chunkBytes, cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(cudaMemcpyAsync(mX0.rawPointer(), mNoiseHost.rawPointer(), chunkBytes, cudaMemcpyHostToDevice, mStream));
+
+    // LeRobot's prev_chunk_left_over: the previous chunk's rows from startRow, zero-padded to the chunk.
+    float* seed = mRtcSeedHost.dataPointer<float>();
+    float* weight = mRtcWeightHost.dataPointer<float>();
+    std::fill_n(seed, static_cast<size_t>(mChunk) * mMaxActionDim, 0.0F);
+    std::fill_n(weight, mChunk, 0.0F);
+    if (rtc != nullptr && !mPrevious.empty())
+    {
+        int32_t const startRow = rtc->startRow >= 0 ? rtc->startRow : mChunk - rtc->executionHorizon;
+        int32_t const leftover = std::max(0, mChunk - startRow);
+        std::copy_n(mPrevious.begin() + static_cast<ptrdiff_t>(startRow) * mMaxActionDim,
+            static_cast<size_t>(leftover) * mMaxActionDim, seed);
+        std::vector<float> const weights
+            = prefixWeights(rtc->inferenceDelay, std::min(rtc->executionHorizon, leftover), mChunk);
+        std::copy(weights.begin(), weights.end(), weight);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mRtcSeed.rawPointer(), seed, chunkBytes, cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(mRtcWeight.rawPointer(), weight, mChunk * sizeof(float), cudaMemcpyHostToDevice, mStream));
 
     CUDA_CHECK(cudaEventRecord(mEvents[0], mStream));
     mVisual.setShape("pixel_values", {views, 3, mImageSize, mImageSize});
@@ -343,6 +390,7 @@ SmolvlaChunk SmolvlaPolicy::act(SmolvlaObservation const& observation, std::vect
 
     float const* out = mOutHost.dataPointer<float>();
     chunk.normalized.assign(out, out + static_cast<int64_t>(mChunk) * mMaxActionDim);
+    mPrevious = chunk.normalized;
     chunk.robot.resize(static_cast<size_t>(mChunk) * mActionDim);
     for (int32_t t = 0; t < mChunk; ++t)
     {

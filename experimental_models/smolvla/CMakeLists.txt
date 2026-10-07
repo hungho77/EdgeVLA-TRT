@@ -29,3 +29,10 @@ target_include_directories(
 target_link_libraries(
   smolvla_policy_inference PRIVATE smolvlaExperimental vlaExperimental
                                    edgellmCore commonLibraryExt)
+
+add_executable(smolvla_async_control examples/smolvla_async_control.cpp)
+target_include_directories(smolvla_async_control PRIVATE ${CMAKE_SOURCE_DIR}/cpp
+                                                         ${COMMON_INCLUDE_DIRS})
+target_link_libraries(
+  smolvla_async_control PRIVATE smolvlaExperimental vlaExperimental edgellmCore
+                                commonLibraryExt)

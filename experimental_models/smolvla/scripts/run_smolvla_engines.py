@@ -37,6 +37,10 @@ class Engine:
         self.engine = trt.Runtime(logger).deserialize_cuda_engine(
             open(path, "rb").read())
         self.context = self.engine.create_execution_context()
+        self.names = {
+            self.engine.get_tensor_name(i)
+            for i in range(self.engine.num_io_tensors)
+        }
         self.trt = trt
 
     def __call__(self, inputs, stream):
@@ -113,16 +117,23 @@ def main():
             dt = torch.tensor(-1.0 / steps, device="cuda")
             for step in range(steps):
                 t = torch.full((1, ), 1.0 + step * float(dt), device="cuda")
-                x = denoise(
-                    {
-                        "x_t": x,
-                        "timestep": t,
-                        "dt": dt,
-                        **{
-                            n: kv[n]
-                            for n in config["kv_names"]
-                        }
-                    }, stream)["x_next"]
+                inputs = {
+                    "x_t": x,
+                    "timestep": t,
+                    "dt": dt,
+                    **{
+                        n: kv[n]
+                        for n in config["kv_names"]
+                    }
+                }
+                if "x_0" in denoise.names:
+                    inputs.update(x_0=noise,
+                                  rtc_seed=torch.zeros_like(noise),
+                                  rtc_weight=torch.zeros(1,
+                                                         noise.shape[1],
+                                                         1,
+                                                         device="cuda"))
+                x = denoise(inputs, stream)["x_next"]
             stream.synchronize()
             times["denoise"] = time.perf_counter() - t0
         return x, times

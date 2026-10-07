@@ -52,6 +52,13 @@ CUDA-graphed denoise loop. Raw frame-300 request against LeRobot end to end: ide
 normalized chunk cosine 0.999999 (max \|d\| 0.0053), robot actions cosine 0.999999 (max \|d\| 0.146 on a
 ±90 joint range); engines 83 ms per call (visual 33.5, prefix 9.6, 10 denoise steps 40.4).
 
+RTC and async (`SmolvlaRtc`, `smolvla_async_control`): LeRobot's RTC guides the velocity through autograd,
+which engines cannot run, so the runtime keeps LeRobot's prefix weights (LINEAR schedule over the previous
+chunk's leftover rows; SmolVLA's actions are absolute, so no state re-encoding) and inpaints them on the
+flow path inside the denoise engine (zero weights are an exact identity). At 30 Hz with a drifting state the
+planner lags 3-4 ticks; with RTC the frozen rows reproduce the committed actions (switch jump 0.0000),
+without it a switch jumps up to 43.6.
+
 The vision tower multiplies Q and K in FP16 (scale and softmax FP32), which halves it against LeRobot's
 FP32 upcast; the text attention keeps the upcast.
 
@@ -61,4 +68,4 @@ FP32 upcast; the text attention keeps the upcast.
    per-step velocity, actions).
 2. Export (`tensorrt_edgellm/models/smolvla`): visual, prefix (cross K/V folded in), denoise step. Done.
 3. C++ runtime (`experimental_models/smolvla`), golden test end to end, timing. Done.
-4. RTC / async, INT8 where the timing says it pays.
+4. RTC / async: done. Low-bit quantization: left for a dedicated scheme.
