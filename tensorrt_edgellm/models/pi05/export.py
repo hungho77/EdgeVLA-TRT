@@ -137,6 +137,14 @@ def _write_component_config(out_dir: str, config: dict,
         json.dump(config, f, indent=2)
 
 
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _export_id(fingerprint: str, options: dict) -> str:
     """Identity stamped on every component of one export.
 
@@ -677,11 +685,24 @@ def export_visual(weights: Dict[str, torch.Tensor], out_dir: str,
 
 
 def export_prefix(weights: Dict[str, torch.Tensor],
-                  embedding: Dict[str, torch.Tensor], out_dir: str,
-                  dtype: torch.dtype, variant: str, max_prefix_len: int,
-                  max_batch_size: int, export_id: str) -> None:
+                  embedding: Dict[str, torch.Tensor],
+                  out_dir: str,
+                  dtype: torch.dtype,
+                  variant: str,
+                  max_prefix_len: int,
+                  max_batch_size: int,
+                  export_id: str,
+                  int8: "str | None" = None,
+                  int8_alpha: float = 0.5,
+                  fp16_projections: "list[str] | None" = None) -> None:
     cfg = Pi05PrefixConfig(**_variant(variant))
     model: Pi05Prefix = build_pi05_prefix(cfg, weights, dtype).to("cpu")
+    if int8:
+        from safetensors.torch import load_file
+
+        from .int8_prefix import quantize_prefix_int8
+        act_amax = None if int8 == "uncalibrated" else load_file(int8)
+        quantize_prefix_int8(model, act_amax, int8_alpha, fp16_projections)
     args, input_names, output_names, dynamic_shapes = (
         model.get_onnx_export_args("cpu"))
     os.makedirs(out_dir, exist_ok=True)
@@ -769,12 +790,19 @@ def export_pi05_components(
     max_batch_size: int = 1,
     num_denoise_steps: "int | None" = None,
     hoist_adarms_cond: bool = True,
+    prefix_int8: "str | None" = None,
+    prefix_int8_alpha: float = 0.5,
+    prefix_fp16_projections: "list[str] | None" = None,
 ) -> None:
     """Export pi0.5 policy components from a converted openpi checkpoint.
 
     ``hoist_adarms_cond`` (default) moves the time embedder and the per-site
     AdaRMS Denses out of the per-step action graph into a one-shot ``cond``
     component. Turning it off exports no ``cond`` and keeps them per-step.
+
+    ``prefix_int8`` exports the prefix projections as W8A8 SmoothQuant from a
+    calibration file (see ``int8_prefix.py``), or with placeholder scales when it
+    is ``"uncalibrated"``; ``prefix_fp16_projections`` names projections to keep.
     """
     if dtype != torch.float16:
         # Rejected here rather than at load: the attention plugin and the component
@@ -825,6 +853,12 @@ def export_pi05_components(
         "paligemma_variant": paligemma_variant,
         "expert_variant": expert_variant,
     }
+    if prefix_int8:
+        options["prefix_int8"] = (prefix_int8 if prefix_int8 == "uncalibrated"
+                                  else _file_sha256(prefix_int8))
+        options["prefix_int8_alpha"] = prefix_int8_alpha
+        options["prefix_fp16_projections"] = sorted(prefix_fp16_projections
+                                                    or [])
     fingerprint = checkpoint_fingerprint(checkpoint)
     export_id = _export_id(fingerprint, options)
     _validate_existing_export(output_dir, fingerprint, export_id)
@@ -888,7 +922,8 @@ def export_pi05_components(
             elif component == "prefix":
                 export_prefix(prefix_w, embedding_w, out_dir, dtype,
                               paligemma_variant, max_prefix_len,
-                              max_batch_size, export_id)
+                              max_batch_size, export_id, prefix_int8,
+                              prefix_int8_alpha, prefix_fp16_projections)
             elif component == "action":
                 if hoist_adarms_cond:
                     stage_if_new(os.path.join(output_dir, "cond"))

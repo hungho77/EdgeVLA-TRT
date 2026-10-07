@@ -84,3 +84,30 @@ scores either field. On AGX Orin (JetPack 6.2) against two raw SO101 dataset fra
 match at cosine 0.999999 (max |d| 0.31 on joint ranges of about ±100); the normalized chunk is at
 cosine 0.99999 with max |d| 0.008, just outside the comparator's 5e-3 ceiling. pi05_libero passes
 it (cosine 0.999991, max |d| 4.8e-3).
+
+## INT8 prefix (opt-in)
+
+The prefix tower dominates a pi0.5 call. `--pi05-prefix-int8 <stats>` exports its projections as W8A8
+SmoothQuant (per-channel INT8 weights, per-tensor INT8 activations) from activation statistics that
+`scripts/calibrate_pi05_prefix_int8.py` collects by running openpi on dataset frames:
+
+```bash
+python experimental_models/pi05/scripts/calibrate_pi05_prefix_int8.py --config pi05_so101 \
+    --checkpoint <openpi checkpoint> --dataset <LeRobot v3 root> --num-frames 48 --out prefix_amax.safetensors
+tensorrt-edgellm-export <checkpoint> <onnx_dir> --pi05-policy-config pi05_so101 \
+    --pi05-prefix-int8 prefix_amax.safetensors --pi05-prefix-int8-alpha 0.8 \
+    --pi05-prefix-fp16-projections o_proj,down_proj
+```
+
+Gemma's `down_proj` inputs carry outliers up to ~1e4 that per-tensor INT8 cannot hold, so the useful
+setting keeps `o_proj` and `down_proj` in FP16 and quantizes q/k/v and gate/up. SO101 on AGX Orin
+against openpi FP32 (held-out dataset frames):
+
+| Prefix | Robot actions, max \|d\| (mean) | Note |
+|---|---|---|
+| FP16 | 0.21-0.31 | openpi's own bf16 vs FP32: 0.16-0.28 |
+| W8A8 all projections, alpha 0.5 | 12.7-17.9 | unusable |
+| W8A8 q/k/v + gate/up, alpha 0.8 | 0.78-1.45 (0.10-0.30) | about 5x the bf16 floor |
+
+The full W8A8 prefix runs in 67 ms against 128 ms for FP16; the accurate setting saves less, since a third of
+the prefix FLOPs stay FP16.

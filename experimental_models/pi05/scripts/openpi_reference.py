@@ -52,6 +52,12 @@ def main():
                         type=int,
                         default=None,
                         help="num_steps for sample_actions")
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help=
+        "run openpi's own bfloat16 precision instead of FP32 (its noise floor)"
+    )
     parser.add_argument("--out", required=True)
     parser.add_argument("--noise-out",
                         required=True,
@@ -82,14 +88,16 @@ def main():
 
     # create_trained_policy casts the model to bfloat16, which also rounds buffers such as the
     # RoPE inverse frequencies; casting back cannot restore them. Keep everything FP32 instead.
-    to_precision = PaliGemmaWithExpertModel.to_bfloat16_for_selected_params
-    PaliGemmaWithExpertModel.to_bfloat16_for_selected_params = (
-        lambda self, precision="bfloat16": to_precision(self, "float32"))
+    if not args.bf16:
+        to_precision = PaliGemmaWithExpertModel.to_bfloat16_for_selected_params
+        PaliGemmaWithExpertModel.to_bfloat16_for_selected_params = (
+            lambda self, precision="bfloat16": to_precision(self, "float32"))
     train_config = openpi_config.get_config(args.config)
     policy = policy_config.create_trained_policy(train_config,
                                                  args.checkpoint,
                                                  pytorch_device="cpu")
-    policy._model.to(torch.float32)
+    if not args.bf16:
+        policy._model.to(torch.float32)
 
     request = json.load(open(args.observation))
     observation = {
