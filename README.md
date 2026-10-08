@@ -275,8 +275,12 @@ AGX Orin, two raw SO101 camera frames, `bridge_orig` statistics, against the off
 CPU: identical prompt ids and preprocessed pixels, the same 7 action tokens on both frames (including one decided by
 a 0.04 logit margin), identical actions; 705.8 ms per action in FP16 (vision 22.5 ms, prefill and 7 tokens 683.3 ms).
 Consecutive calls in one process match fresh-process results. Building the 7B FP16 engine peaks near a 64 GB Orin's
-memory (22 GB of GPU allocations plus the 20 GB serialized engine): the OOM killer stopped three of four builds after
-engine generation, so build with little else resident.
+unified memory: TensorRT 10.3 keeps the parser's 13 GB of weights, about 20 GB of plan (its two optimization profiles
+duplicate part of the weights) and about 20 GB of GPU allocations alive at once, 51 GB of host memory at the peak,
+and it cannot stream the plan to disk. With other processes and the page cache holding memory the OOM killer stops
+it during serialization; with about 47 GB available it completes (`llm_build` exit 0, same action tokens on both
+frames), though allocation failures during tactic selection then cost about 10% of LLM time. Build with nothing else
+resident; low-bit weights remove the problem.
 
 ```bash
 python experimental_models/openvla/scripts/openvla_reference.py --checkpoint openvla-7b --image frame.png \

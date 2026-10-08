@@ -27,9 +27,16 @@ constants), prompt template, image placeholder id, action bins and every dataset
 import argparse
 import json
 import os
+import sys
 
 import torch
 from torch import nn
+
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+from tensorrt_edgellm.onnx.trt_workarounds import \
+    apply_trt103_workarounds  # noqa: E402
 
 
 class OpenVLAVision(nn.Module):
@@ -144,6 +151,10 @@ def main():
                           output_names=["image_embeds"],
                           opset_version=17,
                           dynamo=False)
+        rewrites = apply_trt103_workarounds(
+            os.path.join(args.out, "vision.onnx"))
+        if rewrites:
+            print(f"vision: {rewrites} TensorRT 10.3 attention rewrites")
         write_runtime_config(args.checkpoint, args.out)
         print(f"exported -> {args.out}/vision.onnx, config.json")
 
