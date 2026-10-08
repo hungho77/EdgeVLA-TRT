@@ -73,6 +73,7 @@ Gr00tProcessing::Gr00tProcessing(std::string const& path)
     mMaxActionDim = json.at("max_action_dim").get<int32_t>();
     mActionHorizon = json.at("action_horizon").get<int32_t>();
     mClipState = json.value("clip_state", true);
+    mClipActions = json.value("clip_actions", true);
 
     std::map<std::string, int32_t> stateOffsets;
     for (auto const& g : json.at("state"))
@@ -150,9 +151,11 @@ std::vector<float> Gr00tProcessing::decodeActions(float const* modelActions, std
             {
                 double const lo = g.min[row + d];
                 double const hi = g.max[row + d];
-                double const a = std::clamp(
-                    static_cast<double>(modelActions[static_cast<size_t>(t) * mMaxActionDim + g.offset + d]), -1.0,
-                    1.0);
+                double a = modelActions[static_cast<size_t>(t) * mMaxActionDim + g.offset + d];
+                if (mClipActions)
+                {
+                    a = std::clamp(a, -1.0, 1.0);
+                }
                 double v = (a + 1.0) / 2.0 * (hi - lo) + lo;
                 if (g.relative)
                 {
@@ -185,7 +188,11 @@ std::vector<float> Gr00tProcessing::encodeActions(
                 {
                     v -= rawState[g.referenceOffset + d];
                 }
-                double const a = degenerate(lo, hi) ? 0.0 : std::clamp(2.0 * (v - lo) / (hi - lo) - 1.0, -1.0, 1.0);
+                double a = degenerate(lo, hi) ? 0.0 : 2.0 * (v - lo) / (hi - lo) - 1.0;
+                if (mClipActions)
+                {
+                    a = std::clamp(a, -1.0, 1.0);
+                }
                 out[static_cast<size_t>(t) * mMaxActionDim + g.offset + d] = static_cast<float>(a);
             }
         }

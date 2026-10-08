@@ -23,3 +23,20 @@ target_include_directories(
           ${ONNX_PARSER_INCLUDE_DIR})
 target_link_libraries(gr00tExperimental PUBLIC vlaExperimental)
 set_property(TARGET gr00tExperimental PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+# GR00T N1.6's Eagle backbone reproduces albumentations' OpenCV resizes, so it
+# needs OpenCV (JetPack ships it).
+find_package(OpenCV QUIET COMPONENTS core imgproc)
+if(OpenCV_FOUND)
+  add_library(gr00tEagle STATIC gr00tEagleBackbone.cpp)
+  target_include_directories(
+    gr00tEagle
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
+            ${ONNX_PARSER_INCLUDE_DIR} ${OpenCV_INCLUDE_DIRS})
+  target_link_libraries(gr00tEagle PUBLIC vlaExperimental opencv_core
+                                          opencv_imgproc)
+  set_property(TARGET gr00tEagle PROPERTY POSITION_INDEPENDENT_CODE ON)
+else()
+  message(STATUS "OpenCV not found: skipping the GR00T N1.6 Eagle backbone")
+endif()

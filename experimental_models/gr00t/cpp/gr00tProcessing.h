@@ -26,7 +26,7 @@ namespace trt_edgellm
 namespace gr00t
 {
 
-//! One embodiment's state/action processing, from processing.json (export_gr00t_n1_7_processing.py).
+//! One embodiment's state/action processing, from processing.json (export_gr00t_processing.py).
 //! Raw state and actions are the groups concatenated in their modality order.
 class Gr00tProcessing
 {
@@ -61,7 +61,8 @@ public:
     std::vector<float> decodeActions(float const* modelActions, std::vector<float> const& rawState) const;
 
     //! Inverse of decodeActions for chunk rows [0, numRows): absolute raw actions [numRows, rawActionDim] ->
-    //! model actions [numRows, maxActionDim], relative to \p rawState, clipped to [-1, 1], zero-padded.
+    //! model actions [numRows, maxActionDim], relative to \p rawState, clipped to [-1, 1] unless clip_actions is off,
+    //! zero-padded.
     std::vector<float> encodeActions(
         float const* absoluteActions, int32_t numRows, std::vector<float> const& rawState) const;
 
@@ -86,6 +87,7 @@ private:
     int32_t mMaxStateDim{0};
     int32_t mMaxActionDim{0};
     bool mClipState{true};
+    bool mClipActions{true}; //!< N1.5's min_max unnormalization does not clip the model output
 };
 
 } // namespace gr00t

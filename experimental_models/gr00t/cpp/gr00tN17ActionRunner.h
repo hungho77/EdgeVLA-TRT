@@ -33,7 +33,7 @@ namespace trt_edgellm
 namespace gr00t
 {
 
-//! GR00T N1.7 action head on the engines written by export_gr00t_n1_7_action_head.py.
+//! GR00T N1.7 action head on the engines written by export_gr00t_action_head.py.
 //!
 //! One action chunk is prepare() (backbone features -> cached cross-attention K/V), encodeState(), then
 //! sample(), which runs the flow-matching Euler steps. Every buffer is allocated at construction.
