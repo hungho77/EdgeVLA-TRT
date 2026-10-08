@@ -152,7 +152,15 @@ python experimental_models/gr00t/scripts/export_gr00t_action_head.py --gr00t-src
     [--int8-weights --features <pre-norm backbone features .npy> --input-ids <input ids .npy>]
 python experimental_models/gr00t/scripts/export_gr00t_processing.py --gr00t-src <dir holding gr00t/> \
     --checkpoint GR00T-N1.7-SO101-Multitask --embodiment new_embodiment --out engines/action/processing.json
-# then trtexec --fp16 (and --int8 for the W8A8 denoise_step) each of action_onnx/*.onnx into engines/action
+# action engines: the backbone token axis needs a profile (--int8 as well for a W8A8 denoise_step)
+cp action_onnx/config.json engines/action/
+T=backbone_features:1xNx2048,image_mask:1xN,attention_mask:1xN
+trtexec --onnx=action_onnx/vl_prep.onnx --saveEngine=engines/action/vl_prep.engine --fp16 \
+    --minShapes=${T//N/16} --optShapes=${T//N/145} --maxShapes=${T//N/512}
+trtexec --onnx=action_onnx/state_encoder.onnx --saveEngine=engines/action/state_encoder.engine --fp16
+T=cross_keys:16x1xNx1536,cross_values:16x1xNx1536,text_bias:1x1x1xN,image_bias:1x1x1xN
+trtexec --onnx=action_onnx/denoise_step.onnx --saveEngine=engines/action/denoise_step.engine --fp16 \
+    --minShapes=${T//N/16} --optShapes=${T//N/145} --maxShapes=${T//N/512}
 python experimental_models/gr00t/examples/gr00t_policy_client.py --server-cmd "gr00t_policy_server \
     --llmEngineDir engines/llm --multimodalEngineDir engines --actionEngineDir engines/action" ...
 ```
