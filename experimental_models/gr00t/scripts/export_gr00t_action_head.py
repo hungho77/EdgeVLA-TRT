@@ -613,14 +613,27 @@ def main():
     parser.add_argument("--features", help="[tokens, 2048] .npy for --check")
     parser.add_argument("--input-ids", help="[tokens] .npy for --check")
     parser.add_argument("--image-token-id", type=int, default=151655)
+    parser.add_argument(
+        "--denoising-steps",
+        type=int,
+        help=
+        "override the checkpoint's num_inference_timesteps, as Gr00tPolicy(denoising_steps=...)"
+    )
     args = parser.parse_args()
 
-    head, config = load_action_head(args.gr00t_src, args.checkpoint)
+    def load():
+        head, config = load_action_head(args.gr00t_src, args.checkpoint)
+        if args.denoising_steps:
+            head.num_inference_timesteps = args.denoising_steps
+            config.num_inference_timesteps = args.denoising_steps
+        return head, config
+
+    head, config = load()
     index = embodiment_index(args.checkpoint, args.embodiment)
     if args.check:
         check(head, config, index, args.features, args.input_ids,
               args.image_token_id, args.int8_weights)
-        head, config = load_action_head(args.gr00t_src, args.checkpoint)
+        head, config = load()
     if args.out:
         calibration = None
         if args.int8_weights:
