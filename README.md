@@ -22,19 +22,19 @@ support for platforms upstream no longer targets.
 ## Support matrix
 
 VLA and VLN models on AGX Orin 64 GB, JetPack 6.2 (CUDA 12.6, TensorRT 10.3). Each port is verified export → engine
-build → C++ inference against the official implementation (FP32, same inputs and noise); engines are FP16 unless
-noted.
+build → C++ inference against the official implementation (FP32, same inputs and noise); the numbers are in each
+guide. Engines are FP16 unless noted.
 
-| Model | Checkpoint verified | Accuracy vs official | Latency on Orin | RTC | Async loop | Server | Guide |
-|---|---|---|---|:---:|:---:|:---:|---|
-| GR00T N1.7 | `GR00T-N1.7-SO101-Multitask`, `ducido/GR00T-N1.7-SO101-banana-all49` | actions max \|Δ\| 0.21 (joints ±90) | 96.4 ms / chunk (73.1 ms W8A8 DiT) | ✓ | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n17) |
-| GR00T N1.6 | `GR00T-N1.6-SO101-Multitask` | 0.15 / 0.20 (official bf16: 0.29 / 0.16) | 171.7 ms / chunk | ✓ | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n16) |
-| GR00T N1.5 | `GR00T-N1.5-SO101-Multitask` | 0.091 / 0.085 (official bf16: 0.74 / 0.46) | 110.4 ms / chunk | ✓ | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n15) |
-| pi0.5 | openpi `pi05_so101` | within openpi's own bf16 spread | 204.5 ms / chunk (177.9 ms INT8 prefix) | ✓ | ✓ | | [pi0.5](experimental_models/pi05/README.md#so101-pi05_so101) |
-| SmolVLA | LeRobot 0.6.1 | actions within 0.137 (joints ±90) | 83-93 ms / chunk | ✓ | ✓ | | [SmolVLA](experimental_models/smolvla/DESIGN.md) |
-| X-VLA | `lerobot/xvla-base` (LeRobot 0.6.1) | actions max \|Δ\| 0.0008 | 155.8 ms / 30-step chunk | ✓ | ✓ | | [X-VLA](experimental_models/xvla/README.md) |
-| OpenVLA | `openvla/openvla-7b` | identical action tokens | 706 ms / action | | | | [OpenVLA](experimental_models/openvla/README.md) |
-| InternVLA-N1 (VLN) | `InternVLA-N1-DualVLN` | export → build → inference verified | first plan 181 ms, System-1 tick 188 ms | | dual-rate | ✓ | [InternVLA-N1](experimental_models/internvla_n1/README.md) |
+| Model | Checkpoint verified | Latency on Orin | RTC | Async loop | Server | Guide |
+|---|---|---|:---:|:---:|:---:|---|
+| GR00T N1.7 | `GR00T-N1.7-SO101-Multitask`, `ducido/GR00T-N1.7-SO101-banana-all49` | 96.4 ms / chunk (73.1 ms W8A8 DiT) | ✓ | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n17) |
+| GR00T N1.6 | `GR00T-N1.6-SO101-Multitask` | 171.7 ms / chunk | ✓ | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n16) |
+| GR00T N1.5 | `GR00T-N1.5-SO101-Multitask` | 110.4 ms / chunk | ✓ | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n15) |
+| pi0.5 | openpi `pi05_so101` | 204.5 ms / chunk (177.9 ms INT8 prefix) | ✓ | ✓ | | [pi0.5](experimental_models/pi05/README.md#so101-pi05_so101) |
+| SmolVLA | LeRobot 0.6.1 | 83-93 ms / chunk | ✓ | ✓ | | [SmolVLA](experimental_models/smolvla/DESIGN.md) |
+| X-VLA | `lerobot/xvla-base` (LeRobot 0.6.1) | 155.8 ms / 30-step chunk | ✓ | ✓ | | [X-VLA](experimental_models/xvla/README.md) |
+| OpenVLA | `openvla/openvla-7b` | 706 ms / action | | | | [OpenVLA](experimental_models/openvla/README.md) |
+| InternVLA-N1 (VLN) | `InternVLA-N1-DualVLN` | first plan 181 ms, System-1 tick 188 ms | | dual-rate | ✓ | [InternVLA-N1](experimental_models/internvla_n1/README.md) |
 
 - **RTC**: real-time chunking, where the next action chunk is inpainted from the unexecuted tail of the previous one,
   so chunk switches do not jump.
