@@ -29,6 +29,7 @@ support for platforms upstream no longer targets.
 | NVFP4 AWQ `pre_quant_scale`, NVFP4 CASK epilogue cap (TRT 10.13/10.14) | Fixed; needs Thor to verify | [FIXES.md](FIXES.md) |
 | InternLM2-backed InternVL3 checkpoints | Converter | `tensorrt_edgellm/scripts/convert_internlm2_internvl.py` |
 | GR00T N1.7 policy | Backbone through Edge-LLM, action head with cross-attention K/V cached per call; 114.5 ms per action chunk on Orin, matching the official model | [below](#gr00t-n17) |
+| GR00T N1.6 policy | Eagle 3 backbone as plain-op engines with bit-exact official preprocessing, N1.7's action head and RTC; 172 ms per chunk, actions comparable to the official model's own bf16 spread | [below](#gr00t-n16) |
 | VLA replan caching | Encoder-cache partial hits and KV prefix reuse with tail-only hidden capture; ~2× faster InternVLA-N1 replans | [below](#kv-cache-reuse-for-vla-control-loops) |
 
 Upstream VLA support (experimental pi0.5, Alpamayo, Cosmos3-Edge policy) is unchanged and documented under
@@ -91,7 +92,7 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 
 1. **InternVLA-N1 pilot**: done (above), measured on synthetic and real rendered navigation episodes.
 2. **GR00T N1.7**: done ([below](#gr00t-n17)): W8A8 DiT, CUDA-graph denoising, RTC chunking and SO101
-   pre/post-processing.
+   pre/post-processing. **GR00T N1.6**: done ([below](#gr00t-n16)).
 3. **Shared VLA layer**: done ([below](#shared-vla-layer)), extracted from InternVLA-N1 and GR00T.
 4. **Bidirectional-prefix VLAs** (pi0.5, SmolVLA): encoder cache, persistent CUDA graphs, prefix KV pool in
    the core runtime.
@@ -140,14 +141,70 @@ llm_build --onnxDir gr00t_onnx/llm --engineDir engines/llm --maxBatchSize 1 --ma
 visual_build --onnxDir gr00t_onnx/visual --engineDir engines --minImageTokens 16 --maxImageTokens 512 \
     --maxImageTokensPerImage 256
 # action head and processing (need the GR00T N1.7 source and its dependencies, e.g. transformers 4.57 and diffusers)
-python experimental_models/gr00t/scripts/export_gr00t_n1_7_action_head.py --gr00t-src <dir holding gr00t/> \
+python experimental_models/gr00t/scripts/export_gr00t_action_head.py --gr00t-src <dir holding gr00t/> \
     --checkpoint GR00T-N1.7-SO101-Multitask --embodiment new_embodiment --out action_onnx \
     [--int8-weights --features <pre-norm backbone features .npy> --input-ids <input ids .npy>]
-python experimental_models/gr00t/scripts/export_gr00t_n1_7_processing.py --gr00t-src <dir holding gr00t/> \
+python experimental_models/gr00t/scripts/export_gr00t_processing.py --gr00t-src <dir holding gr00t/> \
     --checkpoint GR00T-N1.7-SO101-Multitask --embodiment new_embodiment --out engines/action/processing.json
 # then trtexec --fp16 (and --int8 for the W8A8 denoise_step) each of action_onnx/*.onnx into engines/action
 python experimental_models/gr00t/examples/gr00t_policy_client.py --server-cmd "gr00t_policy_server \
     --llmEngineDir engines/llm --multimodalEngineDir engines --actionEngineDir engines/action" ...
+```
+
+## GR00T N1.6
+
+GR00T N1.6 (SO101 fine-tune) shares N1.7's action head and denoising loop; its backbone is NVIDIA's Eagle 3
+(Eagle-Block2A-2B-v2: a SigLIP2 tower, 2x2 pixel unshuffle and an MLP connector into Qwen3-1.7B truncated to 16
+layers), which Edge-LLM has no model for:
+
+- **Backbone** (`tensorrt_edgellm.models.eagle`): the two halves in plain PyTorch ops, exported as a `visual` and
+  a `prefix` engine (`trtexec --stronglyTyped`). Each camera is its own batch item: the official packed
+  FlashAttention keeps the images apart, and its eager fallback would not (image-token cosine 0.77 between the
+  two). GR00T casts the backbone to bf16 at load, which also rounds Qwen3's RoPE `inv_freq` buffer; the model was
+  trained with those frequencies, so the export reproduces them. The fine-tuned top four LLM layers and the whole
+  action head are stored in FP32, and the official policy rounds them to bf16 when it loads; the engines keep the
+  stored weights.
+- **Preprocessing** (`Gr00tEagleBackbone`, needs OpenCV): albumentations' shortest-edge INTER_AREA resize,
+  95% centre crop and resize again (OpenCV), Eagle's resize to multiples of 28 (a port of Pillow's fixed-point
+  bicubic), the lower-cased, punctuation-free instruction and Eagle's chat template. Pixel values are
+  bit-identical to the official processor's and token ids identical.
+- **Action head and policy**: `export_gr00t_action_head.py` and `export_gr00t_processing.py` take N1.6
+  checkpoints too (`--check`: the split head matches the official `get_action` exactly), and
+  `Gr00tN17Policy`, its RTC included, runs on the Eagle features unchanged.
+
+AGX Orin, two SO101 dataset frames (300, 900) from raw video and raw state, against the official `Gr00tPolicy`
+on the CPU with FP32 activations (its weights as it loads them) and the same x_0 (`scripts/official_reference.py`);
+the official policy as it serves, bf16 throughout, is the precision floor:
+
+| Frames 300 / 900 | FP16 engines | official bf16 |
+|---|---|---|
+| Backbone features, cosine | 0.99764 / 0.99980 | 0.99826 / 0.99119 |
+| Normalized actions, max \|Δ\| | 0.0049 / 0.0029 | 0.0072 / 0.0047 |
+| Absolute SO101 actions, max \|Δ\| (joint range ±90) | 0.148 / 0.202 | 0.287 / 0.159 |
+| Policy step p50, preprocessing to actions (visual 53.9 ms, prefix 30.9 ms) | 171.7 ms | |
+
+A few image tokens are very sensitive to precision in both (lowest per-token cosine 0.45 for the engines on frame
+300, 0.21 for official bf16 on frame 900), and TensorRT rebuilds of the same graph moved the frame-300 backbone
+cosine between 0.994 and 0.9988; the actions stayed at or below the bf16 spread in every build.
+`gr00t_policy_server` is not wired to the Eagle backbone yet.
+
+`gr00t_async_control --eagleBackboneDir` at 30 Hz (horizon 16, overlap 10, frozen 8, drifting state): no stalls,
+planner latency 5-6 ticks, switch jump at most 0.0105 joint units (11.2 with no frozen rows).
+
+```bash
+python experimental_models/gr00t/scripts/official_reference.py --gr00t-src Isaac-GR00T \
+    --checkpoint GR00T-N1.6-SO101-Multitask --modality-config GR00T-N1.6-SO101-Multitask/so101_config.py \
+    --dataset so101-multitask --frame 300 --eager-attention --out ref_f300.npz   # Isaac-GR00T's pins, transformers 4.51.3
+python -m tensorrt_edgellm.models.eagle.export GR00T-N1.6-SO101-Multitask \
+    Isaac-GR00T/gr00t/model/modules/nvidia/Eagle-Block2A-2B-v2 backbone_onnx
+trtexec --onnx=backbone_onnx/visual/model.onnx --saveEngine=engines/backbone/visual.engine --stronglyTyped \
+    --minShapes=pixel_values:1x3x252x336 --optShapes=pixel_values:2x3x252x336 --maxShapes=pixel_values:3x3x252x336
+trtexec --onnx=backbone_onnx/prefix/model.onnx --saveEngine=engines/backbone/prefix.engine --stronglyTyped \
+    --minShapes=token_ids:1x2,image_features:1x1x2048 --optShapes=token_ids:1x260,image_features:1x216x2048 \
+    --maxShapes=token_ids:1x512,image_features:1x324x2048
+cp backbone_onnx/*.json engines/backbone/
+# action head and processing.json as for N1.7 (with the N1.6 source), into engines/action
+gr00t_n16_policy_inference --backboneDir engines/backbone --actionDir engines/action --inputFile obs.json
 ```
 
 ## Shared VLA layer

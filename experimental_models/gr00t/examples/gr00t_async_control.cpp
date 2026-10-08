@@ -15,12 +15,17 @@
  * limitations under the License.
  */
 
-//! GR00T N1.7 asynchronous control loop: a fixed-rate loop executes one action per tick while backbone, action
-//! head and real-time chunking run on the planner thread (vla::AsyncChunker). The robot is simulated: fixed camera
-//! frames and a state that drifts every tick (--drift), so the RTC seed is re-encoded against a moving arm. The
-//! report shows stalls, planner latency in ticks, and the action jump at each chunk switch.
+//! GR00T asynchronous control loop: a fixed-rate loop executes one action per tick while backbone, action head and
+//! real-time chunking run on the planner thread (vla::AsyncChunker). The backbone is N1.7's Edge-LLM VLM
+//! (--llmEngineDir, --multimodalEngineDir, --promptFile) or N1.6's Eagle (--eagleBackboneDir, --task). The robot is
+//! simulated: fixed camera frames and a state that drifts every tick (--drift), so the RTC seed is re-encoded
+//! against a moving arm. The report shows stalls, planner latency in ticks, and the action jump at each chunk switch.
 
 #include "gr00tN17Policy.h"
+#ifdef GR00T_EAGLE_BACKBONE
+#include "gr00tEagleBackbone.h"
+#include "runtime/imageUtils.h"
+#endif
 
 #include "common/tensor.h"
 #include "common/trtUtils.h"
@@ -34,6 +39,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <random>
 #include <sstream>
 #include <string>
@@ -89,22 +95,32 @@ int main(int argc, char** argv)
     std::string const visDir = argOf(argc, argv, "--multimodalEngineDir");
     std::string const actionDir = argOf(argc, argv, "--actionEngineDir");
     std::string const promptFile = argOf(argc, argv, "--promptFile");
+    std::string const eagleDir = argOf(argc, argv, "--eagleBackboneDir");
+    std::string const task = argOf(argc, argv, "--task");
+    bool const eagle = !eagleDir.empty();
     std::vector<std::string> const images = splitComma(argOf(argc, argv, "--images"));
     std::vector<float> rawState;
     for (auto const& v : splitComma(argOf(argc, argv, "--rawState")))
     {
         rawState.push_back(std::stof(v));
     }
-    if (llmDir.empty() || visDir.empty() || actionDir.empty() || promptFile.empty() || images.empty()
-        || rawState.empty())
+    bool const backboneGiven = eagle ? !task.empty() : !(llmDir.empty() || visDir.empty() || promptFile.empty());
+    if (!backboneGiven || actionDir.empty() || images.empty() || rawState.empty())
     {
         std::fprintf(stderr,
-            "usage: %s --llmEngineDir DIR --multimodalEngineDir DIR --actionEngineDir DIR --promptFile FILE\n"
-            "          --images a.png,b.png --rawState v0,v1,... [--ticks 120] [--controlHz 30] [--overlap 8]\n"
-            "          [--frozen 5] [--drift 0.3] [--imageTokenId 151655]\n",
+            "usage: %s (--llmEngineDir DIR --multimodalEngineDir DIR --promptFile FILE | --eagleBackboneDir DIR\n"
+            "          --task TEXT) --actionEngineDir DIR --images a.png,b.png --rawState v0,v1,... [--ticks 120]\n"
+            "          [--controlHz 30] [--overlap 8] [--frozen 5] [--drift 0.3] [--imageTokenId 151655]\n",
             argv[0]);
         return 2;
     }
+#ifndef GR00T_EAGLE_BACKBONE
+    if (eagle)
+    {
+        std::fprintf(stderr, "this build has no Eagle backbone (it needs OpenCV)\n");
+        return 2;
+    }
+#endif
     int32_t const ticks = std::stoi(argOf(argc, argv, "--ticks", "120"));
     double const controlHz = std::stod(argOf(argc, argv, "--controlHz", "30"));
     int32_t const overlap = std::stoi(argOf(argc, argv, "--overlap", "8"));
@@ -112,20 +128,43 @@ int main(int argc, char** argv)
     // Small enough for SO101: joint 4's relative bounds span ~1.9, and a seed outside them is clipped.
     float const drift = std::stof(argOf(argc, argv, "--drift", "0.3"));
     int32_t const imageTokenId = std::stoi(argOf(argc, argv, "--imageTokenId", "151655"));
-    std::ifstream promptStream(promptFile);
-    std::string const prompt((std::istreambuf_iterator<char>(promptStream)), std::istreambuf_iterator<char>());
-
-    auto const pluginHandles = loadEdgellmPluginLib();
     cudaStream_t planStream;
     cudaStreamCreate(&planStream);
-    std::unordered_map<std::string, std::string> const noLora;
-    rt::LLMInferenceRuntime backbone(llmDir, visDir, noLora, planStream);
+    std::unique_ptr<rt::LLMInferenceRuntime> backbone;
+    rt::LLMGenerationRequest request;
+#ifdef GR00T_EAGLE_BACKBONE
+    std::unique_ptr<gr00t::Gr00tEagleBackbone> eagleBackbone;
+    std::vector<rt::imageUtils::ImageData> frames;
+    std::vector<gr00t::Gr00tView> views;
+    if (eagle)
+    {
+        eagleBackbone = std::make_unique<gr00t::Gr00tEagleBackbone>(eagleDir, planStream);
+        for (auto const& path : images)
+        {
+            frames.push_back(rt::imageUtils::loadRgbImageFromFile(path));
+        }
+        for (auto const& frame : frames)
+        {
+            views.push_back(
+                gr00t::Gr00tView{frame.data(), static_cast<int32_t>(frame.height), static_cast<int32_t>(frame.width)});
+        }
+    }
+#endif
+    std::unique_ptr<void, DlDeleter> pluginHandle;
+    if (!eagle)
+    {
+        std::ifstream promptStream(promptFile);
+        std::string const prompt((std::istreambuf_iterator<char>(promptStream)), std::istreambuf_iterator<char>());
+        pluginHandle = loadEdgellmPluginLib();
+        std::unordered_map<std::string, std::string> const noLora;
+        backbone = std::make_unique<rt::LLMInferenceRuntime>(llmDir, visDir, noLora, planStream);
+        request = vla::makeBackboneRequest(prompt, vla::loadImages(images), kCaptureSlot);
+    }
     gr00t::Gr00tN17Policy policy(actionDir, planStream);
     auto const& cfg = policy.runner().config();
     int32_t const horizon = policy.processing().actionHorizon();
     int32_t const actionDim = policy.processing().rawActionDim();
 
-    rt::LLMGenerationRequest const request = vla::makeBackboneRequest(prompt, vla::loadImages(images), kCaptureSlot);
     rt::Tensor noiseHost(rt::Coords(std::vector<int64_t>{cfg.actionHorizon, cfg.actionDim}), rt::DeviceType::kCPU,
         nvinfer1::DataType::kFLOAT, "gr00t::noiseHost");
     rt::Tensor noise(rt::Coords(std::vector<int64_t>{cfg.actionHorizon, cfg.actionDim}), rt::DeviceType::kGPU,
@@ -152,14 +191,27 @@ int main(int argc, char** argv)
         cudaMemcpyAsync(noise.rawPointer(), noiseHost.rawPointer(),
             static_cast<size_t>(cfg.actionHorizon) * cfg.actionDim * sizeof(float), cudaMemcpyHostToDevice, planStream);
 
-        rt::Tensor const* features = vla::runBackbone(backbone, request, planStream);
-        ELLM_CHECK(features != nullptr, "backbone request failed");
+        rt::Tensor const* features = nullptr;
+        std::vector<uint8_t> imageMask;
+#ifdef GR00T_EAGLE_BACKBONE
+        if (eagle)
+        {
+            features = &eagleBackbone->encode(views, task);
+            imageMask = eagleBackbone->imageMask();
+        }
+#endif
+        if (!eagle)
+        {
+            features = vla::runBackbone(*backbone, request, planStream);
+            ELLM_CHECK(features != nullptr, "backbone request failed");
+            imageMask = vla::tokenMask(*backbone, imageTokenId);
+        }
         gr00t::Gr00tN17Policy::Rtc rtc;
         rtc.overlapSteps = overlap;
         rtc.frozenSteps = frozen;
         rtc.startRow = static_cast<int32_t>(tick - lastPlanTick);
-        std::vector<float> chunk = policy.act(*features, vla::tokenMask(backbone, imageTokenId), observation.rawState,
-            noise, planStream, lastPlanTick < 0 ? nullptr : &rtc);
+        std::vector<float> chunk = policy.act(
+            *features, imageMask, observation.rawState, noise, planStream, lastPlanTick < 0 ? nullptr : &rtc);
         lastPlanTick = tick;
         return chunk;
     };

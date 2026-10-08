@@ -40,3 +40,17 @@ target_include_directories(
                               ${ONNX_PARSER_INCLUDE_DIR})
 target_link_libraries(gr00t_async_control PRIVATE gr00tExperimental edgellmCore
                                                   commonLibraryExt)
+
+if(TARGET gr00tEagle)
+  add_executable(gr00t_n16_policy_inference gr00t_n16_policy_inference.cpp)
+  target_include_directories(
+    gr00t_n16_policy_inference
+    PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
+            ${ONNX_PARSER_INCLUDE_DIR})
+  target_link_libraries(
+    gr00t_n16_policy_inference
+    PRIVATE gr00tEagle gr00tExperimental vlaExperimental edgellmCore
+            commonLibraryExt)
+  target_link_libraries(gr00t_async_control PRIVATE gr00tEagle)
+  target_compile_definitions(gr00t_async_control PRIVATE GR00T_EAGLE_BACKBONE)
+endif()
