@@ -1,4 +1,4 @@
-# SmolVLA on EdgeVLA (design notes)
+# SmolVLA on EdgeVLA-TRT (design notes)
 
 Target: [`quangnd58/smolvla-so101-multitask`](https://huggingface.co/quangnd58/smolvla-so101-multitask)
 (LeRobot `v0.6.1`, base `lerobot/smolvla_base`), validated export -> build -> inference against LeRobot's
