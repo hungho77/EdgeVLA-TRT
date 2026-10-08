@@ -48,6 +48,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+from tensorrt_edgellm.onnx.trt_workarounds import \
+    move_key_scale_to_query  # noqa: E402
+
 #: Additive bias for masked backbone positions; finite so FP16 engines stay NaN-free.
 MASKED_BIAS = -30000.0
 
@@ -463,6 +469,9 @@ def _export_onnx(module, args, out, name, **kwargs):
                           dynamo=False,
                           **kwargs)
         model = onnx.load(tmp)
+    rewrites = move_key_scale_to_query(model)
+    if rewrites:
+        print(f"{name}: {rewrites} TensorRT 10.3 attention rewrites")
     onnx.save(model,
               os.path.join(out, f"{name}.onnx"),
               save_as_external_data=True,
