@@ -41,11 +41,12 @@ struct Gr00tView
     int32_t width{0};
 };
 
-//! GR00T N1.6's Eagle backbone on the visual / prefix engines written by
-//! ``tensorrt_edgellm.models.eagle.export``, with the official preprocessing: albumentations
+//! GR00T's Eagle backbone (N1.5 or N1.6) on the visual / prefix engines written by
+//! ``tensorrt_edgellm.models.eagle.export``, with the official preprocessing. N1.6: albumentations
 //! SmallestMaxSize (OpenCV INTER_AREA), FractionalCenterCrop and SmallestMaxSize again, Eagle's
-//! smart_resize with PIL's bicubic resize, [-1, 1] pixels, and the lower-cased, punctuation-free task
-//! in Eagle's chat template.
+//! smart_resize with PIL's bicubic resize, and the lower-cased, punctuation-free task before the images.
+//! N1.5: centre crop and torch's antialiased bilinear resize to 224x224 on [0, 1] floats, truncated to 8 bits,
+//! and the task after the images. Both feed [-1, 1] pixels and Eagle's chat template.
 //!
 //! NOT thread-safe: one instance, one stream; every buffer is allocated at construction.
 class Gr00tEagleBackbone
@@ -92,8 +93,12 @@ private:
     rt::Tensor mContextMemory;
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;
 
+    std::vector<float> preprocessViewN15(Gr00tView const& view) const;
+
+    bool mN15Pipeline{false};
+    bool mTextAfterImages{false};
     int32_t mShortestEdge{256};
-    double mCropFraction{0.95}; //!< double: the crop size is int(side * fraction) in Python
+    double mCropFraction{0.95}; //!< N1.6's crop_fraction or N1.5's crop scale; double: int(side * fraction) in Python
     int32_t mImageHeight{0};
     int32_t mImageWidth{0};
     int32_t mImageTokens{0};

@@ -159,6 +159,99 @@ inline unsigned char clip8(int32_t value)
     return static_cast<unsigned char>(std::clamp(value >> kPrecisionBits, 0, 255));
 }
 
+//! torch's antialiased bilinear coefficients for one axis (F.interpolate(mode="bilinear", antialias=True,
+//! align_corners=False) on FP32), with its float / double promotions.
+struct AxisWeights
+{
+    int32_t maxSize{};
+    std::vector<int32_t> start;
+    std::vector<int32_t> count;
+    std::vector<float> weights; //!< [out, maxSize]
+};
+
+AxisWeights torchAntialiasWeights(int32_t inSize, int32_t outSize)
+{
+    float const scale = static_cast<float>(inSize) / static_cast<float>(outSize);
+    float const support = scale >= 1.0F ? scale : 1.0F;
+    float const invScale = scale >= 1.0F ? 1.0F / scale : 1.0F;
+    AxisWeights a;
+    a.maxSize = static_cast<int32_t>(std::ceil(support)) * 2 + 1;
+    a.start.resize(outSize);
+    a.count.resize(outSize);
+    a.weights.assign(static_cast<size_t>(outSize) * a.maxSize, 0.0F);
+    for (int32_t i = 0; i < outSize; ++i)
+    {
+        auto const center = static_cast<float>(scale * (i + 0.5));
+        auto const xmin = std::max<int64_t>(static_cast<int64_t>(static_cast<double>(center - support) + 0.5), 0);
+        int64_t const xsize = std::clamp<int64_t>(
+            std::min<int64_t>(static_cast<int64_t>(static_cast<double>(center + support) + 0.5), inSize) - xmin, 0,
+            a.maxSize);
+        float* w = &a.weights[static_cast<size_t>(i) * a.maxSize];
+        float total = 0.0F;
+        for (int64_t j = 0; j < xsize; ++j)
+        {
+            auto const x
+                = static_cast<float>((static_cast<double>(static_cast<float>(j + xmin) - center) + 0.5) * invScale);
+            w[j] = std::abs(x) < 1.0F ? 1.0F - std::abs(x) : 0.0F;
+            total += w[j];
+        }
+        if (total != 0.0F)
+        {
+            for (int64_t j = 0; j < xsize; ++j)
+            {
+                w[j] /= total;
+            }
+        }
+        a.start[i] = static_cast<int32_t>(xmin);
+        a.count[i] = static_cast<int32_t>(xsize);
+    }
+    return a;
+}
+
+//! torch's antialiased bilinear resize of planar FP32 [channels, height, width]: the width pass, then the height
+//! pass, each a product then fused multiply-adds in FP32, as torch's aarch64 build accumulates. This order and the
+//! FMAs matter: N1.5 truncates the result to 8 bits, and plain multiply-adds flip ~1% of the pixels by one step.
+std::vector<float> resizeBilinearAntialiasTorch(
+    std::vector<float> const& src, int32_t channels, int32_t height, int32_t width, int32_t outHeight, int32_t outWidth)
+{
+    AxisWeights const wx = torchAntialiasWeights(width, outWidth);
+    std::vector<float> horizontal(static_cast<size_t>(channels) * height * outWidth);
+    for (int64_t row = 0; row < static_cast<int64_t>(channels) * height; ++row)
+    {
+        for (int32_t x = 0; x < outWidth; ++x)
+        {
+            float const* w = &wx.weights[static_cast<size_t>(x) * wx.maxSize];
+            float const* in = &src[row * width + wx.start[x]];
+            float out = in[0] * w[0];
+            for (int32_t j = 1; j < wx.count[x]; ++j)
+            {
+                out = std::fmaf(in[j], w[j], out);
+            }
+            horizontal[row * outWidth + x] = out;
+        }
+    }
+    AxisWeights const wy = torchAntialiasWeights(height, outHeight);
+    std::vector<float> out(static_cast<size_t>(channels) * outHeight * outWidth);
+    for (int32_t c = 0; c < channels; ++c)
+    {
+        for (int32_t y = 0; y < outHeight; ++y)
+        {
+            float const* w = &wy.weights[static_cast<size_t>(y) * wy.maxSize];
+            for (int32_t x = 0; x < outWidth; ++x)
+            {
+                float const* in = &horizontal[(static_cast<size_t>(c) * height + wy.start[y]) * outWidth + x];
+                float value = in[0] * w[0];
+                for (int32_t j = 1; j < wy.count[y]; ++j)
+                {
+                    value = std::fmaf(in[static_cast<size_t>(j) * outWidth], w[j], value);
+                }
+                out[(static_cast<size_t>(c) * outHeight + y) * outWidth + x] = value;
+            }
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 std::vector<unsigned char> Gr00tEagleBackbone::resizeBicubicPil(
@@ -226,8 +319,20 @@ Gr00tEagleBackbone::Gr00tEagleBackbone(std::string const& engineDir, cudaStream_
     Json const config = readJson(engineDir + "/config.json");
     ELLM_CHECK(config.at("model_family").get<std::string>() == "gr00t_eagle",
         "Gr00tEagleBackbone: " + engineDir + " is not a GR00T Eagle backbone");
-    mShortestEdge = config.at("shortest_image_edge").get<int32_t>();
-    mCropFraction = config.at("crop_fraction").get<double>();
+    std::string const pipeline = config.at("image_pipeline").get<std::string>();
+    ELLM_CHECK(
+        pipeline == "gr00t_n16" || pipeline == "gr00t_n15", "Gr00tEagleBackbone: unknown image pipeline " + pipeline);
+    mN15Pipeline = pipeline == "gr00t_n15";
+    if (mN15Pipeline)
+    {
+        mCropFraction = config.at("crop_scale").get<double>();
+    }
+    else
+    {
+        mShortestEdge = config.at("shortest_image_edge").get<int32_t>();
+        mCropFraction = config.at("crop_fraction").get<double>();
+    }
+    mTextAfterImages = config.at("text_after_images").get<bool>();
     mImageHeight = config.at("image_height").get<int32_t>();
     mImageWidth = config.at("image_width").get<int32_t>();
     mImageTokens = config.at("image_tokens_per_view").get<int32_t>();
@@ -249,6 +354,9 @@ Gr00tEagleBackbone::Gr00tEagleBackbone(std::string const& engineDir, cudaStream_
     mVisual = vla::TrtEngine(*mRuntime, engineDir + "/visual.engine", stream);
     mPrefix = vla::TrtEngine(*mRuntime, engineDir + "/prefix.engine", stream);
     mContextMemory = vla::allocateSharedContextMemory({&mVisual, &mPrefix}, "gr00t::eagleContextMemory");
+    mMaxTokens = std::min<int32_t>(mMaxTokens,
+        static_cast<int32_t>(
+            mPrefix.engine().getProfileShape("token_ids", 0, nvinfer1::OptProfileSelector::kMAX).d[1]));
 
     int64_t const pixels = static_cast<int64_t>(mMaxViews) * 3 * mImageHeight * mImageWidth;
     mPixelsHost = makeTensor({pixels}, DataType::kHALF, "gr00t::pixelsHost", rt::DeviceType::kCPU);
@@ -288,7 +396,8 @@ std::string Gr00tEagleBackbone::formalize(std::string const& task)
 
 std::string Gr00tEagleBackbone::prompt(std::string const& task, int32_t numViews) const
 {
-    std::string text = mPromptPrefix + (mFormalize ? formalize(task) : task);
+    std::string const instruction = mFormalize ? formalize(task) : task;
+    std::string text = mPromptPrefix + (mTextAfterImages ? "" : instruction);
     std::string context;
     for (int32_t i = 0; i < mImageTokens; ++i)
     {
@@ -300,11 +409,45 @@ std::string Gr00tEagleBackbone::prompt(std::string const& task, int32_t numViews
         prefix.replace(prefix.find("{index}"), 7, std::to_string(v + 1));
         text += prefix + context + mImageSuffix;
     }
-    return text + mPromptSuffix;
+    return text + (mTextAfterImages ? instruction : "") + mPromptSuffix;
+}
+
+std::vector<float> Gr00tEagleBackbone::preprocessViewN15(Gr00tView const& view) const
+{
+    // VideoToTensor ([0, 1] floats), VideoCrop (eval: centre crop of int(side * scale)), VideoResize (bilinear,
+    // antialiased) and VideoToNumpy (truncation to 8 bits); Eagle 2.5 then sees a single tile.
+    int32_t const cropH = static_cast<int32_t>(view.height * mCropFraction);
+    int32_t const cropW = static_cast<int32_t>(view.width * mCropFraction);
+    int32_t const top = pyRound((view.height - cropH) / 2.0);
+    int32_t const left = pyRound((view.width - cropW) / 2.0);
+    std::vector<float> crop(static_cast<size_t>(3) * cropH * cropW);
+    for (int32_t c = 0; c < 3; ++c)
+    {
+        for (int32_t y = 0; y < cropH; ++y)
+        {
+            for (int32_t x = 0; x < cropW; ++x)
+            {
+                crop[(static_cast<size_t>(c) * cropH + y) * cropW + x]
+                    = static_cast<float>(view.rgb[(static_cast<size_t>(top + y) * view.width + left + x) * 3 + c])
+                    / 255.0F;
+            }
+        }
+    }
+    std::vector<float> planar = resizeBilinearAntialiasTorch(crop, 3, cropH, cropW, mImageHeight, mImageWidth);
+    for (float& value : planar)
+    {
+        float const pixel = static_cast<float>(static_cast<unsigned char>(value * 255.0F)) * (1.0F / 255.0F);
+        value = (pixel - 0.5F) / 0.5F;
+    }
+    return planar;
 }
 
 std::vector<float> Gr00tEagleBackbone::preprocessView(Gr00tView const& view) const
 {
+    if (mN15Pipeline)
+    {
+        return preprocessViewN15(view);
+    }
     cv::Mat const frame(view.height, view.width, CV_8UC3, const_cast<unsigned char*>(view.rgb));
     cv::Mat image = smallestMaxSize(frame, mShortestEdge);
     int32_t const cropH = std::max(1, static_cast<int32_t>(image.rows * mCropFraction));

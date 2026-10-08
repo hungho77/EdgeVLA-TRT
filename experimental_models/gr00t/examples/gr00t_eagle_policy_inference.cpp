@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-//! GR00T N1.6 policy call on a raw observation: Eagle backbone -> action head -> absolute joint targets.
+//! GR00T N1.5 / N1.6 policy call on a raw observation: Eagle backbone -> action head -> absolute joint targets.
 //! Request JSON in ({"task", "state", "cameras": {video key: image path}}), action chunk out; cameras are fed in
 //! processing.json's video_keys order.
 

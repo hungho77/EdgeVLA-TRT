@@ -31,6 +31,7 @@ support for platforms upstream no longer targets.
 | GR00T N1.7 policy | Backbone through Edge-LLM, action head with cross-attention K/V cached per call; 114.5 ms per action chunk on Orin, matching the official model | [below](#gr00t-n17) |
 | pi0.5 SO101 policy (openpi `pi05_so101`) | JetPack 6 engines with SO101 pre/post-processing, RTC with state-relative re-encoding, async control, opt-in INT8 prefix; 204.5 ms per call (177.9 ms INT8), matching openpi FP32 within its own bf16 spread | [pi0.5](experimental_models/pi05/README.md#so101-pi05_so101) |
 | SmolVLA policy (LeRobot 0.6.1) | Visual / prefix / denoise engines from plain PyTorch ops, RTC as flow-path inpainting, async control; 83-93 ms per call, robot actions within 0.137 of LeRobot | [design](experimental_models/smolvla/DESIGN.md) |
+| GR00T N1.5 policy | Eagle 2.5 backbone and N1.5's action head (future tokens) on the same runtime, bit-exact preprocessing, RTC; 110 ms per chunk, well inside the official model's bf16 spread | [below](#gr00t-n15) |
 | GR00T N1.6 policy | Eagle 3 backbone as plain-op engines with bit-exact official preprocessing, N1.7's action head and RTC; 172 ms per chunk, actions comparable to the official model's own bf16 spread | [below](#gr00t-n16) |
 | VLA replan caching | Encoder-cache partial hits and KV prefix reuse with tail-only hidden capture; ~2× faster InternVLA-N1 replans | [below](#kv-cache-reuse-for-vla-control-loops) |
 
@@ -94,11 +95,11 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 
 1. **InternVLA-N1 pilot**: done (above), measured on synthetic and real rendered navigation episodes.
 2. **GR00T N1.7**: done ([below](#gr00t-n17)): W8A8 DiT, CUDA-graph denoising, RTC chunking and SO101
-   pre/post-processing. **GR00T N1.6**: done ([below](#gr00t-n16)).
+   pre/post-processing. **GR00T N1.6** and **N1.5**: done ([below](#gr00t-n16)).
 3. **Shared VLA layer**: done ([below](#shared-vla-layer)), extracted from InternVLA-N1 and GR00T.
 4. **Bidirectional-prefix VLAs**: pi0.5 SO101 and SmolVLA policy runtimes done, with RTC and async control;
    the encoder cache and prefix KV pool in the core runtime are still open.
-5. **More VLAs**: GR00T N1.5, OpenVLA, X-VLA.
+5. **More VLAs**: OpenVLA, X-VLA.
 
 ## GR00T N1.7
 
@@ -191,6 +192,44 @@ A few image tokens are very sensitive to precision in both (lowest per-token cos
 cosine between 0.994 and 0.9988; the actions stayed at or below the bf16 spread in every build.
 `gr00t_policy_server` is not wired to the Eagle backbone yet.
 
+### GR00T N1.5
+
+GR00T N1.5 (SO101 fine-tune, data config `so100_dualcam`) runs on the same pieces:
+
+- **Backbone**: Eagle 2.5, SigLIP at 224x224 (256 tokens per camera, no pixel unshuffle), a linear connector and
+  Qwen3 cut to 12 layers; `tensorrt_edgellm.models.eagle` picks the variant from the checkpoint. N1.5 loads with
+  `from_pretrained(torch_dtype=bfloat16)`, which leaves the RoPE `inv_freq` buffer in FP32, so N1.5 keeps the exact
+  frequencies (N1.6 rounds them).
+- **Action head**: the same DiT with N1.5's 32 learned target-vision tokens between state and actions, a 4-layer
+  VL self-attention, and cross-attention over every backbone token; the split head matches `get_action` exactly.
+- **Preprocessing**: 95% centre crop and torch's antialiased bilinear resize to 224x224 on [0, 1] floats, truncated
+  to 8 bits, then the instruction after the images. The truncation makes the resize's arithmetic visible: the port
+  uses torch's FP32 weights, its width-then-height order and fused multiply-adds, which plain multiply-adds miss
+  on ~1% of the pixels. Min/max state and action normalization without clipping (`clip_actions: false`).
+- **Language**: N1.5's official clients pass the instruction as a one-element list, which the batched transform
+  renders as `"['Pick up ...']"`, while training saw the plain text; the port feeds the plain text
+  (`official_reference.py --n15-served-language` reproduces the served prompt; actions move up to 0.30).
+
+| Frames 300 / 900, vs official FP32 | FP16 engines | official bf16 |
+|---|---|---|
+| Absolute SO101 actions, max \|Δ\| | 0.091 / 0.085 | 0.741 / 0.456 |
+| Normalized actions, max \|Δ\| (frame 300) | 0.0016 | |
+| Policy step p50 (visual 22.9 ms, prefix 39.9 ms) | 110.4 ms | |
+
+Pixel values are bit-identical and token ids identical on both frames. `gr00t_async_control --eagleBackboneDir` at
+30 Hz (overlap 8, frozen 5): no stalls, planner latency 4 ticks, switch jump 0.0000 (14.2 with no frozen rows).
+
+```bash
+python experimental_models/gr00t/scripts/official_reference.py --gr00t-src groot-n15 \
+    --checkpoint GR00T-N1.5-SO101-Multitask --n15-data-config so100_dualcam --dataset so101-multitask \
+    --frame 300 --eager-attention --out ref_f300.npz   # N1.5's pins; pytorch3d, decord, flash_attn unused
+python -m tensorrt_edgellm.models.eagle.export GR00T-N1.5-SO101-Multitask \
+    groot-n15/gr00t/model/backbone/eagle2_hg_model backbone_onnx
+python experimental_models/gr00t/scripts/export_gr00t_processing.py --gr00t-src groot-n15 \
+    --checkpoint GR00T-N1.5-SO101-Multitask --n15-data-config so100_dualcam --out engines/action/processing.json
+# action head as for N1.6 (--max-backbone-tokens 1024); engines with trtexec as above, 224x224 images
+```
+
 `gr00t_async_control --eagleBackboneDir` at 30 Hz (horizon 16, overlap 10, frozen 8, drifting state): no stalls,
 planner latency 5-6 ticks, switch jump at most 0.0105 joint units (11.2 with no frozen rows).
 
@@ -207,7 +246,7 @@ trtexec --onnx=backbone_onnx/prefix/model.onnx --saveEngine=engines/backbone/pre
     --maxShapes=token_ids:1x512,image_features:1x324x2048
 cp backbone_onnx/*.json engines/backbone/
 # action head and processing.json as for N1.7 (with the N1.6 source), into engines/action
-gr00t_n16_policy_inference --backboneDir engines/backbone --actionDir engines/action --inputFile obs.json
+gr00t_eagle_policy_inference --backboneDir engines/backbone --actionDir engines/action --inputFile obs.json
 ```
 
 ## Shared VLA layer
