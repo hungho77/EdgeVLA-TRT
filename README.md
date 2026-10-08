@@ -1,6 +1,6 @@
 <div align="center">
 
-# EdgeVLA
+# EdgeVLA-TRT
 
 **Vision-Language-Action inference on NVIDIA Jetson, built on NVIDIA TensorRT Edge-LLM**
 
@@ -10,12 +10,12 @@
 
 </div>
 
-EdgeVLA is a fork of [NVIDIA TensorRT Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM) focused on
+EdgeVLA-TRT is a fork of [NVIDIA TensorRT Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM) focused on
 Vision-Language-Action (VLA), vision-language navigation (VLN) and world-action models on edge devices. It keeps
 Edge-LLM's export → engine build → C++ runtime pipeline and adds VLA models, VLA-oriented runtime work, and
 support for platforms upstream no longer targets.
 
-> EdgeVLA is an independent project. It is not an NVIDIA product and is not endorsed by NVIDIA. NVIDIA and
+> EdgeVLA-TRT is an independent project. It is not an NVIDIA product and is not endorsed by NVIDIA. NVIDIA and
 > TensorRT are trademarks of NVIDIA Corporation. Code from upstream keeps its NVIDIA copyright headers and is
 > distributed under the Apache License 2.0.
 
@@ -372,7 +372,7 @@ The build, export and runtime workflow is upstream's:
 On JetPack 6 follow [JETPACK6.md](JETPACK6.md) instead of the JetPack 7 build line.
 
 ```bash
-git clone --recurse-submodules https://github.com/hungho77/edge-vla.git
+git clone --recurse-submodules https://github.com/hungho77/EdgeVLA-TRT.git
 ```
 
 Python packages, CLI names (`tensorrt-edgellm-*`) and C++ namespaces keep their upstream names so that
