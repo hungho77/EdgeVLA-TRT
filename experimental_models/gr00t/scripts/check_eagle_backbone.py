@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Eager parity of the plain-op Eagle backbone against the official GR00T N1.6 features.
+"""Eager parity of the plain-op Eagle backbone against the official GR00T N1.5 / N1.6 features.
 
 Feeds the pixel values and token ids captured by ``official_reference.py`` to
 ``tensorrt_edgellm.models.eagle`` (FP32, or FP16 with --fp16) and compares the backbone features.
@@ -30,9 +30,9 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
-from tensorrt_edgellm.models.eagle.modeling_eagle import (EagleConfig,
-                                                          EaglePrefix,
+from tensorrt_edgellm.models.eagle.modeling_eagle import (EaglePrefix,
                                                           EagleVisual,
+                                                          gr00t_eagle_config,
                                                           load_eagle_weights)
 
 
@@ -45,7 +45,7 @@ def load_backbone_state(checkpoint):
         with safe_open(os.path.join(checkpoint, shard), "pt") as f:
             for key in f.keys():
                 if key.startswith(
-                        "backbone.model."
+                        "backbone."
                 ) and "lm_head" not in key and ".head." not in key:
                     state[key] = f.get_tensor(key).float()
     return state
@@ -66,16 +66,15 @@ def main():
     args = parser.parse_args()
 
     ref = np.load(args.reference)
-    pixels = np.concatenate([
-        ref[k] for k in sorted(f for f in ref.files
-                               if f.startswith("backbone_input.pixel_values."))
-    ])
-    cfg = EagleConfig(
-        image_height=pixels.shape[2],
-        image_width=pixels.shape[3],
-        text_layers=int(
-            json.load(open(os.path.join(args.checkpoint,
-                                        "config.json")))["select_layer"]))
+    if "backbone_input.eagle_pixel_values" in ref.files:
+        pixels = ref["backbone_input.eagle_pixel_values"]
+    else:
+        pixels = np.concatenate([
+            ref[k]
+            for k in sorted(f for f in ref.files
+                            if f.startswith("backbone_input.pixel_values."))
+        ])
+    cfg = gr00t_eagle_config(args.checkpoint, pixels.shape[2], pixels.shape[3])
     visual, prefix = EagleVisual(cfg), EaglePrefix(cfg)
     state = load_backbone_state(args.checkpoint)
     if args.bf16_weights:

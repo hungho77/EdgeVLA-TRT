@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Export a GR00T N1.6 or N1.7 action head as three ONNX graphs for one embodiment.
+"""Export a GR00T N1.5, N1.6 or N1.7 action head as three ONNX graphs for one embodiment.
 
 The DiT's cross-attention keys and values depend only on the backbone
 features, which are fixed for a whole action-chunk call, so they are computed
@@ -55,6 +55,10 @@ MASKED_BIAS = -30000.0
 def head_classes(model_type):
     """The official config and action-head classes for a checkpoint's model_type."""
     import importlib
+    if model_type == "gr00t_n1_5":
+        module = importlib.import_module(
+            "gr00t.model.action_head.flow_matching_action_head")
+        return module.FlowmatchingActionHeadConfig, module.FlowmatchingActionHead
     version = {"Gr00tN1d6": "n1d6", "Gr00tN1d7": "n1d7"}.get(model_type)
     if version is None:
         raise SystemExit(f"unsupported GR00T model_type {model_type!r}")
@@ -72,6 +76,8 @@ def load_action_head(gr00t_src, checkpoint):
 
     config_dict = json.load(open(os.path.join(checkpoint, "config.json")))
     config_class, head_class = head_classes(config_dict["model_type"])
+    if config_dict["model_type"] == "gr00t_n1_5":
+        config_dict = config_dict["action_head_cfg"]
     config = config_class(**{
         k: v
         for k, v in config_dict.items() if v is not None
@@ -92,8 +98,12 @@ def load_action_head(gr00t_src, checkpoint):
 
 
 def embodiment_index(checkpoint, embodiment):
-    mapping = json.load(open(os.path.join(checkpoint, "embodiment_id.json")))
-    return int(mapping[embodiment])
+    path = os.path.join(checkpoint, "embodiment_id.json")
+    if os.path.exists(path):
+        return int(json.load(open(path))[embodiment])
+    # N1.5 checkpoints rely on the source tree's mapping.
+    from gr00t.data.embodiment_tags import EMBODIMENT_TAG_MAPPING
+    return int(EMBODIMENT_TAG_MAPPING[embodiment])
 
 
 def slice_embodiment(module, index):
@@ -118,13 +128,21 @@ class VLPrep(nn.Module):
         self.vl_self_attention = getattr(head, "vl_self_attention",
                                          nn.Identity())
         self.cross = nn.ModuleList(cross_blocks(head))
+        # N1.5's DiT cross-attends every backbone token in every cross block; N1.6 / N1.7 alternate text and
+        # image tokens.
+        self.alternate = bool(
+            getattr(head.config, "use_alternate_vl_dit", False))
 
     def forward(self, backbone_features, image_mask, attention_mask):
         features = self.vl_self_attention(self.vlln(backbone_features))
         keys = torch.stack([b.attn1.to_k(features) for b in self.cross])
         values = torch.stack([b.attn1.to_v(features) for b in self.cross])
-        text = (~image_mask) & attention_mask
-        image = image_mask & attention_mask
+        if self.alternate:
+            text = (~image_mask) & attention_mask
+            image = image_mask & attention_mask
+        else:
+            # image_mask stays a graph input so every version binds the same tensors.
+            text = image = attention_mask & (image_mask | ~image_mask)
         zero = torch.zeros_like(backbone_features[..., 0])
         text_bias = torch.where(text, zero, zero + MASKED_BIAS)[:, None,
                                                                 None, :]
@@ -156,6 +174,8 @@ class DenoiseStep(nn.Module):
         self.action_encoder = head.action_encoder
         self.action_decoder = head.action_decoder
         self.position_embedding = head.position_embedding if head.config.add_pos_embed else None
+        # N1.5's learned target-vision tokens sit between the state and the actions.
+        self.future_tokens = getattr(head, "future_tokens", None)
         self.blocks = head.model.transformer_blocks
         self.norm_out = head.model.norm_out
         self.proj_out_2 = head.model.proj_out_2
@@ -216,7 +236,13 @@ class DenoiseStep(nn.Module):
         if self.position_embedding is not None:
             action_features = action_features + self.position_embedding.weight[:actions.shape[
                 1]][None]
-        hidden = torch.cat((state_features, action_features), dim=1)
+        tokens = [state_features, action_features]
+        if self.future_tokens is not None:
+            tokens.insert(
+                1,
+                self.future_tokens.weight[None].expand(actions.shape[0], -1,
+                                                       -1))
+        hidden = torch.cat(tokens, dim=1)
         cross_index = 0
         for index, block in enumerate(self.blocks):
             normed = self._ada_norm(block, hidden, block_mods[index])
@@ -347,8 +373,12 @@ def calibration_run(vl_prep,
 
 
 def split_modules(head, config):
-    return (VLPrep(head), StateEncoder(head),
-            DenoiseStep(head, config.attend_text_every_n_blocks))
+    return (
+        VLPrep(head),
+        StateEncoder(head),
+        # N1.5 has no text / image split (both biases are its attention mask); alternating them anyway keeps
+        # both graph inputs, so every version binds the same tensors.
+        DenoiseStep(head, getattr(config, "attend_text_every_n_blocks", 2)))
 
 
 def run_split(vl_prep, state_encoder, denoise, features, image_mask,

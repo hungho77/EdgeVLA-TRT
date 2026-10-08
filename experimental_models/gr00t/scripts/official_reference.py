@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Official GR00T N1.6 reference for one raw dataset observation.
+"""Official GR00T N1.5 / N1.6 reference for one raw dataset observation.
 
 Runs the GR00T source tree's own ``Gr00tPolicy`` on the CPU from a seeded x_0, in FP32 (the
 policy's bf16 weights, FP32 activations) or with --bf16 as the policy serves (the precision floor), and
@@ -23,6 +23,10 @@ prediction and the absolute actions.
     python official_reference.py --gr00t-src Isaac-GR00T --checkpoint GR00T-N1.6-SO101-Multitask \\
         --modality-config GR00T-N1.6-SO101-Multitask/so101_config.py --dataset so101-multitask \\
         --frame 300 --eager-attention --out ref_f300.npz
+
+N1.5 checkpoints take the N1.5 source tree and policy API: pass --n15-data-config with the data config the
+checkpoint was fine-tuned with (e.g. so100_dualcam); its video keys are fed the dataset cameras in --video-keys
+order.
 """
 
 import argparse
@@ -103,8 +107,20 @@ def main():
     parser.add_argument("--bf16",
                         action="store_true",
                         help="run as the policy serves, activations in bf16")
+    parser.add_argument(
+        "--n15-data-config",
+        help=
+        "GR00T N1.5: the fine-tuning data config; selects the N1.5 policy API")
+    parser.add_argument(
+        "--n15-served-language",
+        action="store_true",
+        help=
+        "N1.5: keep the serving path's prompt, which renders the batched instruction as its "
+        "numpy repr (['...']); by default the prompt holds the plain text, as in training"
+    )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+    n15 = args.n15_data_config is not None
 
     sys.path.insert(0, args.gr00t_src)
     from unittest import mock
@@ -112,18 +128,38 @@ def main():
     import gr00t.model  # noqa: F401  registers the models and processors
     import torch
     from gr00t.data.embodiment_tags import EmbodimentTag
-    from gr00t.policy import gr00t_policy
+    if n15:
+        from gr00t.experiment.data_config import load_data_config
+        from gr00t.model import policy as gr00t_policy
+    else:
+        from gr00t.policy import gr00t_policy
     if args.modality_config:
         exec(
             open(args.modality_config).read(), {"__name__": "modality_config"})
 
+    if not torch.cuda.is_available():
+        # Eagle 2.5's RADIO module (unused by GR00T) reads the GPU capability when it is imported.
+        torch.cuda.get_device_capability = lambda *a, **kw: (0, 0)
     if args.eager_attention:
         from transformers.modeling_utils import PreTrainedModel
         PreTrainedModel._check_and_enable_flash_attn_2 = classmethod(
             lambda cls, config, *a, **kw: config)
-    policy = gr00t_policy.Gr00tPolicy(EmbodimentTag(args.embodiment),
-                                      args.checkpoint,
-                                      device="cpu")
+    if n15:
+        if not args.n15_served_language:
+            from gr00t.model.transforms import GR00TTransform
+            prepare_language = GR00TTransform._prepare_language
+            GR00TTransform._prepare_language = lambda self, data: str(
+                np.asarray(prepare_language(self, data)).reshape(-1)[0])
+        data_config = load_data_config(args.n15_data_config)
+        policy = gr00t_policy.Gr00tPolicy(args.checkpoint,
+                                          args.embodiment,
+                                          data_config.modality_config(),
+                                          data_config.transform(),
+                                          device="cpu")
+    else:
+        policy = gr00t_policy.Gr00tPolicy(EmbodimentTag(args.embodiment),
+                                          args.checkpoint,
+                                          device="cpu")
     if not args.bf16:
         policy.model.float()
     if args.eager_attention:
@@ -140,7 +176,7 @@ def main():
                 module.eager_attention_forward = _packed_eager(
                     module.eager_attention_forward)
     head = policy.model.action_head
-    horizon, action_dim = head.config.action_horizon, head.action_dim
+    horizon, action_dim = head.config.action_horizon, head.config.action_dim if n15 else head.action_dim
     noise = np.random.default_rng(args.seed).standard_normal(
         (1, horizon, action_dim)).astype(np.float32)
 
@@ -162,8 +198,9 @@ def main():
     def spy_head(backbone_output, action_input, *a, **kw):
         captured["backbone_features"] = backbone_output["backbone_features"][
             0].detach().float().numpy()
-        captured["image_mask"] = backbone_output["image_mask"][0].detach(
-        ).numpy()
+        if "image_mask" in backbone_output:
+            captured["image_mask"] = backbone_output["image_mask"][0].detach(
+            ).numpy()
         captured["state"] = action_input["state"][0].detach().float().numpy()
         captured["embodiment_id"] = int(action_input["embodiment_id"][0])
         out = real_head_get_action(backbone_output, action_input, *a, **kw)
@@ -190,7 +227,7 @@ def main():
                             item)
         return real_backbone_forward(vl_input, *a, **kw)
 
-    eagle = getattr(backbone, "model", None)
+    eagle = getattr(backbone, "eagle_model" if n15 else "model", None)
     real_extract = getattr(eagle, "extract_feature", None)
 
     def spy_extract(*a, **kw):
@@ -215,17 +252,28 @@ def main():
         name, dim = item.split(":")
         split[name] = state[None, None, offset:offset + int(dim)]
         offset += int(dim)
-    observation = {
-        "video": {
-            k: v[None, None]
-            for k, v in frames.items()
-        },
-        "state": split,
-        "language": {
-            "annotation.human.task_description": [[instruction]]
-        },
-    }
-    keep_dtype = mock.MagicMock() if args.bf16 else mock.patch.object(
+    if n15:
+        observation = {
+            key: frames[camera][None]
+            for key, camera in zip(data_config.video_keys, args.video_keys)
+        }
+        observation.update({
+            f"state.{name}": value[0]
+            for name, value in split.items()
+        })
+        observation["annotation.human.task_description"] = [instruction]
+    else:
+        observation = {
+            "video": {
+                k: v[None, None]
+                for k, v in frames.items()
+            },
+            "state": split,
+            "language": {
+                "annotation.human.task_description": [[instruction]]
+            },
+        }
+    keep_dtype = mock.MagicMock() if args.bf16 or n15 else mock.patch.object(
         gr00t_policy, "_rec_to_dtype", lambda x, dtype: x)
     with keep_dtype, \
             mock.patch.object(head, "get_action", spy_head), \
@@ -233,9 +281,18 @@ def main():
             mock.patch.object(backbone, "forward", spy_backbone), \
             (mock.patch.object(eagle, "extract_feature", spy_extract) if real_extract else mock.MagicMock()), \
             mock.patch("torch.randn", side_effect=fixed_randn), torch.no_grad():
-        actions, _ = policy.get_action(observation)
-    absolute = np.concatenate([actions[k][0] for k in split if k in actions],
-                              axis=-1)
+        actions = policy.get_action(observation)
+        if not n15:
+            actions = actions[0]
+    if n15:
+        absolute = np.concatenate([actions[f"action.{k}"] for k in split],
+                                  axis=-1)
+        captured["input_ids"] = captured["backbone_input.eagle_input_ids"][0]
+        captured["image_mask"] = captured[
+            "input_ids"] == eagle.config.image_token_index
+    else:
+        absolute = np.concatenate(
+            [actions[k][0] for k in split if k in actions], axis=-1)
     np.savez(args.out,
              noise=noise,
              raw_state=state,

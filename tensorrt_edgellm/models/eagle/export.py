@@ -12,14 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Export a GR00T N1.6 Eagle backbone as visual / prefix ONNX components (FP16, batch 1).
+"""Export a GR00T N1.5 or N1.6 Eagle backbone as visual / prefix ONNX components (FP16, batch 1).
 
     python -m tensorrt_edgellm.models.eagle.export <gr00t checkpoint> <eagle dir> <out_dir>
 
-``<eagle dir>`` is the Eagle-Block2A-2B-v2 directory of the GR00T source tree
-(``gr00t/model/modules/nvidia/Eagle-Block2A-2B-v2``), which holds the tokenizer. Writes
-``<out_dir>/{visual,prefix}/model.onnx``, ``tokenizer.json`` and ``config.json`` with the image
-pipeline and prompt layout the runtime reproduces.
+``<eagle dir>`` is the Eagle directory of the matching GR00T source tree, which holds the tokenizer:
+``gr00t/model/modules/nvidia/Eagle-Block2A-2B-v2`` (N1.6) or ``gr00t/model/backbone/eagle2_hg_model``
+(N1.5). Writes ``<out_dir>/{visual,prefix}/model.onnx``, ``tokenizer.json`` and ``config.json`` with
+the image pipeline and prompt layout the runtime reproduces. N1.5's image pipeline comes from its data
+config, which lives in the source tree: every N1.5 data config centre-crops 95% and resizes to 224x224
+(--n15-crop-scale, --n15-image-size).
 """
 
 import argparse
@@ -31,12 +33,13 @@ import torch
 
 from ...onnx.export_encoder import _run_dynamo_export
 from .modeling_eagle import (EagleConfig, EaglePrefix, EagleVisual,
-                             load_eagle_weights)
+                             gr00t_eagle_config, load_eagle_weights)
 
 logger = logging.getLogger(__name__)
 
 MAX_VIEWS = 3
-MAX_TOKENS = 512
+MAX_TOKENS = 1024
+PROMPT_PREFIX = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
 
 
 def load_backbone_state(checkpoint: str) -> dict:
@@ -49,7 +52,7 @@ def load_backbone_state(checkpoint: str) -> dict:
         with safe_open(os.path.join(checkpoint, shard), "pt") as f:
             for key in f.keys():
                 if key.startswith(
-                        "backbone.model."
+                        "backbone."
                 ) and "lm_head" not in key and ".head." not in key:
                     state[key] = f.get_tensor(key).float()
     return state
@@ -71,9 +74,23 @@ def image_size(processor: dict, height: int, width: int):
     return max(28, round(h / 28) * 28), max(28, round(w / 28) * 28)
 
 
-def export_eagle(checkpoint: str, eagle_dir: str, out_dir: str,
-                 camera_height: int, camera_width: int) -> None:
+def runtime_config(checkpoint: str, camera_height: int, camera_width: int,
+                   n15_crop_scale: float, n15_image_size: int) -> dict:
+    """The image pipeline and prompt layout of the checkpoint's version, as config.json fields."""
     model_config = json.load(open(os.path.join(checkpoint, "config.json")))
+    if model_config["model_type"] == "gr00t_n1_5":
+        # VideoCrop (eval: centre crop) and VideoResize (bilinear, antialiased) on [0, 1] floats, then
+        # uint8; Eagle 2.5 then sees one 224 tile. The images come before the instruction, and the template
+        # adds the assistant turn.
+        return {
+            "image_pipeline": "gr00t_n15",
+            "crop_scale": n15_crop_scale,
+            "image_height": n15_image_size,
+            "image_width": n15_image_size,
+            "formalize_language": False,
+            "text_after_images": True,
+            "prompt_suffix": "<|im_end|>\n<|im_start|>assistant\n",
+        }
     processor = json.load(
         open(os.path.join(checkpoint,
                           "processor_config.json")))["processor_kwargs"]
@@ -87,9 +104,22 @@ def export_eagle(checkpoint: str, eagle_dir: str, out_dir: str,
             "only the albumentations shortest-edge / fractional-crop image pipeline is supported"
         )
     height, width = image_size(processor, camera_height, camera_width)
-    cfg = EagleConfig(image_height=height,
-                      image_width=width,
-                      text_layers=int(model_config["select_layer"]))
+    return {
+        "image_pipeline": "gr00t_n16",
+        "shortest_image_edge": processor["shortest_image_edge"],
+        "crop_fraction": processor["crop_fraction"],
+        "image_height": height,
+        "image_width": width,
+        "formalize_language": bool(processor.get("formalize_language", True)),
+        "text_after_images": False,
+        "prompt_suffix": "<|im_end|>\n",
+    }
+
+
+def export_eagle(checkpoint: str, eagle_dir: str, out_dir: str,
+                 runtime: dict) -> None:
+    height, width = runtime["image_height"], runtime["image_width"]
+    cfg = gr00t_eagle_config(checkpoint, height, width)
     visual, prefix = EagleVisual(cfg), EaglePrefix(cfg)
     load_eagle_weights(load_backbone_state(checkpoint), visual, prefix)
     visual, prefix = visual.half().eval(), prefix.half().eval()
@@ -115,17 +145,16 @@ def export_eagle(checkpoint: str, eagle_dir: str, out_dir: str,
         }, {
             1: Dim("image_tokens", min=1, max=MAX_VIEWS * cfg.image_tokens)
         }))
-    stage_runtime_assets(eagle_dir, out_dir, cfg, processor, camera_height,
-                         camera_width)
+    stage_runtime_assets(eagle_dir, out_dir, cfg, runtime)
     logger.info("Eagle backbone export complete: %s", out_dir)
 
 
 def stage_runtime_assets(eagle_dir: str, out_dir: str, cfg: EagleConfig,
-                         processor: dict, camera_height: int,
-                         camera_width: int) -> None:
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(eagle_dir)
-    tokenizer.backend_tokenizer.save(os.path.join(out_dir, "tokenizer.json"))
+                         runtime: dict) -> None:
+    from transformers import Qwen2TokenizerFast
+    os.makedirs(out_dir, exist_ok=True)
+    Qwen2TokenizerFast.from_pretrained(eagle_dir).backend_tokenizer.save(
+        os.path.join(out_dir, "tokenizer.json"))
     for name in ("tokenizer_config.json", "special_tokens_map.json"):
         source = os.path.join(eagle_dir, name)
         if os.path.exists(source):
@@ -135,26 +164,17 @@ def stage_runtime_assets(eagle_dir: str, out_dir: str, cfg: EagleConfig,
     json.dump(
         {
             "model_family": "gr00t_eagle",
-            "camera_height": camera_height,
-            "camera_width": camera_width,
-            "shortest_image_edge": processor["shortest_image_edge"],
-            "crop_fraction": processor["crop_fraction"],
-            "image_height": cfg.image_height,
-            "image_width": cfg.image_width,
+            **runtime,
             "image_tokens_per_view": cfg.image_tokens,
             "max_views": MAX_VIEWS,
             "max_tokens": MAX_TOKENS,
             "hidden_size": cfg.text_hidden,
             "image_token_id": cfg.image_token_id,
-            "formalize_language": bool(
-                processor.get("formalize_language", True)),
-            # Eagle's chat template for one user turn of text followed by the images.
-            "prompt_prefix":
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n",
+            # Eagle's chat template for one user turn of the instruction and the images.
+            "prompt_prefix": PROMPT_PREFIX,
             "image_prefix": "<image {index}><img>",
             "image_context": "<IMG_CONTEXT>",
             "image_suffix": "</img>",
-            "prompt_suffix": "<|im_end|>\n",
         },
         open(os.path.join(out_dir, "config.json"), "w"),
         indent=1)
@@ -169,10 +189,24 @@ def main():
     parser.add_argument("out_dir")
     parser.add_argument("--camera-height", type=int, default=480)
     parser.add_argument("--camera-width", type=int, default=640)
+    parser.add_argument("--n15-crop-scale", type=float, default=0.95)
+    parser.add_argument("--n15-image-size", type=int, default=224)
+    parser.add_argument(
+        "--assets-only",
+        action="store_true",
+        help=
+        "rewrite config.json and the tokenizer without re-exporting the ONNX")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    export_eagle(args.checkpoint, args.eagle_dir, args.out_dir,
-                 args.camera_height, args.camera_width)
+    runtime = runtime_config(args.checkpoint, args.camera_height,
+                             args.camera_width, args.n15_crop_scale,
+                             args.n15_image_size)
+    if args.assets_only:
+        cfg = gr00t_eagle_config(args.checkpoint, runtime["image_height"],
+                                 runtime["image_width"])
+        stage_runtime_assets(args.eagle_dir, args.out_dir, cfg, runtime)
+    else:
+        export_eagle(args.checkpoint, args.eagle_dir, args.out_dir, runtime)
 
 
 if __name__ == "__main__":

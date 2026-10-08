@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run the GR00T N1.6 engines on the inputs ``official_reference.py`` captured, stage by stage.
+"""Run the GR00T N1.5 / N1.6 engines on the inputs ``official_reference.py`` captured, stage by stage.
 
 The Eagle visual / prefix engines get the official pixel values and token ids; the action engines get
 the resulting features (or, with --official-features, the official ones), the official normalized state
 and the same x_0. Prints the backbone feature and normalized action agreement.
 
-    python run_gr00t_n16_engines.py --engines engines --reference ref_f300.npz
+    python run_gr00t_engines.py --engines engines --reference ref_f300.npz
 """
 
 import argparse
@@ -90,10 +90,14 @@ def main():
     ref = np.load(args.reference)
     stream = torch.cuda.Stream()
 
-    pixels = np.concatenate([
-        ref[k] for k in sorted(f for f in ref.files
-                               if f.startswith("backbone_input.pixel_values."))
-    ])
+    if "backbone_input.eagle_pixel_values" in ref.files:
+        pixels = ref["backbone_input.eagle_pixel_values"]
+    else:
+        pixels = np.concatenate([
+            ref[k]
+            for k in sorted(f for f in ref.files
+                            if f.startswith("backbone_input.pixel_values."))
+        ])
     tokens = torch.from_numpy(ref["input_ids"])[None].cuda()
     image = load("backbone/visual.engine")(
         {

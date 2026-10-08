@@ -12,23 +12,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GR00T N1.6's Eagle 3 backbone (Eagle-Block2A-2B-v2) in plain PyTorch ops.
+"""GR00T's Eagle backbones in plain PyTorch ops: N1.6's Eagle 3 (Eagle-Block2A-2B-v2) and N1.5's Eagle 2.5
+(SigLIP 224, a linear connector, Qwen3 cut to 12 layers).
 
 Two components with explicit shapes, so they run eagerly for parity and export to standard ONNX:
 
-* ``EagleVisual``: SigLIP2 on fixed-size images, one image per batch item (the official packed
-  FlashAttention keeps images apart the same way), 2x2 pixel unshuffle and the ``mlp1`` connector.
-  The checkpoint config disables windowed attention and 2D RoPE, so the window split the official
+* ``EagleVisual``: the SigLIP / SigLIP2 tower on fixed-size images, one image per batch item (N1.6's
+  packed FlashAttention keeps images apart the same way), N1.6's 2x2 pixel unshuffle and the
+  ``mlp1`` connector. N1.6's config disables windowed attention and 2D RoPE, so the window split its
   code performs is a permutation it undoes, and is left out.
 * ``EaglePrefix``: Qwen3 truncated to ``select_layer`` decoder layers over the prompt with the image
   features scattered into the image-context positions, causal, returning the final-norm hidden
   states GR00T's action head reads (``hidden_states[-1]`` of transformers 4.51).
 
-GR00T trains and serves the backbone after ``.to(torch.bfloat16)``, which also rounds Qwen3's
-non-persistent RoPE ``inv_freq`` buffer; the rounded frequencies are part of the model as trained,
-so they are reproduced here (``rope_inv_freq_bf16``).
+GR00T N1.6 trains and serves the backbone after ``.to(torch.bfloat16)``, which also rounds Qwen3's
+non-persistent RoPE ``inv_freq`` buffer; the rounded frequencies are part of that model, so they are
+reproduced (``rope_inv_freq_bf16``). N1.5 loads with ``from_pretrained(torch_dtype=bfloat16)``,
+which leaves the buffer in FP32.
 """
 
+import json
+import os
 from dataclasses import dataclass
 
 import torch
@@ -60,6 +64,9 @@ class EagleConfig:
     rope_inv_freq_bf16: bool = True
     vocab_size: int = 151680
     image_token_id: int = 151669
+    pixel_unshuffle: bool = True
+    connector_layers: int = 2
+    weight_root: str = "backbone.model."
 
     @property
     def grid(self):
@@ -68,7 +75,28 @@ class EagleConfig:
     @property
     def image_tokens(self):
         h, w = self.grid
-        return (h // 2) * (w // 2)
+        return (h // 2) * (w // 2) if self.pixel_unshuffle else h * w
+
+
+def gr00t_eagle_config(checkpoint: str, image_height: int,
+                       image_width: int) -> EagleConfig:
+    """The backbone of a GR00T N1.5 or N1.6 checkpoint, for images of the given size."""
+    config = json.load(open(os.path.join(checkpoint, "config.json")))
+    if config["model_type"] == "gr00t_n1_5":
+        return EagleConfig(image_height=image_height,
+                           image_width=image_width,
+                           text_layers=int(
+                               config["backbone_cfg"]["select_layer"]),
+                           rope_inv_freq_bf16=False,
+                           pixel_unshuffle=False,
+                           connector_layers=1,
+                           weight_root="backbone.eagle_model.")
+    if config["model_type"] == "Gr00tN1d6":
+        return EagleConfig(image_height=image_height,
+                           image_width=image_width,
+                           text_layers=int(config["select_layer"]))
+    raise ValueError(
+        f"no Eagle backbone for model_type {config['model_type']!r}")
 
 
 class _VisionLayer(nn.Module):
@@ -112,9 +140,12 @@ class EagleVisual(nn.Module):
         self.layers = nn.ModuleList(
             _VisionLayer(cfg) for _ in range(cfg.vision_layers))
         self.post_layernorm = nn.LayerNorm(d, eps=cfg.vision_eps)
-        self.mlp1 = nn.Sequential(nn.LayerNorm(4 * d),
-                                  nn.Linear(4 * d, cfg.text_hidden), nn.GELU(),
-                                  nn.Linear(cfg.text_hidden, cfg.text_hidden))
+        if cfg.connector_layers == 2:
+            self.mlp1 = nn.Sequential(
+                nn.LayerNorm(4 * d), nn.Linear(4 * d, cfg.text_hidden),
+                nn.GELU(), nn.Linear(cfg.text_hidden, cfg.text_hidden))
+        else:
+            self.mlp1 = nn.Sequential(nn.Linear(d, cfg.text_hidden))
         self.register_buffer("positions",
                              torch.zeros(cfg.grid[0] * cfg.grid[1], d),
                              persistent=False)
@@ -145,10 +176,11 @@ class EagleVisual(nn.Module):
         for layer in self.layers:
             x = layer(x)
         x = self.post_layernorm(x)
-        # F.pixel_unshuffle(2) on [C, h, w]: channel c * 4 + dy * 2 + dx.
-        x = x.reshape(v, h // 2, 2, w // 2, 2,
-                      cfg.vision_hidden).permute(0, 1, 3, 5, 2, 4)
-        x = x.reshape(v, (h // 2) * (w // 2), 4 * cfg.vision_hidden)
+        if cfg.pixel_unshuffle:
+            # F.pixel_unshuffle(2) on [C, h, w]: channel c * 4 + dy * 2 + dx.
+            x = x.reshape(v, h // 2, 2, w // 2, 2,
+                          cfg.vision_hidden).permute(0, 1, 3, 5, 2, 4)
+            x = x.reshape(v, (h // 2) * (w // 2), 4 * cfg.vision_hidden)
         return self.mlp1(x)
 
 
@@ -235,22 +267,28 @@ class EaglePrefix(nn.Module):
 
 def load_eagle_weights(state: dict, visual: EagleVisual,
                        prefix: EaglePrefix) -> None:
-    """Load GR00T's ``backbone.model.*`` weights; the language model keeps its first layers."""
-    vision = "backbone.model.vision_model.vision_model."
-    text = "backbone.model.language_model.model."
+    """Load GR00T's backbone weights; the language model keeps its first layers."""
+    root = visual.cfg.weight_root
+    vision = root + "vision_model.vision_model."
+    text = root + "language_model.model."
     v, t = {}, {}
     for key, value in state.items():
         if key.startswith(vision + "embeddings."):
             name = key[len(vision + "embeddings."):]
-            v[name.replace(".weight", "") if name.
-              startswith("position_embedding") else name] = value
+            if name.startswith("position_embedding"):
+                v["position_embedding"] = value
+            elif name == "patch_embedding.weight" and value.dim() == 4:
+                # SigLIP's Conv2d patch embedding as a linear over (row, col, channel) patch features.
+                v[name] = value.permute(0, 2, 3, 1).reshape(value.shape[0], -1)
+            else:
+                v[name] = value
         elif key.startswith(vision + "encoder.layers."):
             name = key[len(vision + "encoder."):]
             v[name.replace("self_attn.", "").replace("mlp.", "")] = value
         elif key.startswith(vision + "post_layernorm."):
             v[key[len(vision):]] = value
-        elif key.startswith("backbone.model.mlp1."):
-            v[key[len("backbone.model."):]] = value
+        elif key.startswith(root + "mlp1."):
+            v[key[len(root):]] = value
         elif key.startswith(text + "layers."):
             name = key[len(text):]
             if int(name.split(".")[1]) < prefix.cfg.text_layers:
