@@ -15,11 +15,14 @@
  * limitations under the License.
  */
 
-//! GR00T N1.7 policy server: one JSON request per stdin line, one JSON reply per stdout line.
+//! GR00T policy server: one JSON request per stdin line, one JSON reply per stdout line. The backbone is N1.7's
+//! Edge-LLM VLM (--llmEngineDir, --multimodalEngineDir) or N1.5 / N1.6's Eagle (--eagleBackboneDir), which applies
+//! the official image and language preprocessing itself.
 //!
-//! Request:  {"images": ["top.png", "wrist.png"],   camera frames after GR00T's eval image transform
+//! Request:  {"images": ["top.png", "wrist.png"],   N1.7: camera frames after GR00T's eval image transform;
+//!                                                   Eagle: raw camera frames in processing.json's video_keys order
 //!            "state": [...],                        raw state, groups concatenated in modality order
-//!            "instruction": "pick the cube",        after GR00T's language formalization
+//!            "instruction": "pick the cube",        N1.7: after GR00T's language formalization; Eagle: as given
 //!            "rtc": {"overlap": 8, "frozen": 2,     optional, chunk inpainting from the previous reply;
 //!                    "ramp_rate": 6.0,              start_row: rows of it executed when this chunk starts
 //!                    "start_row": 8},               (default action_horizon - overlap)
@@ -30,6 +33,9 @@
 //!            "timing_ms": {...}}  or {"error": "..."}
 
 #include "gr00tN17Policy.h"
+#ifdef GR00T_EAGLE_BACKBONE
+#include "gr00tEagleBackbone.h"
+#endif
 
 #include "common/tensor.h"
 #include "common/trtUtils.h"
@@ -44,6 +50,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -93,20 +100,42 @@ int main(int argc, char** argv)
     std::string const llmDir = argOf(argc, argv, "--llmEngineDir");
     std::string const visDir = argOf(argc, argv, "--multimodalEngineDir");
     std::string const actionDir = argOf(argc, argv, "--actionEngineDir");
-    if (llmDir.empty() || visDir.empty() || actionDir.empty())
+    std::string const eagleDir = argOf(argc, argv, "--eagleBackboneDir");
+    bool const eagle = !eagleDir.empty();
+    if (actionDir.empty() || (!eagle && (llmDir.empty() || visDir.empty())))
     {
         std::fprintf(stderr,
-            "usage: %s --llmEngineDir DIR --multimodalEngineDir DIR --actionEngineDir DIR [--cudaGraph 1]\n"
+            "usage: %s (--llmEngineDir DIR --multimodalEngineDir DIR | --eagleBackboneDir DIR) --actionEngineDir DIR\n"
+            "          [--cudaGraph 1]\n"
             "  actionEngineDir holds the action engines, config.json and processing.json.\n",
             argv[0]);
         return 2;
     }
+#ifndef GR00T_EAGLE_BACKBONE
+    if (eagle)
+    {
+        std::fprintf(stderr, "this build has no Eagle backbone (it needs OpenCV)\n");
+        return 2;
+    }
+#endif
 
-    auto const pluginHandles = loadEdgellmPluginLib();
     cudaStream_t stream;
     cudaStreamCreate(&stream);
-    std::unordered_map<std::string, std::string> const noLora;
-    rt::LLMInferenceRuntime backbone(llmDir, visDir, noLora, stream);
+    std::unique_ptr<void, DlDeleter> pluginHandle;
+    std::unique_ptr<rt::LLMInferenceRuntime> backbone;
+    if (!eagle)
+    {
+        pluginHandle = loadEdgellmPluginLib();
+        std::unordered_map<std::string, std::string> const noLora;
+        backbone = std::make_unique<rt::LLMInferenceRuntime>(llmDir, visDir, noLora, stream);
+    }
+#ifdef GR00T_EAGLE_BACKBONE
+    std::unique_ptr<gr00t::Gr00tEagleBackbone> eagleBackbone;
+    if (eagle)
+    {
+        eagleBackbone = std::make_unique<gr00t::Gr00tEagleBackbone>(eagleDir, stream);
+    }
+#endif
     gr00t::Gr00tN17Policy policy(actionDir, stream);
     policy.runner().setUseCudaGraph(argOf(argc, argv, "--cudaGraph", "1") != "0");
     gr00t::Gr00tProcessing const& processing = policy.processing();
@@ -170,15 +199,38 @@ int main(int argc, char** argv)
             cudaMemcpyAsync(
                 noise.rawPointer(), noiseHost.rawPointer(), noiseCount * sizeof(float), cudaMemcpyHostToDevice, stream);
 
-            rt::LLMGenerationRequest const request
-                = vla::makeBackboneRequest(buildPrompt(in.at("instruction").get<std::string>(), images.size()),
-                    vla::loadImages(images), kCaptureSlot);
-            rt::Tensor const* features = vla::runBackbone(backbone, request, stream);
-            if (features == nullptr)
+            std::string const instruction = in.at("instruction").get<std::string>();
+            rt::Tensor const* features = nullptr;
+            std::vector<uint8_t> imageMask;
+#ifdef GR00T_EAGLE_BACKBONE
+            if (eagle)
             {
-                throw std::runtime_error("backbone request failed");
+                std::vector<rt::imageUtils::ImageData> frames;
+                std::vector<gr00t::Gr00tView> views;
+                for (auto const& path : images)
+                {
+                    frames.push_back(rt::imageUtils::loadRgbImageFromFile(path));
+                }
+                for (auto const& frame : frames)
+                {
+                    views.push_back(gr00t::Gr00tView{
+                        frame.data(), static_cast<int32_t>(frame.height), static_cast<int32_t>(frame.width)});
+                }
+                features = &eagleBackbone->encode(views, instruction);
+                imageMask = eagleBackbone->imageMask();
             }
-            std::vector<uint8_t> const imageMask = vla::tokenMask(backbone, imageTokenId);
+#endif
+            if (!eagle)
+            {
+                rt::LLMGenerationRequest const request = vla::makeBackboneRequest(
+                    buildPrompt(instruction, images.size()), vla::loadImages(images), kCaptureSlot);
+                features = vla::runBackbone(*backbone, request, stream);
+                if (features == nullptr)
+                {
+                    throw std::runtime_error("backbone request failed");
+                }
+                imageMask = vla::tokenMask(*backbone, imageTokenId);
+            }
             cudaStreamSynchronize(stream);
             double const backboneMs = msSince(t0);
 

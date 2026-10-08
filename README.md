@@ -31,6 +31,7 @@ support for platforms upstream no longer targets.
 | GR00T N1.7 policy | Backbone through Edge-LLM, action head with cross-attention K/V cached per call; 114.5 ms per action chunk on Orin, matching the official model | [below](#gr00t-n17) |
 | pi0.5 SO101 policy (openpi `pi05_so101`) | JetPack 6 engines with SO101 pre/post-processing, RTC with state-relative re-encoding, async control, opt-in INT8 prefix; 204.5 ms per call (177.9 ms INT8), matching openpi FP32 within its own bf16 spread | [pi0.5](experimental_models/pi05/README.md#so101-pi05_so101) |
 | SmolVLA policy (LeRobot 0.6.1) | Visual / prefix / denoise engines from plain PyTorch ops, RTC as flow-path inpainting, async control; 83-93 ms per call, robot actions within 0.137 of LeRobot | [design](experimental_models/smolvla/DESIGN.md) |
+| X-VLA policy (LeRobot 0.6.1) | Florence-2 vision and encoder plus the soft-prompted action transformer as three engines; matches LeRobot (actions max \|Δ\| 0.0008), 138 ms per 30-step chunk | [below](#x-vla) |
 | GR00T N1.5 policy | Eagle 2.5 backbone and N1.5's action head (future tokens) on the same runtime, bit-exact preprocessing, RTC; 110 ms per chunk, well inside the official model's bf16 spread | [below](#gr00t-n15) |
 | GR00T N1.6 policy | Eagle 3 backbone as plain-op engines with bit-exact official preprocessing, N1.7's action head and RTC; 172 ms per chunk, actions comparable to the official model's own bf16 spread | [below](#gr00t-n16) |
 | VLA replan caching | Encoder-cache partial hits and KV prefix reuse with tail-only hidden capture; ~2× faster InternVLA-N1 replans | [below](#kv-cache-reuse-for-vla-control-loops) |
@@ -99,7 +100,7 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 3. **Shared VLA layer**: done ([below](#shared-vla-layer)), extracted from InternVLA-N1 and GR00T.
 4. **Bidirectional-prefix VLAs**: pi0.5 SO101 and SmolVLA policy runtimes done, with RTC and async control;
    the encoder cache and prefix KV pool in the core runtime are still open.
-5. **More VLAs**: OpenVLA, X-VLA.
+5. **More VLAs**: X-VLA done ([below](#x-vla)); OpenVLA in progress.
 
 ## GR00T N1.7
 
@@ -190,7 +191,9 @@ the official policy as it serves, bf16 throughout, is the precision floor:
 A few image tokens are very sensitive to precision in both (lowest per-token cosine 0.45 for the engines on frame
 300, 0.21 for official bf16 on frame 900), and TensorRT rebuilds of the same graph moved the frame-300 backbone
 cosine between 0.994 and 0.9988; the actions stayed at or below the bf16 spread in every build.
-`gr00t_policy_server` is not wired to the Eagle backbone yet.
+`gr00t_policy_server --eagleBackboneDir engines/backbone --actionEngineDir engines/action` serves N1.5 and N1.6: it
+takes raw camera frames (in `processing.json`'s `video_keys` order) and the raw instruction, since the Eagle backbone
+applies the official preprocessing, and replies with the same actions as `gr00t_eagle_policy_inference`.
 
 ### GR00T N1.5
 
@@ -247,6 +250,41 @@ trtexec --onnx=backbone_onnx/prefix/model.onnx --saveEngine=engines/backbone/pre
 cp backbone_onnx/*.json engines/backbone/
 # action head and processing.json as for N1.7 (with the N1.6 source), into engines/action
 gr00t_eagle_policy_inference --backboneDir engines/backbone --actionDir engines/action --inputFile obs.json
+```
+
+## X-VLA
+
+X-VLA (LeRobot 0.6.1, `lerobot/xvla-base`) runs as three engines built from LeRobot's own modules through the
+legacy ONNX exporter ([`experimental_models/xvla`](experimental_models/xvla)): `vision` (Florence-2's DaViT and
+projection, one batch item per camera), `encoder` (the BART encoder over the primary view's tokens and the padded
+instruction) and `step` (one flow step of the soft-prompted action transformer, x1 to the action over 10 steps).
+The exported graphs go through `tensorrt_edgellm.onnx.trt_workarounds`: TensorRT 10.3 miscomputes attention whose
+transposed key is scaled after a fused QKV projection was split into heads, which left actions 0.04 off on a 0.57
+range, in FP32 too, while onnxruntime matched the eager model (see [JETPACK6.md](JETPACK6.md)). `XvlaPolicy`
+reproduces LeRobot's processing: ImageNet normalization and resize_with_pad, BART tokens padded to the saved
+length, the zero-padded state, and the ee6d action space (gripper channels zeroed in the inputs, sigmoid on the
+output). The domain id is a runtime input (`setDomainId`, default: the preprocessor's), the denoising loop replays
+as a CUDA graph, and `XvlaRtc` adds real-time chunking: each step's predicted clean action is pulled toward the
+previous chunk's remaining rows with LeRobot's LINEAR prefix weights (X-VLA's ee6d actions are absolute, so the
+rows are reused as they are).
+
+AGX Orin, two cameras from raw SO101 frames, against LeRobot's `XVLAPolicy` in FP32 with the same x1: identical
+token ids, bit-identical preprocessed views, actions max |Δ| 0.0008 / 0.0006 on two frames (cosine 1.000000);
+155.8 ms per chunk (vision 25.4, encoder 3.2, 10 steps 127.3) with unlocked clocks. `xvla_async_control` at 30 Hz
+(horizon 30, overlap 20, frozen 6, drifting state): no stalls, planner latency 5-6 ticks, switch jump 0.0000 with
+RTC (0.0151 without).
+
+```bash
+python experimental_models/xvla/scripts/lerobot_xvla_reference.py --checkpoint xvla-base --observation obs.json \
+    --out ref.npz                                         # LeRobot 0.6.1
+python experimental_models/xvla/scripts/export_xvla.py --checkpoint xvla-base --check ref.npz --out xvla_onnx
+trtexec --onnx=xvla_onnx/vision.onnx --saveEngine=engines/vision.engine --stronglyTyped \
+    --minShapes=images:1x3x224x224 --optShapes=images:2x3x224x224 --maxShapes=images:3x3x224x224
+trtexec --onnx=xvla_onnx/encoder.onnx --saveEngine=engines/encoder.engine --stronglyTyped
+trtexec --onnx=xvla_onnx/step.onnx --saveEngine=engines/step.engine --stronglyTyped
+cp -r xvla_onnx/config.json xvla_onnx/tokenizer engines/
+xvla_policy_inference --engineDir engines --inputFile obs.json
+xvla_async_control --engineDir engines --inputFile obs.json [--domain ID] [--rtc 1]
 ```
 
 ## Shared VLA layer
