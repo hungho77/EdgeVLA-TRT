@@ -190,7 +190,9 @@ the official policy as it serves, bf16 throughout, is the precision floor:
 A few image tokens are very sensitive to precision in both (lowest per-token cosine 0.45 for the engines on frame
 300, 0.21 for official bf16 on frame 900), and TensorRT rebuilds of the same graph moved the frame-300 backbone
 cosine between 0.994 and 0.9988; the actions stayed at or below the bf16 spread in every build.
-`gr00t_policy_server` is not wired to the Eagle backbone yet.
+`gr00t_policy_server --eagleBackboneDir engines/backbone --actionEngineDir engines/action` serves N1.5 and N1.6: it
+takes raw camera frames (in `processing.json`'s `video_keys` order) and the raw instruction, since the Eagle backbone
+applies the official preprocessing, and replies with the same actions as `gr00t_eagle_policy_inference`.
 
 ### GR00T N1.5
 
