@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Export the GR00T N1.7 action head as three ONNX graphs for one embodiment.
+"""Export a GR00T N1.6 or N1.7 action head as three ONNX graphs for one embodiment.
 
 The DiT's cross-attention keys and values depend only on the backbone
 features, which are fixed for a whole action-chunk call, so they are computed
@@ -30,12 +30,12 @@ The official GR00T modules provide the weights and every layer's math; only
 the cross-attention of the DiT blocks is re-expressed to take K/V as inputs.
 Embodiment-specific weight banks are sliced to the chosen embodiment.
 
-Needs the GR00T N1.7 source (--gr00t-src: the directory holding the ``gr00t``
-package) and its dependencies (transformers 4.57, diffusers).
+Needs the GR00T source of the checkpoint's version (--gr00t-src: the directory
+holding the ``gr00t`` package) and its dependencies.
 
-    python export_gr00t_n1_7_action_head.py --gr00t-src <dir> --checkpoint MODEL_ZOO/GR00T-N1.7-SO101-Multitask \\
+    python export_gr00t_action_head.py --gr00t-src <dir> --checkpoint MODEL_ZOO/GR00T-N1.7-SO101-Multitask \\
         --embodiment new_embodiment --check
-    python export_gr00t_n1_7_action_head.py ... --out action_onnx --max-backbone-tokens 512
+    python export_gr00t_action_head.py ... --out action_onnx --max-backbone-tokens 512
 """
 
 import argparse
@@ -52,18 +52,31 @@ from torch import nn
 MASKED_BIAS = -30000.0
 
 
+def head_classes(model_type):
+    """The official config and action-head classes for a checkpoint's model_type."""
+    import importlib
+    version = {"Gr00tN1d6": "n1d6", "Gr00tN1d7": "n1d7"}.get(model_type)
+    if version is None:
+        raise SystemExit(f"unsupported GR00T model_type {model_type!r}")
+    configs = importlib.import_module(f"gr00t.configs.model.gr00t_{version}")
+    model = importlib.import_module(
+        f"gr00t.model.gr00t_{version}.gr00t_{version}")
+    stem = f"Gr00tN1d{version[-1]}"
+    return getattr(configs, f"{stem}Config"), getattr(model,
+                                                      f"{stem}ActionHead")
+
+
 def load_action_head(gr00t_src, checkpoint):
     sys.path.insert(0, gr00t_src)
-    from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
-    from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7ActionHead
     from safetensors import safe_open
 
     config_dict = json.load(open(os.path.join(checkpoint, "config.json")))
-    config = Gr00tN1d7Config(**{
+    config_class, head_class = head_classes(config_dict["model_type"])
+    config = config_class(**{
         k: v
         for k, v in config_dict.items() if v is not None
     })
-    head = Gr00tN1d7ActionHead(config)
+    head = head_class(config)
     weight_map = json.load(
         open(os.path.join(checkpoint,
                           "model.safetensors.index.json")))["weight_map"]
@@ -102,7 +115,8 @@ class VLPrep(nn.Module):
     def __init__(self, head):
         super().__init__()
         self.vlln = head.vlln
-        self.vl_self_attention = head.vl_self_attention
+        self.vl_self_attention = getattr(head, "vl_self_attention",
+                                         nn.Identity())
         self.cross = nn.ModuleList(cross_blocks(head))
 
     def forward(self, backbone_features, image_mask, attention_mask):
@@ -317,7 +331,7 @@ def calibration_run(vl_prep,
         for seed in range(samples):
             generator = torch.Generator().manual_seed(100 + seed)
             state = torch.randn(1,
-                                config.state_history_length,
+                                getattr(config, "state_history_length", 1),
                                 config.max_state_dim,
                                 generator=generator)
             noise = torch.randn(1,
@@ -368,7 +382,8 @@ def check(head,
     image_mask = input_ids == image_token_id
     attention_mask = torch.ones_like(image_mask)
     torch.manual_seed(0)
-    state = torch.randn(1, config.state_history_length, config.max_state_dim)
+    state = torch.randn(1, getattr(config, "state_history_length", 1),
+                        config.max_state_dim)
 
     with torch.no_grad():
         embodiment = torch.tensor([index])
@@ -477,7 +492,7 @@ def export(head,
                     3: "backbone_tokens"
                 }
             })
-        state = torch.randn(1, config.state_history_length,
+        state = torch.randn(1, getattr(config, "state_history_length", 1),
                             config.max_state_dim)
         _export_onnx(state_encoder, (state, ),
                      out,
@@ -514,17 +529,28 @@ def export(head,
                 }
             })
     meta = {
-        "action_horizon": config.action_horizon,
-        "action_dim": config.max_action_dim,
-        "state_dim": config.max_state_dim * config.state_history_length,
-        "num_inference_timesteps": config.num_inference_timesteps,
-        "num_timestep_buckets": config.num_timestep_buckets,
-        "num_cross_blocks": num_cross,
-        "cross_inner_dim": inner,
-        "backbone_embedding_dim": config.backbone_embedding_dim,
-        "max_backbone_tokens": max_tokens,
-        "embodiment_index": index,
-        "denoise_quantization": "w8a8" if int8_weights else "none",
+        "action_horizon":
+        config.action_horizon,
+        "action_dim":
+        config.max_action_dim,
+        "state_dim":
+        config.max_state_dim * getattr(config, "state_history_length", 1),
+        "num_inference_timesteps":
+        config.num_inference_timesteps,
+        "num_timestep_buckets":
+        config.num_timestep_buckets,
+        "num_cross_blocks":
+        num_cross,
+        "cross_inner_dim":
+        inner,
+        "backbone_embedding_dim":
+        config.backbone_embedding_dim,
+        "max_backbone_tokens":
+        max_tokens,
+        "embodiment_index":
+        index,
+        "denoise_quantization":
+        "w8a8" if int8_weights else "none",
     }
     json.dump(meta, open(os.path.join(out, "config.json"), "w"), indent=2)
     print(f"exported vl_prep / state_encoder / denoise_step -> {out}")

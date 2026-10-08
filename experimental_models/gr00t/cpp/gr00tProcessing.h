@@ -26,7 +26,7 @@ namespace trt_edgellm
 namespace gr00t
 {
 
-//! One embodiment's state/action processing, from processing.json (export_gr00t_n1_7_processing.py).
+//! One embodiment's state/action processing, from processing.json (export_gr00t_processing.py).
 //! Raw state and actions are the groups concatenated in their modality order.
 class Gr00tProcessing
 {

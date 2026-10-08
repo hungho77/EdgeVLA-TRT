@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Write one embodiment's GR00T N1.7 state/action processing as processing.json.
+"""Write one embodiment's GR00T N1.6 / N1.7 state/action processing as processing.json.
 
 The official processor resolves which statistics apply (percentiles,
 relative-action overrides, per-step bounds); this records the result so the C++
@@ -25,7 +25,7 @@ policy only does arithmetic:
           order; clip to [-1, 1], then (a + 1) / 2 * (max - min) + min with
           (T, D) or (D,) bounds; relative groups add the raw reference state.
 
-    python export_gr00t_n1_7_processing.py --gr00t-src <dir> --checkpoint GR00T-N1.7-SO101-Multitask \\
+    python export_gr00t_processing.py --gr00t-src <dir> --checkpoint GR00T-N1.7-SO101-Multitask \\
         --embodiment new_embodiment --out engines/action/processing.json
 """
 
@@ -47,8 +47,14 @@ def main():
     args = parser.parse_args()
 
     sys.path.insert(0, args.gr00t_src)
-    import gr00t.model.gr00t_n1d7.gr00t_n1d7  # noqa: F401  registers the config
-    import gr00t.model.gr00t_n1d7.processing_gr00t_n1d7  # noqa: F401  registers the processor
+    import importlib
+    model_type = json.load(
+        open(f"{args.checkpoint}/config.json"))["model_type"]
+    version = {"Gr00tN1d6": "n1d6", "Gr00tN1d7": "n1d7"}[model_type]
+    # Importing the model and processor modules registers them with transformers.
+    importlib.import_module(f"gr00t.model.gr00t_{version}.gr00t_{version}")
+    importlib.import_module(
+        f"gr00t.model.gr00t_{version}.processing_gr00t_{version}")
     from gr00t.data.types import ActionRepresentation, ActionType
     from transformers import AutoProcessor
 
