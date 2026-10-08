@@ -12,14 +12,19 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under
 # the License.
-
-# Shared VLA layer: TensorRT engine helpers, the VLM-backbone prefill and the
-# dual-rate planner/control handoff, used by internvla_n1 and gr00t.
-add_library(vlaExperimental STATIC cpp/vlaEngine.cpp cpp/vlaBackbone.cpp
-                                   cpp/vlaImage.cpp)
+add_library(openvlaExperimental STATIC cpp/openvlaPolicy.cpp)
 target_include_directories(
-  vlaExperimental
+  openvlaExperimental
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp
   PRIVATE ${CMAKE_SOURCE_DIR}/cpp ${COMMON_INCLUDE_DIRS}
           ${ONNX_PARSER_INCLUDE_DIR})
-set_property(TARGET vlaExperimental PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(openvlaExperimental PUBLIC vlaExperimental)
+set_property(TARGET openvlaExperimental PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+add_executable(openvla_policy_inference examples/openvla_policy_inference.cpp)
+target_include_directories(
+  openvla_policy_inference PRIVATE ${CMAKE_SOURCE_DIR}/cpp
+                                   ${COMMON_INCLUDE_DIRS})
+target_link_libraries(
+  openvla_policy_inference PRIVATE openvlaExperimental vlaExperimental
+                                   edgellmCore commonLibraryExt)

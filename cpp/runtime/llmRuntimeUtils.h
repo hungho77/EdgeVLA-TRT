@@ -230,11 +230,15 @@ struct LLMGenerationRequest
     mutable std::vector<FormattedRequest>
         formattedRequests; //!< Formatted requests (mutable to allow runtime modification)
     std::vector<std::vector<int32_t>> preTokenizedInputIds; //!< Optional pre-tokenized text inputs, one per request.
-    float temperature;                                      //!< Temperature parameter for sampling
-    float topP;                                             //!< Top-p (nucleus) sampling parameter
-    int64_t topK;                                           //!< Top-k sampling parameter
-    int64_t maxGenerateLength;                              //!< Max length of the generated tokens
-    std::optional<uint64_t> samplingSeed;                   //!< Stable request-level sampling seed
+    //! Optional image embeddings computed outside the runtime (e.g. by a VLA's own vision engine): [image tokens,
+    //! hidden] FP16 on the GPU, in prompt order, borrowed for the call. They fill the positions of the engine's
+    //! image_token_id in preTokenizedInputIds. Only for handleRequest on a runtime without a multimodal engine.
+    rt::Tensor const* precomputedImageEmbeddings{nullptr};
+    float temperature;                                                  //!< Temperature parameter for sampling
+    float topP;                                                         //!< Top-p (nucleus) sampling parameter
+    int64_t topK;                                                       //!< Top-k sampling parameter
+    int64_t maxGenerateLength;                                          //!< Max length of the generated tokens
+    std::optional<uint64_t> samplingSeed;                               //!< Stable request-level sampling seed
     SpecProposalSampling proposalSampling{SpecProposalSampling::kAuto}; //!< Draft proposal sampling policy
     int32_t diffusionMaxDenoisingSteps{0}; //!< Optional DiffusionGemma denoise-step override (0 = runtime default)
     std::string loraWeightsName{""};       //!< Name of the LoRA weights. Default to empty string for no LoRA weights

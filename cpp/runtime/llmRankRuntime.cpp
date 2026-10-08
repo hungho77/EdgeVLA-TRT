@@ -1406,6 +1406,8 @@ LLMRankRuntime::GenerationSession::AdmissionIntent LLMRankRuntime::GenerationSes
     auto const& item = request.requests.front();
     ELLM_CHECK(!item.pastTrajectory.has_value(),
         "admitRequest cannot take an action request; trajectory execution founds its own batch.");
+    ELLM_CHECK(request.precomputedImageEmbeddings == nullptr,
+        "admitRequest cannot take precomputed image embeddings; submit them through handleRequest.");
 
     SlotSeed seed;
     seed.originalIndex = originalIndex;
@@ -1822,6 +1824,8 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
     context.layerDebugger = LayerDebugger::fromEnv();
     bool const supportsMultimodalInput
         = (mAudioRunner != nullptr) || (mVisionRunner != nullptr) || (mActionRunner != nullptr);
+    ELLM_CHECK(request.precomputedImageEmbeddings == nullptr || !supportsMultimodalInput,
+        "Precomputed image embeddings are only supported by a runtime without a multimodal engine");
 
     if (supportsMultimodalInput)
     {
@@ -1850,6 +1854,19 @@ std::unique_ptr<LLMRankRuntime::SteppedGeneration> LLMRankRuntime::beginGenerati
                 LOG_ERROR("Failed to tokenize input text for request %d in batch", i);
                 return nullptr;
             }
+        }
+        if (request.precomputedImageEmbeddings != nullptr)
+        {
+            int32_t const imageTokenId = mDeployment.base.imageTokenId;
+            ELLM_CHECK(imageTokenId >= 0, "Precomputed image embeddings need image_token_id in the engine config");
+            int64_t placeholders = 0;
+            for (auto const& ids : context.rawBatchedInputIds)
+            {
+                placeholders += std::count(ids.begin(), ids.end(), imageTokenId);
+            }
+            ELLM_CHECK(placeholders == request.precomputedImageEmbeddings->getShape()[0],
+                "Precomputed image embeddings must have one row per image_token_id in the prompt");
+            context.visualEmbeddings = rt::OptionalInputTensor{*request.precomputedImageEmbeddings};
         }
     }
 

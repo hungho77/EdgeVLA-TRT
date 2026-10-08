@@ -81,9 +81,6 @@ public:
     //! GR00T's formalize_language: lower case, then drop every character that is neither a word character
     //! nor whitespace (bytes of multi-byte UTF-8 characters are kept).
     static std::string formalize(std::string const& task);
-    //! PIL's Image.resize(BICUBIC) on 8-bit RGB: separable, antialiased, 22-bit fixed point.
-    static std::vector<unsigned char> resizeBicubicPil(
-        unsigned char const* rgb, int32_t height, int32_t width, int32_t outHeight, int32_t outWidth);
 
 private:
     cudaStream_t mStream;
