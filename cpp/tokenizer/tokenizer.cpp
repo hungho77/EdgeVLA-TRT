@@ -180,7 +180,11 @@ bool Tokenizer::parseTokenizerConfig(
     {
         auto const& normConfig = jsonData["normalizer"];
         std::string const normType = normConfig.value("type", "");
-        if (normType == "Replace")
+        if (normType == "Prepend")
+        {
+            mNormalizerPrepend = normConfig.value("prepend", "");
+        }
+        else if (normType == "Replace")
         {
             std::string pattern;
             if (normConfig.contains("pattern") && normConfig["pattern"].is_object())
@@ -202,7 +206,11 @@ bool Tokenizer::parseTokenizerConfig(
                 for (auto const& step : normConfig["normalizers"])
                 {
                     std::string const stepType = step.value("type", "");
-                    if (stepType == "Replace" && step.contains("pattern") && step["pattern"].is_object())
+                    if (stepType == "Prepend")
+                    {
+                        mNormalizerPrepend = step.value("prepend", "");
+                    }
+                    else if (stepType == "Replace" && step.contains("pattern") && step["pattern"].is_object())
                     {
                         std::string pattern = step["pattern"].value("String", "");
                         std::string content = step.value("content", "");
@@ -690,6 +698,12 @@ std::vector<Rank> Tokenizer::encode(std::string const& text, bool addBos, bool a
                 // Process raw text partition
                 std::string piece = part.rawText.substr(part.offset, part.length);
 
+                // A Prepend normalizer marks the start of each non-empty text segment (e.g. "In" -> "▁In" for
+                // Llama-2 style SentencePiece tokenizers), as Hugging Face tokenizers normalize per segment.
+                if (!mNormalizerPrepend.empty() && !piece.empty())
+                {
+                    piece.insert(0, mNormalizerPrepend);
+                }
                 // Apply normalizer replacements (e.g., space -> ▁ for SentencePiece-style tokenizers)
                 for (auto const& [pattern, replacement] : mNormalizerReplacements)
                 {

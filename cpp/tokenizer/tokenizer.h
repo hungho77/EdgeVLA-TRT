@@ -391,6 +391,7 @@ protected:
 
     // Normalizer: list of (pattern, replacement) pairs applied before pre-tokenization.
     std::vector<std::pair<std::string, std::string>> mNormalizerReplacements;
+    std::string mNormalizerPrepend; //!< Prepend normalizer, applied to each non-empty text segment
 
     // Decoder replacements: list of (pattern, replacement) pairs applied after decoding (reverse of normalizer).
     std::vector<std::pair<std::string, std::string>> mDecoderReplacements;
