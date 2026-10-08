@@ -31,6 +31,7 @@ support for platforms upstream no longer targets.
 | GR00T N1.7 policy | Backbone through Edge-LLM, action head with cross-attention K/V cached per call; 114.5 ms per action chunk on Orin, matching the official model | [below](#gr00t-n17) |
 | pi0.5 SO101 policy (openpi `pi05_so101`) | JetPack 6 engines with SO101 pre/post-processing, RTC with state-relative re-encoding, async control, opt-in INT8 prefix; 204.5 ms per call (177.9 ms INT8), matching openpi FP32 within its own bf16 spread | [pi0.5](experimental_models/pi05/README.md#so101-pi05_so101) |
 | SmolVLA policy (LeRobot 0.6.1) | Visual / prefix / denoise engines from plain PyTorch ops, RTC as flow-path inpainting, async control; 83-93 ms per call, robot actions within 0.137 of LeRobot | [design](experimental_models/smolvla/DESIGN.md) |
+| OpenVLA (`openvla-7b`) | Fused DINOv2 + SigLIP vision engine feeding Edge-LLM's Llama-2 runtime as precomputed image embeddings; identical action tokens to the official model, 706 ms per action in FP16 | [below](#openvla) |
 | X-VLA policy (LeRobot 0.6.1) | Florence-2 vision and encoder plus the soft-prompted action transformer as three engines; matches LeRobot (actions max \|Δ\| 0.0008), 138 ms per 30-step chunk | [below](#x-vla) |
 | GR00T N1.5 policy | Eagle 2.5 backbone and N1.5's action head (future tokens) on the same runtime, bit-exact preprocessing, RTC; 110 ms per chunk, well inside the official model's bf16 spread | [below](#gr00t-n15) |
 | GR00T N1.6 policy | Eagle 3 backbone as plain-op engines with bit-exact official preprocessing, N1.7's action head and RTC; 172 ms per chunk, actions comparable to the official model's own bf16 spread | [below](#gr00t-n16) |
@@ -100,7 +101,7 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 3. **Shared VLA layer**: done ([below](#shared-vla-layer)), extracted from InternVLA-N1 and GR00T.
 4. **Bidirectional-prefix VLAs**: pi0.5 SO101 and SmolVLA policy runtimes done, with RTC and async control;
    the encoder cache and prefix KV pool in the core runtime are still open.
-5. **More VLAs**: X-VLA done ([below](#x-vla)); OpenVLA in progress.
+5. **More VLAs**: X-VLA and OpenVLA done ([below](#openvla)).
 
 ## GR00T N1.7
 
@@ -250,6 +251,45 @@ trtexec --onnx=backbone_onnx/prefix/model.onnx --saveEngine=engines/backbone/pre
 cp backbone_onnx/*.json engines/backbone/
 # action head and processing.json as for N1.7 (with the N1.6 source), into engines/action
 gr00t_eagle_policy_inference --backboneDir engines/backbone --actionDir engines/action --inputFile obs.json
+```
+
+## OpenVLA
+
+OpenVLA (`openvla/openvla-7b`) runs its vision backbone as one engine and its Llama-2 on Edge-LLM's regular LLM
+runtime ([`experimental_models/openvla`](experimental_models/openvla)), so it uses the runtime's KV cache, sampler and
+low-bit paths:
+
+- **Vision** (`export_openvla_vision.py`, timm 0.9.10): the fused DINOv2 + SigLIP towers (second-to-last block's
+  patches) and the fused-GELU projector, 256 x 4096 embeddings for the 224x224 image.
+- **LLM** (`extract_openvla_llm.py`, then `tensorrt-edgellm-export` and `llm_build`): OpenVLA's Llama-2 as a plain
+  checkpoint. Its config is `LlamaConfig(**text_config)`, i.e. RMSNorm eps 1e-6 (not Llama-2's published 1e-5), and the
+  pad id 32000 is the image placeholder. `LLMGenerationRequest::precomputedImageEmbeddings` hands the projected patches
+  to the runtime, which writes them at the placeholder positions right after BOS.
+- **Policy** (`OpenvlaPolicy`): PIL's bicubic resize and the processor's two normalizations (DINOv2's constants are
+  the bf16-rounded ImageNet values the processor stores), the `In: What action should the robot take to ...?\nOut:`
+  prompt with the empty token appended, greedy decoding of one token per action dimension, the bin mapping and the
+  dataset's q01 / q99 unnormalization. Llama-2's `tokenizer.json` prepends `\u2581` through a `Prepend` normalizer,
+  which Edge-LLM's tokenizer now honours; without it the first word tokenized differently.
+
+AGX Orin, two raw SO101 camera frames, `bridge_orig` statistics, against the official `predict_action` in FP32 on the
+CPU: identical prompt ids and preprocessed pixels, the same 7 action tokens on both frames (including one decided by
+a 0.04 logit margin), identical actions; 705.8 ms per action in FP16 (vision 22.5 ms, prefill and 7 tokens 683.3 ms).
+Consecutive calls in one process match fresh-process results. Building the 7B FP16 engine peaks near a 64 GB Orin's
+memory (22 GB of GPU allocations plus the 20 GB serialized engine): the OOM killer stopped three of four builds after
+engine generation, so build with little else resident.
+
+```bash
+python experimental_models/openvla/scripts/openvla_reference.py --checkpoint openvla-7b --image frame.png \
+    --instruction "pick up the banana" --unnorm-key bridge_orig --out ref.npz        # transformers 4.40.1
+python experimental_models/openvla/scripts/export_openvla_vision.py --checkpoint openvla-7b --check ref.npz \
+    --out vision_onnx
+trtexec --onnx=vision_onnx/vision.onnx --saveEngine=vision/vision.engine --stronglyTyped && cp vision_onnx/config.json vision/
+python experimental_models/openvla/scripts/extract_openvla_llm.py --checkpoint openvla-7b --out openvla_llm
+tensorrt-edgellm-export openvla_llm llm_onnx
+python experimental_models/openvla/scripts/extract_openvla_llm.py --checkpoint openvla-7b --patch-onnx-config llm_onnx/llm
+llm_build --onnxDir llm_onnx/llm --engineDir llm_engine --maxBatchSize 1 --maxInputLen 512 --maxKVCacheCapacity 640
+openvla_policy_inference --visionDir vision --llmEngineDir llm_engine --image frame.png --instruction "..." \
+    --unnormKey bridge_orig
 ```
 
 ## X-VLA
