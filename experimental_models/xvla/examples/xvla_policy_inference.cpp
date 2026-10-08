@@ -76,7 +76,8 @@ int main(int argc, char** argv)
     if (engineDir.empty() || inputFile.empty())
     {
         std::fprintf(stderr,
-            "usage: %s --engineDir DIR --inputFile request.json [--noise x1.f32] [--output out.json] [--iters N]\n",
+            "usage: %s --engineDir DIR --inputFile request.json [--noise x1.f32] [--output out.json] [--iters N] "
+            "[--cudaGraph 1]\n",
             argv[0]);
         return 2;
     }
@@ -103,6 +104,7 @@ int main(int argc, char** argv)
     cudaStreamCreate(&stream);
     {
         xvla::XvlaPolicy policy(engineDir, stream);
+        policy.setUseCudaGraph(argOf(argc, argv, "--cudaGraph", "1") != "0");
         xvla::XvlaChunk const chunk = policy.act(views, state, task, noise);
         int32_t const iters = std::stoi(argOf(argc, argv, "--iters", "0"));
         if (iters > 0)

@@ -131,7 +131,9 @@ def main():
                 "proprio": torch.from_numpy(ref["proprio"])[None].cuda(),
                 "domain_id": torch.tensor([int(ref["domain_id"])]).cuda(),
                 "vlm_features": vlm,
-                "aux_visual_inputs": aux
+                "aux_visual_inputs": aux,
+                "rtc_seed": torch.zeros_like(x1),
+                "rtc_weight": torch.zeros(1, x1.shape[1], 1).cuda()
             }, stream)["action_next"].float()
     out = action[0].cpu().numpy()
     gripper = config["gripper_idx"]

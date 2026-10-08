@@ -27,3 +27,10 @@ target_include_directories(xvla_policy_inference PRIVATE ${CMAKE_SOURCE_DIR}/cpp
 target_link_libraries(
   xvla_policy_inference PRIVATE xvlaExperimental vlaExperimental edgellmCore
                                 commonLibraryExt)
+
+add_executable(xvla_async_control examples/xvla_async_control.cpp)
+target_include_directories(xvla_async_control PRIVATE ${CMAKE_SOURCE_DIR}/cpp
+                                                      ${COMMON_INCLUDE_DIRS})
+target_link_libraries(
+  xvla_async_control PRIVATE xvlaExperimental vlaExperimental edgellmCore
+                             commonLibraryExt)

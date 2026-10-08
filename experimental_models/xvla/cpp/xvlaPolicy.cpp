@@ -84,6 +84,8 @@ XvlaPolicy::XvlaPolicy(std::string const& engineDir, cudaStream_t stream)
     mStateDim = config.at("state_dim").get<int32_t>();
     mNumSteps = config.at("num_steps").get<int32_t>();
     mGripper = config.at("gripper_idx").get<std::vector<int32_t>>();
+    mNumDomains = config.at("num_domains").get<int32_t>();
+    setDomainId(config.at("domain_id").get<int32_t>());
     // LeRobot unnormalizes with the saved statistics and passes actions through when the checkpoint has none.
     if (config.contains("action_mean"))
     {
@@ -118,6 +120,11 @@ XvlaPolicy::XvlaPolicy(std::string const& engineDir, cudaStream_t stream)
     mStageHost
         = makeTensor({chunkElems + mProprioDim + mNumSteps}, DataType::kHALF, "xvla::stageHost", rt::DeviceType::kCPU);
     mOutHost = makeTensor({chunkElems}, DataType::kHALF, "xvla::outHost", rt::DeviceType::kCPU);
+    mDomain = makeTensor({1}, DataType::kINT64, "xvla::domain");
+    mRtcSeed = makeTensor({1, mChunk, mActionDim}, DataType::kHALF, "xvla::rtcSeed");
+    mRtcWeight = makeTensor({1, mChunk, 1}, DataType::kHALF, "xvla::rtcWeight");
+    // 8 bytes of domain id, then the seed and weights as FP16.
+    mRtcHost = makeTensor({4 + chunkElems + mChunk}, DataType::kHALF, "xvla::rtcHost", rt::DeviceType::kCPU);
 
     auto* times = static_cast<__half*>(mStageHost.rawPointer());
     for (int32_t s = 0; s < mNumSteps; ++s)
@@ -134,6 +141,10 @@ XvlaPolicy::XvlaPolicy(std::string const& engineDir, cudaStream_t stream)
 
 XvlaPolicy::~XvlaPolicy() noexcept
 {
+    if (mGraph != nullptr)
+    {
+        cudaGraphExecDestroy(mGraph);
+    }
     for (cudaEvent_t event : mEvents)
     {
         cudaEventDestroy(event);
@@ -192,6 +203,27 @@ std::vector<float> XvlaPolicy::preprocessView(unsigned char const* rgb, int32_t 
     return out;
 }
 
+void XvlaPolicy::setDomainId(int32_t domainId)
+{
+    ELLM_CHECK(domainId >= 0 && domainId < mNumDomains,
+        "XvlaPolicy: domain id outside [0, " + std::to_string(mNumDomains) + ")");
+    mDomainId = domainId;
+}
+
+std::vector<float> XvlaPolicy::prefixWeights(int32_t delay, int32_t horizon, int32_t total)
+{
+    int32_t const start = std::min(delay, horizon);
+    std::vector<float> weights(static_cast<size_t>(total), 0.0F);
+    std::fill_n(weights.begin(), std::min(start, total), 1.0F);
+    int32_t const steps = std::min(horizon, total) - start;
+    for (int32_t i = 0; i < steps; ++i)
+    {
+        // torch.linspace(1, 0, steps + 2)[1:-1]
+        weights[static_cast<size_t>(start + i)] = 1.0F - static_cast<float>(i + 1) / static_cast<float>(steps + 1);
+    }
+    return weights;
+}
+
 std::vector<int64_t> XvlaPolicy::tokenize(std::string const& task) const
 {
     auto const ids = mTokenizer->encode(task, /*addBos=*/true, /*addEos=*/true);
@@ -207,8 +239,27 @@ std::vector<int64_t> XvlaPolicy::tokenize(std::string const& task) const
     return out;
 }
 
+void XvlaPolicy::enqueueDenoiseLoop()
+{
+    size_t const featureBytes = static_cast<size_t>(mImageTokens) * mHidden * sizeof(__half);
+    mStep.bind("x1", mX1.rawPointer());
+    mStep.bind("proprio", mProprio.rawPointer());
+    mStep.bind("vlm_features", mVlm.rawPointer());
+    mStep.bind("aux_visual_inputs", static_cast<char*>(mFeatures.rawPointer()) + featureBytes);
+    mStep.bind("domain_id", mDomain.rawPointer());
+    mStep.bind("rtc_seed", mRtcSeed.rawPointer());
+    mStep.bind("rtc_weight", mRtcWeight.rawPointer());
+    for (int32_t s = 0; s < mNumSteps; ++s)
+    {
+        mStep.bind("action", mAction[s % 2].rawPointer());
+        mStep.bind("t", mTimes.dataPointer<__half>() + s);
+        mStep.bind("action_next", mAction[(s + 1) % 2].rawPointer());
+        ELLM_CHECK(mStep.enqueue(mStream), "XvlaPolicy: step enqueue failed");
+    }
+}
+
 XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float> const& state, std::string const& task,
-    std::vector<float> const& noise)
+    std::vector<float> const& noise, XvlaRtc const* rtc)
 {
     XvlaChunk chunk;
     ELLM_CHECK(static_cast<int32_t>(state.size()) == mStateDim, "XvlaPolicy: state has the wrong width");
@@ -259,6 +310,22 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
         stage[chunkElems + d] = __float2half(d < mStateDim ? state[d] : 0.0F);
     }
 
+    *static_cast<int64_t*>(mRtcHost.rawPointer()) = mDomainId;
+    auto* seed = static_cast<__half*>(mRtcHost.rawPointer()) + 4;
+    auto* weight = seed + chunkElems;
+    std::fill_n(seed, chunkElems + mChunk, __float2half(0.0F));
+    if (rtc != nullptr && !mPrevious.empty())
+    {
+        int32_t const startRow = rtc->startRow >= 0 ? rtc->startRow : mChunk - rtc->executionHorizon;
+        ELLM_CHECK(startRow >= 0 && startRow <= mChunk, "XvlaPolicy: RTC start row outside the chunk");
+        int32_t const leftover = mChunk - startRow;
+        std::transform(
+            mPrevious.begin() + static_cast<ptrdiff_t>(startRow) * mActionDim, mPrevious.end(), seed, __float2half);
+        std::vector<float> const weights
+            = prefixWeights(rtc->inferenceDelay, std::min(rtc->executionHorizon, leftover), mChunk);
+        std::transform(weights.begin(), weights.end(), weight, __float2half);
+    }
+
     size_t const featureBytes = static_cast<size_t>(mImageTokens) * mHidden * sizeof(__half);
     CUDA_CHECK(cudaMemcpyAsync(
         mPixels.rawPointer(), pixels, numPresent * viewSize * sizeof(__half), cudaMemcpyHostToDevice, mStream));
@@ -268,6 +335,12 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
     CUDA_CHECK(cudaMemcpyAsync(
         mProprio.rawPointer(), stage + chunkElems, mProprioDim * sizeof(__half), cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemsetAsync(mAction[0].rawPointer(), 0, chunkElems * sizeof(__half), mStream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(mDomain.rawPointer(), mRtcHost.rawPointer(), sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(mRtcSeed.rawPointer(), seed, chunkElems * sizeof(__half), cudaMemcpyHostToDevice, mStream));
+    CUDA_CHECK(
+        cudaMemcpyAsync(mRtcWeight.rawPointer(), weight, mChunk * sizeof(__half), cudaMemcpyHostToDevice, mStream));
     auto* features = static_cast<char*>(mFeatures.rawPointer());
     int64_t const missing = static_cast<int64_t>(mCameras.size()) - numPresent;
     if (missing > 0)
@@ -288,16 +361,24 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
     ELLM_CHECK(mEncoder.enqueue(mStream), "XvlaPolicy: encoder enqueue failed");
     CUDA_CHECK(cudaEventRecord(mEvents[2], mStream));
 
-    mStep.bind("x1", mX1.rawPointer());
-    mStep.bind("proprio", mProprio.rawPointer());
-    mStep.bind("vlm_features", mVlm.rawPointer());
-    mStep.bind("aux_visual_inputs", features + featureBytes);
-    for (int32_t s = 0; s < mNumSteps; ++s)
+    if (mUseCudaGraph && mGraph != nullptr)
     {
-        mStep.bind("action", mAction[s % 2].rawPointer());
-        mStep.bind("t", mTimes.dataPointer<__half>() + s);
-        mStep.bind("action_next", mAction[(s + 1) % 2].rawPointer());
-        ELLM_CHECK(mStep.enqueue(mStream), "XvlaPolicy: step enqueue failed");
+        CUDA_CHECK(cudaGraphLaunch(mGraph, mStream));
+    }
+    else
+    {
+        // TensorRT needs one regular enqueue for these shapes before its kernels can be captured.
+        enqueueDenoiseLoop();
+        if (mUseCudaGraph)
+        {
+            CUDA_CHECK(cudaStreamSynchronize(mStream));
+            cudaGraph_t graph{};
+            CUDA_CHECK(cudaStreamBeginCapture(mStream, cudaStreamCaptureModeThreadLocal));
+            enqueueDenoiseLoop();
+            CUDA_CHECK(cudaStreamEndCapture(mStream, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&mGraph, graph, 0));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
     }
     CUDA_CHECK(cudaEventRecord(mEvents[3], mStream));
     CUDA_CHECK(cudaMemcpyAsync(mOutHost.rawPointer(), mAction[mNumSteps % 2].rawPointer(), chunkElems * sizeof(__half),
@@ -313,6 +394,7 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
     {
         chunk.actions[i] = __half2float(out[i]);
     }
+    mPrevious = chunk.actions;
     for (int32_t t = 0; t < mChunk; ++t)
     {
         for (int32_t g : mGripper)
