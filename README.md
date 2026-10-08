@@ -29,6 +29,8 @@ support for platforms upstream no longer targets.
 | NVFP4 AWQ `pre_quant_scale`, NVFP4 CASK epilogue cap (TRT 10.13/10.14) | Fixed; needs Thor to verify | [FIXES.md](FIXES.md) |
 | InternLM2-backed InternVL3 checkpoints | Converter | `tensorrt_edgellm/scripts/convert_internlm2_internvl.py` |
 | GR00T N1.7 policy | Backbone through Edge-LLM, action head with cross-attention K/V cached per call; 114.5 ms per action chunk on Orin, matching the official model | [below](#gr00t-n17) |
+| pi0.5 SO101 policy (openpi `pi05_so101`) | JetPack 6 engines with SO101 pre/post-processing, RTC with state-relative re-encoding, async control, opt-in INT8 prefix; 204.5 ms per call (177.9 ms INT8), matching openpi FP32 within its own bf16 spread | [pi0.5](experimental_models/pi05/README.md#so101-pi05_so101) |
+| SmolVLA policy (LeRobot 0.6.1) | Visual / prefix / denoise engines from plain PyTorch ops, RTC as flow-path inpainting, async control; 83-93 ms per call, robot actions within 0.137 of LeRobot | [design](experimental_models/smolvla/DESIGN.md) |
 | GR00T N1.6 policy | Eagle 3 backbone as plain-op engines with bit-exact official preprocessing, N1.7's action head and RTC; 172 ms per chunk, actions comparable to the official model's own bf16 spread | [below](#gr00t-n16) |
 | VLA replan caching | Encoder-cache partial hits and KV prefix reuse with tail-only hidden capture; ~2× faster InternVLA-N1 replans | [below](#kv-cache-reuse-for-vla-control-loops) |
 
@@ -94,8 +96,9 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 2. **GR00T N1.7**: done ([below](#gr00t-n17)): W8A8 DiT, CUDA-graph denoising, RTC chunking and SO101
    pre/post-processing. **GR00T N1.6**: done ([below](#gr00t-n16)).
 3. **Shared VLA layer**: done ([below](#shared-vla-layer)), extracted from InternVLA-N1 and GR00T.
-4. **Bidirectional-prefix VLAs** (pi0.5, SmolVLA): encoder cache, persistent CUDA graphs, prefix KV pool in
-   the core runtime.
+4. **Bidirectional-prefix VLAs**: pi0.5 SO101 and SmolVLA policy runtimes done, with RTC and async control;
+   the encoder cache and prefix KV pool in the core runtime are still open.
+5. **More VLAs**: GR00T N1.5, OpenVLA, X-VLA.
 
 ## GR00T N1.7
 
