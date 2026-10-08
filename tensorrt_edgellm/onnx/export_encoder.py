@@ -58,6 +58,7 @@ from .export import (_OPSET_VERSION, _fix_initializer_dtypes,
                      _fix_nvfp4_weight_dtype, _permissive_inline_opset,
                      _strip_onnxscript_internal_attrs,
                      setup_fp8_qkv_scales_for_export)
+from .trt_workarounds import apply_trt103_workarounds
 
 if TYPE_CHECKING:
     from ..config import ModelConfig
@@ -626,6 +627,10 @@ def export_internvla_n1_system1_onnx(
     with open(os.path.join(out_dir, "config.json"), "w") as f:
         json.dump(cfg_out, f, indent=2)
     for name, path in paths.items():
+        rewrites = apply_trt103_workarounds(path)
+        if rewrites:
+            logger.info("[System1] %s: %d TensorRT 10.3 attention rewrites",
+                        name, rewrites)
         logger.info("[System1] %s -> %s (%.1f MB)", name, path,
                     os.path.getsize(path) / 1e6)
     return paths
