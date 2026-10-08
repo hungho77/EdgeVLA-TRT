@@ -108,3 +108,19 @@ engine in the pipeline put together.
 
 See `docs/source/user_guide/examples/vla/internvla_n1.md` for the architecture, measured
 latency/fidelity, and the platform build notes.
+
+## AGX Orin 64 GB, JetPack 6.2
+
+InternVLA-N1-DualVLN, FP16 System 2 (Qwen2.5-VL-7B), BF16 System 1, `--ticks 40 --cadence 4`:
+
+| Metric | Value |
+|---|---|
+| First plan | 181 ms (System 2 text-only, as in the CLI example) |
+| System-1 tick, mean / worst | 188 ms (5.3 Hz) / 314 ms |
+
+The LLM engine was built with `--maxInputLen 2048 --maxKVCacheCapacity 2560` to fit beside the other engines.
+
+On TensorRT 10.3 the System-1 memory block's attention needs the rewrite in
+`tensorrt_edgellm.onnx.trt_workarounds`, which the exporter applies (12 rewrites); exports made before it
+moved waypoints by up to 0.43 on a 2.5 range and need a re-export and a memory-engine rebuild
+(see [JETPACK6.md](../../JETPACK6.md)).
