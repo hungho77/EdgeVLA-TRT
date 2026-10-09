@@ -49,8 +49,10 @@ own evaluation conventions (LIBERO-Spatial, 10 tasks x 10 episodes, fixed initia
 - GR00T N1.5 / N1.6 run their Eagle prefix on the LLM runtime
   ([GR00T guide](experimental_models/gr00t/README.md#faster-eagle-backbone)). N1.5's official LIBERO evaluation
   denoises in 8 steps; its checkpoint default of 4 is a speed setting with the same success rate here.
-- Every model has a JSON-lines policy server (`*_policy_server`, `internvla_n1_dual_system_server`). The guides also
-  cover SO101 fine-tunes (GR00T N1.5 / N1.6 / N1.7, pi0.5, SmolVLA, X-VLA) checked against the official policies.
+- Every model has a policy server for a real robot: raw camera frames in over stdin or TCP, action chunks out, with a
+  Python client and an asynchronous real-time-chunking control loop
+  ([real-robot serving](experimental_models/vla/README.md#real-robot-serving)). The guides also cover SO101
+  fine-tunes (GR00T N1.5 / N1.6 / N1.7, pi0.5, SmolVLA, X-VLA) checked against the official policies.
 
 Upstream's VLA support (pi0.5 `libero` / `droid` / `aloha`, Alpamayo, Cosmos3-Edge policy) and its LLMs and VLMs
 are unchanged: [VLA examples](docs/source/user_guide/examples/vla/index.md),
