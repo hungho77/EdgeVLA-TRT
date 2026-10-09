@@ -15,78 +15,54 @@
  * limitations under the License.
  */
 
-//! SmolVLA policy server: one JSON request per stdin line, one JSON reply per stdout line.
+//! SmolVLA policy server for a robot or a simulator: one request in, one action chunk out, over stdin / stdout or
+//! TCP (--port, see vlaServer.h for the framing and the inline-frame protocol).
 //!
-//! Request:  {"cameras": {"image": "top.png", ...},     raw frames keyed by the checkpoint's camera names
-//!            "state": [...],                          robot units, the checkpoint's state width
+//! Request:  {"frames": [{"name": "top", "height": H, "width": W, "bytes": N}, ...] + raw RGB bytes,
+//!              or "cameras": {"top": "top.png", ...},   frames keyed by the dataset's camera names
+//!            "state": [...],                           robot units, the dataset's state width
 //!            "task": "pick the cube",
-//!            "rtc": {"delay": 4, "horizon": 20,       optional, real-time chunking from the previous reply
+//!            "rtc": {"delay": 4, "horizon": 20,        optional, real-time chunking from the previous reply
 //!                    "start_row": 10},
-//!            "seed": 0,                               optional, reseeds x_0
-//!            "reset": true}                           optional, start of an episode
+//!            "seed": 0,                                optional, reseeds x_0
+//!            "reset": true}                            optional, start of an episode
 //! Reply:    {"actions": [[...], ...], "timing_ms": {...}}  or {"error": "..."}
+//! Actions are the dataset's own, in robot units (mean/std unnormalized), as LeRobot returns them.
 
 #include "smolvlaPolicy.h"
 
-#include "runtime/imageUtils.h"
-
-#include <nlohmann/json.hpp>
+#include "vlaServer.h"
 
 #include <chrono>
 #include <cstdio>
-#include <cstring>
-#include <iostream>
 #include <string>
 #include <vector>
 
 using namespace trt_edgellm;
 using Json = nlohmann::json;
 
-namespace
-{
-
-std::string argOf(int argc, char** argv, char const* flag, std::string const& fallback = "")
-{
-    for (int i = 1; i + 1 < argc; ++i)
-    {
-        if (std::strcmp(argv[i], flag) == 0)
-        {
-            return argv[i + 1];
-        }
-    }
-    return fallback;
-}
-
-} // namespace
-
 int main(int argc, char** argv)
 {
-    std::string const engineDir = argOf(argc, argv, "--engineDir");
+    std::string const engineDir = vla::argOf(argc, argv, "--engineDir");
     if (engineDir.empty())
     {
-        std::fprintf(stderr, "usage: %s --engineDir DIR [--cudaGraph 1]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s --engineDir DIR [--cudaGraph 1] [--port N [--host H]]\n", argv[0]);
         return 2;
     }
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
     smolvla::SmolvlaPolicy policy(engineDir, stream);
-    policy.setUseCudaGraph(argOf(argc, argv, "--cudaGraph", "1") != "0");
+    policy.setUseCudaGraph(vla::argOf(argc, argv, "--cudaGraph", "1") != "0");
 
-    std::printf("{\"ready\":true,\"chunk\":%d,\"action_dim\":%d}\n", policy.chunkSize(), policy.actionDim());
-    std::fflush(stdout);
-
-    std::string line;
-    while (std::getline(std::cin, line))
-    {
-        if (line.empty())
-        {
-            break;
-        }
-        Json reply;
-        try
-        {
-            Json const in = Json::parse(line);
+    Json const ready
+        = {{"ready", true}, {"family", "smolvla"}, {"cameras", policy.cameras()}, {"state_dim", policy.stateDim()},
+            {"action_dim", policy.actionDim()}, {"chunk", policy.chunkSize()}, {"rtc", "delay_horizon"}};
+    vla::PolicyServer server(argc, argv);
+    server.run(
+        ready,
+        [&](vla::ServerRequest& request) {
+            Json const& in = request.header;
             auto const t0 = std::chrono::steady_clock::now();
             if (in.value("reset", false))
             {
@@ -96,18 +72,12 @@ int main(int argc, char** argv)
             {
                 policy.setNoiseSeed(in.at("seed").get<uint64_t>());
             }
-            std::vector<rt::imageUtils::ImageData> images;
-            std::vector<std::string> names;
-            for (auto const& [camera, path] : in.at("cameras").items())
-            {
-                images.push_back(rt::imageUtils::loadRgbImageFromFile(path.get<std::string>()));
-                names.push_back(camera);
-            }
+            std::vector<vla::NamedFrame> const frames = vla::collectFrames(request, "cameras");
             smolvla::SmolvlaObservation observation;
-            for (size_t i = 0; i < images.size(); ++i)
+            for (auto const& frame : frames)
             {
-                observation.views.push_back(smolvla::SmolvlaView{names[i], images[i].data(),
-                    static_cast<int32_t>(images[i].height), static_cast<int32_t>(images[i].width)});
+                observation.views.push_back(smolvla::SmolvlaView{frame.name, frame.image.data(),
+                    static_cast<int32_t>(frame.image.height), static_cast<int32_t>(frame.image.width)});
             }
             observation.state = in.at("state").get<std::vector<float>>();
             observation.task = in.at("task").get<std::string>();
@@ -128,17 +98,13 @@ int main(int argc, char** argv)
                 rows.push_back(std::vector<float>(chunk.robot.begin() + static_cast<int64_t>(t) * policy.actionDim(),
                     chunk.robot.begin() + static_cast<int64_t>(t + 1) * policy.actionDim()));
             }
+            Json reply;
             reply["actions"] = rows;
             reply["timing_ms"] = {{"visual", chunk.visualMs}, {"prefix", chunk.prefixMs}, {"denoise", chunk.denoiseMs},
                 {"total", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()}};
-        }
-        catch (std::exception const& e)
-        {
-            reply = {{"error", e.what()}};
-        }
-        std::printf("%s\n", reply.dump().c_str());
-        std::fflush(stdout);
-    }
+            return reply;
+        },
+        [&] { policy.resetEpisode(); });
     cudaStreamDestroy(stream);
     return 0;
 }

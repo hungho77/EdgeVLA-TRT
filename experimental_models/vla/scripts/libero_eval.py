@@ -419,7 +419,12 @@ def main():
         type=int,
         default=0,
         help="chunk rows executed per call (default: per policy)")
-    parser.add_argument("--server-cmd", required=True)
+    parser.add_argument("--server-cmd",
+                        help="spawn the policy server over stdio")
+    parser.add_argument("--port",
+                        type=int,
+                        help="or connect to one listening on TCP")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--server-env",
                         action="append",
                         default=[],
@@ -455,8 +460,12 @@ def main():
     if os.path.exists(args.out):
         results = json.load(open(args.out))
     suite = benchmark.get_benchmark_dict()[args.suite]()
-    server = JsonServer(args.server_cmd,
-                        dict(kv.split("=", 1) for kv in args.server_env))
+    if args.port:
+        from vla_policy_client import VlaPolicyClient
+        server = VlaPolicyClient(host=args.host, port=args.port)
+    else:
+        server = JsonServer(args.server_cmd,
+                            dict(kv.split("=", 1) for kv in args.server_env))
     adapter = POLICIES[args.policy](server, args.rows)
     print("server:", server.info, flush=True)
 

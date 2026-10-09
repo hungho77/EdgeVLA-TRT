@@ -15,53 +15,36 @@
  * limitations under the License.
  */
 
-//! OpenVLA policy server: one JSON request per stdin line, one JSON reply per stdout line.
+//! OpenVLA policy server for a robot or a simulator: one request in, one action out, over stdin / stdout or TCP
+//! (--port, see vlaServer.h for the framing and the inline-frame protocol).
 //!
-//! Request:  {"image": "frame.png",                    the primary camera frame
-//!            "instruction": "pick up the banana",
-//!            "unnorm_key": "bridge_orig"}             the dataset statistics that unnormalize the actions
+//! Request:  {"frames": [{"name": "image", "height": H, "width": W, "bytes": N}] + raw RGB bytes,
+//!              or "image": "frame.png",               the third-person camera frame
+//!            "task": "pick up the banana",            ("instruction" is accepted too)
+//!            "unnorm_key": "bridge_orig"}             optional, default --unnormKey
 //! Reply:    {"actions": [[...]], "action_tokens": [...], "timing_ms": {...}}  or {"error": "..."}
+//! The action is the dataset's unnormalized end-effector delta and gripper (OpenVLA's predict_action), one per call.
 
 #include "openvlaPolicy.h"
 
 #include "common/trtUtils.h"
-#include "runtime/imageUtils.h"
-
-#include <nlohmann/json.hpp>
+#include "vlaServer.h"
 
 #include <cstdio>
-#include <cstring>
-#include <iostream>
 #include <string>
 #include <vector>
 
 using namespace trt_edgellm;
 using Json = nlohmann::json;
 
-namespace
-{
-
-std::string argOf(int argc, char** argv, char const* flag, std::string const& fallback = "")
-{
-    for (int i = 1; i + 1 < argc; ++i)
-    {
-        if (std::strcmp(argv[i], flag) == 0)
-        {
-            return argv[i + 1];
-        }
-    }
-    return fallback;
-}
-
-} // namespace
-
 int main(int argc, char** argv)
 {
-    std::string const visionDir = argOf(argc, argv, "--visionDir");
-    std::string const llmDir = argOf(argc, argv, "--llmEngineDir");
+    std::string const visionDir = vla::argOf(argc, argv, "--visionDir");
+    std::string const llmDir = vla::argOf(argc, argv, "--llmEngineDir");
     if (visionDir.empty() || llmDir.empty())
     {
-        std::fprintf(stderr, "usage: %s --visionDir DIR --llmEngineDir DIR\n", argv[0]);
+        std::fprintf(
+            stderr, "usage: %s --visionDir DIR --llmEngineDir DIR [--unnormKey KEY] [--port N [--host H]]\n", argv[0]);
         return 2;
     }
 
@@ -69,37 +52,32 @@ int main(int argc, char** argv)
     cudaStream_t stream;
     cudaStreamCreate(&stream);
     openvla::OpenvlaPolicy policy(visionDir, llmDir, stream);
+    std::vector<std::string> const keys = policy.unnormKeys();
+    std::string const defaultKey = vla::argOf(argc, argv, "--unnormKey", keys.size() == 1 ? keys.front() : "");
 
-    std::printf("{\"ready\":true}\n");
-    std::fflush(stdout);
-
-    std::string line;
-    while (std::getline(std::cin, line))
+    Json ready = {{"ready", true}, {"family", "openvla"}, {"cameras", {"image"}}, {"state_dim", 0}, {"chunk", 1},
+        {"rtc", nullptr}, {"unnorm_keys", keys}, {"unnorm_key", defaultKey}};
+    if (!defaultKey.empty())
     {
-        if (line.empty())
-        {
-            break;
-        }
-        Json reply;
-        try
-        {
-            Json const in = Json::parse(line);
-            rt::imageUtils::ImageData const image
-                = rt::imageUtils::loadRgbImageFromFile(in.at("image").get<std::string>());
-            openvla::OpenvlaStep const step
-                = policy.act(image.data(), static_cast<int32_t>(image.height), static_cast<int32_t>(image.width),
-                    in.at("instruction").get<std::string>(), in.at("unnorm_key").get<std::string>());
-            reply["actions"] = Json::array({step.actions});
-            reply["action_tokens"] = step.actionIds;
-            reply["timing_ms"] = {{"vision", step.visionMs}, {"llm", step.llmMs}};
-        }
-        catch (std::exception const& e)
-        {
-            reply = {{"error", e.what()}};
-        }
-        std::printf("%s\n", reply.dump().c_str());
-        std::fflush(stdout);
+        ready["action_dim"] = policy.actionDim(defaultKey);
     }
+    vla::PolicyServer server(argc, argv);
+    server.run(ready, [&](vla::ServerRequest& request) {
+        Json const& in = request.header;
+        rt::imageUtils::ImageData const image = request.frames.empty()
+            ? rt::imageUtils::loadRgbImageFromFile(in.at("image").get<std::string>())
+            : std::move(request.frames.front().image);
+        std::string const task
+            = in.contains("task") ? in.at("task").get<std::string>() : in.at("instruction").get<std::string>();
+        std::string const key = in.value("unnorm_key", defaultKey);
+        openvla::OpenvlaStep const step = policy.act(
+            image.data(), static_cast<int32_t>(image.height), static_cast<int32_t>(image.width), task, key);
+        Json reply;
+        reply["actions"] = Json::array({step.actions});
+        reply["action_tokens"] = step.actionIds;
+        reply["timing_ms"] = {{"vision", step.visionMs}, {"llm", step.llmMs}};
+        return reply;
+    });
     cudaStreamDestroy(stream);
     return 0;
 }

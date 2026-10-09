@@ -123,3 +123,67 @@ MUJOCO_GL=egl python experimental_models/vla/scripts/libero_eval.py --policy gr0
 
 `--out` is rewritten after every episode and a rerun with the same file resumes; `--tasks` and `--rows` narrow a
 run or override the rows executed per call.
+
+## Real-robot serving
+
+Every VLA family has a policy server a robot can drive directly: `gr00t_policy_server` (N1.5 / N1.6 / N1.7),
+`pi05_policy_server`, `smolvla_policy_server`, `xvla_policy_server`, `openvla_policy_server`, and
+`internvla_n1_dual_system_server` for navigation. They share one transport
+([`cpp/vlaServer.h`](cpp/vlaServer.h)):
+
+- **stdin / stdout by default**, or **TCP** with `--port N` (bound to 127.0.0.1; `--host 0.0.0.0` for the LAN). TCP
+  serves one client at a time and resets the episode when a client connects.
+- **Raw camera frames inline**: a JSON header line names each frame (`{"frames": [{"name", "height", "width",
+  "bytes"}], "state": [...], "task": "..."}`) and the frames' bytes follow it, each packed `[H, W, 3]` uint8
+  **RGB** (OpenCV images are BGR: convert them). The server applies the checkpoint's own image and language
+  preprocessing; GR00T N1.7's eval image transform runs on the server too. Requests naming image files still
+  work, which is what the simulator harnesses use.
+- **A `ready` line on connect** with the family, the camera names in order, the state and action widths, the
+  chunk size and the RTC scheme.
+
+The Python side is [`scripts/vla_policy_client.py`](scripts/vla_policy_client.py):
+
+```python
+from vla_policy_client import AsyncChunkedController, VlaPolicyClient
+
+client = VlaPolicyClient(host="127.0.0.1", port=5555)          # or server_cmd=[...] to spawn it over stdio
+print(client.info)                                            # cameras, state_dim, action_dim, chunk, rtc
+chunk = client.act({"top": top_rgb, "wrist": wrist_rgb}, state, "pick up the banana", reset=True)
+
+# A 30 Hz loop with the next chunk planned in the background and real-time chunking at the switches.
+read = lambda tick: ({"top": camera_top(), "wrist": camera_wrist()}, joint_state(), "pick up the banana")
+controller = AsyncChunkedController(client, read, overlap=10, frozen=7)
+controller.warmup(read(0))                                    # first plain and RTC calls, before the loop
+for tick in itertools.count():
+    action = controller.step(tick)                            # None: no chunk covers this tick, hold the robot
+    if action is not None:
+        robot.send(action)
+    sleep_until_next_tick()
+```
+
+`frozen` rows are reproduced exactly at a chunk switch, so they must exceed the worst planner latency in ticks
+(`replay_robot.py` reports it); `chunk - overlap` rows are executed before the next chunk is requested.
+[`scripts/replay_robot.py`](scripts/replay_robot.py) is this loop fed by a recorded LeRobot dataset instead of
+hardware.
+
+| Server | Cameras | State in | Actions out | Rows per call | RTC |
+|---|---|---|---|---|---|
+| GR00T N1.5 / N1.6 / N1.7 | `processing.json` `video_keys` | raw state groups in modality order | absolute raw actions per the embodiment (relative joints decoded against the state) | action horizon (16) | overlap / frozen |
+| pi0.5 | the contract's camera slots | robot units, the embodiment's width | robot units after openpi's output transform | action horizon (10 LIBERO, 50 SO101) | overlap / frozen |
+| SmolVLA | the dataset's camera names | the dataset's state | the dataset's actions, unnormalized | chunk (50) | delay / horizon |
+| X-VLA | the checkpoint's camera names | proprio, zero-padded to 20 | ee6d absolute targets: position, rot6d, gripper through a sigmoid | chunk (30) | delay / horizon |
+| OpenVLA | `image` (third-person) | none | one unnormalized end-effector delta and gripper, per the `unnorm_key` dataset | 1 | none |
+
+Verified by replay and in LIBERO over TCP, not on hardware. AGX Orin, SO101 dataset frames at 30 Hz wall clock
+through `replay_robot.py` over TCP with raw frames, 300 ticks each, no stalls (after `warmup`):
+
+| | Policy call | Planner lag (ticks) | Switch jump with RTC / without |
+|---|---|---|---|
+| GR00T N1.7 (frozen 7) | 141 ms | 5 | 0.0087 / 26.9 |
+| SmolVLA (frozen 6) | 79 ms | 3 | 0.0000 / 6.08 |
+| X-VLA (frozen 9) | 188 ms | 6 | 0.0000 / 0.036 |
+| pi0.5 (frozen 12) | 272 ms | 8-11 | 0.0000 / 6.15 |
+
+Inline frames over stdio and TCP give bit-identical actions to the same images by path for every family, and a
+LIBERO-Spatial run through a TCP server (`libero_eval.py --port`) succeeds as over stdio. OpenVLA answers about
+once per second, so it suits slow, synchronous stepping rather than a 30 Hz loop.

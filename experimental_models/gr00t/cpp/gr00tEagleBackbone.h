@@ -134,5 +134,11 @@ private:
     int32_t mLastViews{0};
 };
 
+//! GR00T N1.7's eval image transform on a raw camera frame, as experimental_models/gr00t/examples/
+//! gr00t_policy_client.py applies it (bit-exact to the official processor): letterbox to square (zeros, centred),
+//! SmallestMaxSize (OpenCV INTER_AREA), FractionalCenterCrop and SmallestMaxSize again. Host [1, H, W, 3] RGB.
+rt::imageUtils::ImageData gr00tN17EvalImage(
+    unsigned char const* rgb, int32_t height, int32_t width, int32_t shortestEdge = 256, double cropFraction = 0.95);
+
 } // namespace gr00t
 } // namespace trt_edgellm

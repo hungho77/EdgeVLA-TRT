@@ -15,54 +15,39 @@
  * limitations under the License.
  */
 
-//! pi0.5 policy server: one JSON request per stdin line, one JSON reply per stdout line.
+//! pi0.5 policy server for a robot or a simulator: one request in, one action chunk out, over stdin / stdout or
+//! TCP (--port, see vlaServer.h for the framing and the inline-frame protocol).
 //!
-//! Request:  {"cameras": {"observation/image": "top.png", ...},  frames keyed by the contract's camera slots
-//!            "state": [...],                                    robot units, the embodiment's width
+//! Request:  {"frames": [{"name": "observation/image", "height": H, "width": W, "bytes": N}, ...] + raw RGB,
+//!              or "cameras": {"observation/image": "top.png", ...},  frames keyed by the contract's camera slots
+//!            "state": [...],                           robot units, the embodiment's width
 //!            "task": "pick the cube",
-//!            "rtc": {"overlap": 5, "frozen": 2,                 optional, real-time chunking from the previous reply
+//!            "rtc": {"overlap": 5, "frozen": 2,        optional, real-time chunking from the previous reply
 //!                    "ramp_rate": 6.0, "start_row": 5},
-//!            "reset": true}                                     optional, start of an episode
+//!            "seed": 0,                                optional, reseeds x_0
+//!            "reset": true}                            optional, start of an episode
 //! Reply:    {"actions": [[...], ...], "timing_ms": {...}}  or {"error": "..."}
+//! Actions are robot units for the contract's embodiment (its openpi output transform applied).
 
 #include "common/trtUtils.h"
 #include "runtime/pi05Policy.h"
-
-#include <nlohmann/json.hpp>
+#include "vlaServer.h"
 
 #include <cstdio>
-#include <cstring>
 #include <cuda_runtime.h>
-#include <iostream>
 #include <string>
 #include <vector>
 
 using namespace trt_edgellm;
 using Json = nlohmann::json;
 
-namespace
-{
-
-std::string argOf(int argc, char** argv, char const* flag, std::string const& fallback = "")
-{
-    for (int i = 1; i + 1 < argc; ++i)
-    {
-        if (std::strcmp(argv[i], flag) == 0)
-        {
-            return argv[i + 1];
-        }
-    }
-    return fallback;
-}
-
-} // namespace
-
 int main(int argc, char** argv)
 {
-    std::string const engineDir = argOf(argc, argv, "--engineDir");
+    std::string const engineDir = vla::argOf(argc, argv, "--engineDir");
     if (engineDir.empty())
     {
-        std::fprintf(stderr, "usage: %s --engineDir DIR [--steps N] [--seed N] [--cudaGraph 1]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s --engineDir DIR [--steps N] [--seed N] [--cudaGraph 1] [--port N [--host H]]\n",
+            argv[0]);
         return 2;
     }
 
@@ -72,39 +57,45 @@ int main(int argc, char** argv)
     auto const pluginHandles = loadEdgellmPluginLib();
     pi05::Pi05Policy policy(engineDir, stream);
     pi05::Pi05Runtime& runtime = policy.runtime();
-    runtime.setNoiseSeed(std::stoull(argOf(argc, argv, "--seed", "0")));
-    runtime.setUseCudaGraph(argOf(argc, argv, "--cudaGraph", "1") != "0");
-    std::string const steps = argOf(argc, argv, "--steps");
+    runtime.setNoiseSeed(std::stoull(vla::argOf(argc, argv, "--seed", "0")));
+    runtime.setUseCudaGraph(vla::argOf(argc, argv, "--cudaGraph", "1") != "0");
+    std::string const steps = vla::argOf(argc, argv, "--steps");
     if (!steps.empty())
     {
         runtime.setNumDenoiseSteps(std::stoi(steps));
     }
 
-    std::printf("{\"ready\":true,\"horizon\":%d,\"robot_action_dim\":%d}\n", policy.contract().actionHorizon,
-        policy.robotActionDim());
-    std::fflush(stdout);
-
-    std::string line;
-    while (std::getline(std::cin, line))
+    std::vector<std::string> cameras;
+    for (auto const& slot : policy.cameras())
     {
-        if (line.empty())
-        {
-            break;
-        }
-        Json reply;
-        try
-        {
-            Json const in = Json::parse(line);
+        cameras.push_back(slot.name);
+    }
+    pi05::Pi05Contract const& contract = policy.contract();
+    Json const ready = {{"ready", true}, {"family", "pi05"}, {"policy_config", contract.policyConfig},
+        {"cameras", cameras}, {"state_dim", contract.stateDim}, {"action_dim", policy.robotActionDim()},
+        {"chunk", contract.actionHorizon}, {"rtc", "overlap_frozen"}};
+    vla::PolicyServer server(argc, argv);
+    server.run(
+        ready,
+        [&](vla::ServerRequest& request) {
+            Json const& in = request.header;
             if (in.value("reset", false))
             {
                 policy.resetEpisode();
             }
+            if (in.contains("seed"))
+            {
+                runtime.setNoiseSeed(in.at("seed").get<uint64_t>());
+            }
+            std::vector<vla::NamedFrame> const frames = vla::collectFrames(request, "cameras");
             pi05::Pi05Observation observation;
-            for (auto const& [slot, path] : in.at("cameras").items())
+            for (auto const& frame : frames)
             {
                 pi05::Pi05CameraView view;
-                view.name = slot;
-                view.imagePath = path.get<std::string>();
+                view.name = frame.name;
+                view.rgb = frame.image.data();
+                view.height = static_cast<int32_t>(frame.image.height);
+                view.width = static_cast<int32_t>(frame.image.width);
                 observation.cameras.push_back(view);
             }
             observation.state = in.at("state").get<std::vector<float>>();
@@ -129,16 +120,12 @@ int main(int argc, char** argv)
                 rows.push_back(std::vector<float>(chunk.robotActions.begin() + static_cast<int64_t>(t) * dim,
                     chunk.robotActions.begin() + static_cast<int64_t>(t + 1) * dim));
             }
+            Json reply;
             reply["actions"] = rows;
             reply["timing_ms"] = {{"engines", chunk.timings.engineMs}, {"total", chunk.timings.policyMs}};
-        }
-        catch (std::exception const& e)
-        {
-            reply = {{"error", e.what()}};
-        }
-        std::printf("%s\n", reply.dump().c_str());
-        std::fflush(stdout);
-    }
+            return reply;
+        },
+        [&] { policy.resetEpisode(); });
     cudaStreamDestroy(stream);
     return 0;
 }
