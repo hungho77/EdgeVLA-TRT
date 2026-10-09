@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Robot-side client for the EdgeVLA-TRT policy servers (GR00T, pi0.5, SmolVLA, X-VLA, TurboVLA, OpenVLA).
+"""Robot-side client for the EdgeVLA-TRT policy servers (GR00T, pi0.5, SmolVLA, X-VLA, TurboVLA, RLDX-1, OpenVLA).
 
 Camera frames travel inline as raw RGB behind the request header (see experimental_models/vla/cpp/vlaServer.h), so
 the robot never writes image files. The client either starts the server as a subprocess (stdin / stdout) or connects
@@ -81,7 +81,10 @@ class VlaPolicyClient:
         payload = []
         if frames:
             if self.cameras:
-                unknown = [name for name in frames if name not in self.cameras]
+                unknown = [
+                    name for name in frames
+                    if name.split("@", 1)[0] not in self.cameras
+                ]
                 if unknown:
                     raise ValueError(
                         f"cameras {unknown} not among the server's {self.cameras}"
@@ -149,6 +152,12 @@ class AsyncChunkedController:
 
     ``step`` returns None when no chunk covers the tick (before the first lands, or when the planner fell behind):
     hold the robot, never extrapolate.
+
+    A server whose ``ready`` line lists ``frame_history`` (offsets such as [-6, -4, -2, 0]) also takes past frames,
+    named ``camera@offset``. The controller then snapshots every tick, keeps the frames, and sends the ones at
+    those offsets in ticks, the oldest available standing in before the episode is long enough (as the policies'
+    own evaluation buffers fill at reset). The offsets are in the training data's steps, so the loop should tick at
+    the dataset's rate.
     """
 
     def __init__(self,
@@ -178,6 +187,10 @@ class AsyncChunkedController:
         self.chunks = 0
         self.latencies_ms = []
         self._last_plan_tick = -1
+        self.history = [
+            int(o) for o in client.info.get("frame_history", []) if int(o) < 0
+        ]
+        self._frames = {}  # tick -> frames, kept for history offsets
         self._thread = threading.Thread(target=self._plan_loop, daemon=True)
         self._thread.start()
 
@@ -239,7 +252,24 @@ class AsyncChunkedController:
                             rtc=self._rtc(self.replan_after))
             self._last_plan_tick = -1
 
+    def _with_history(self, tick, observation):
+        frames, state, task = observation
+        self._frames[tick] = frames
+        oldest = -min(self.history)
+        for old in [t for t in self._frames if t < tick - oldest]:
+            del self._frames[old]
+        kept = sorted(self._frames)
+        merged = dict(frames)
+        for offset in self.history:
+            # The latest frame at or before tick + offset; the oldest kept one stands in for earlier ticks.
+            past = self._frames[max([t for t in kept if t <= tick + offset],
+                                    default=kept[0])]
+            merged.update({f"{name}@{offset}": f for name, f in past.items()})
+        return merged, state, task
+
     def step(self, tick):
+        if self.history:
+            observation = self._with_history(tick, self.snapshot(tick))
         with self._lock:
             if self._error is not None:
                 raise self._error
@@ -251,7 +281,8 @@ class AsyncChunkedController:
         # One request in flight at a time: the next one continues the chunk that just landed.
         if (row < 0 or row >= self.replan_after
             ) and self.requested_for <= self.current_tick:
-            observation = self.snapshot(tick)
+            if not self.history:
+                observation = self.snapshot(tick)
             with self._lock:
                 self._request = (tick, observation)
                 self._lock.notify()
