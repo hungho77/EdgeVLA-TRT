@@ -16,7 +16,7 @@
 # Shared VLA layer: TensorRT engine helpers, the VLM-backbone prefill and the
 # dual-rate planner/control handoff, used by internvla_n1 and gr00t.
 add_library(vlaExperimental STATIC cpp/vlaEngine.cpp cpp/vlaBackbone.cpp
-                                   cpp/vlaImage.cpp)
+                                   cpp/vlaImage.cpp cpp/vlaServer.cpp)
 target_include_directories(
   vlaExperimental
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp

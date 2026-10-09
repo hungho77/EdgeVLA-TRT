@@ -28,6 +28,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <future>
 #include <unordered_map>
@@ -490,6 +491,46 @@ float Gr00tEagleBackbone::prefixMs() const
     CUDA_CHECK(cudaEventSynchronize(mEvents[2]));
     CUDA_CHECK(cudaEventElapsedTime(&ms, mEvents[1], mEvents[2]));
     return ms;
+}
+
+rt::imageUtils::ImageData gr00tN17EvalImage(
+    unsigned char const* rgb, int32_t height, int32_t width, int32_t shortestEdge, double cropFraction)
+{
+    // Skipped when the rounded target equals the input, as the reference does.
+    auto smallestMaxSize = [&](cv::Mat const& image) {
+        double const scale = static_cast<double>(shortestEdge) / static_cast<double>(std::min(image.rows, image.cols));
+        cv::Size const size(pyRound(image.cols * scale), pyRound(image.rows * scale));
+        if (size.width == image.cols && size.height == image.rows)
+        {
+            return image;
+        }
+        cv::Mat resized;
+        cv::resize(image, resized, size, 0.0, 0.0, cv::INTER_AREA);
+        return resized;
+    };
+    cv::Mat image(height, width, CV_8UC3, const_cast<unsigned char*>(rgb));
+    if (height != width)
+    {
+        int32_t const side = std::max(height, width);
+        int32_t const padH = side - height;
+        int32_t const padW = side - width;
+        cv::Mat padded;
+        cv::copyMakeBorder(image, padded, padH / 2, padH - padH / 2, padW / 2, padW - padW / 2, cv::BORDER_CONSTANT,
+            cv::Scalar(0, 0, 0));
+        image = padded;
+    }
+    image = smallestMaxSize(image);
+    int32_t const cropH = std::max(1, static_cast<int32_t>(image.rows * cropFraction));
+    int32_t const cropW = std::max(1, static_cast<int32_t>(image.cols * cropFraction));
+    image = smallestMaxSize(image(cv::Rect((image.cols - cropW) / 2, (image.rows - cropH) / 2, cropW, cropH)).clone());
+    rt::Tensor pixels(
+        {1, image.rows, image.cols, 3}, rt::DeviceType::kCPU, nvinfer1::DataType::kUINT8, "gr00t::n17EvalImage");
+    for (int32_t y = 0; y < image.rows; ++y)
+    {
+        std::memcpy(pixels.dataPointer<unsigned char>() + static_cast<size_t>(y) * image.cols * 3, image.ptr(y),
+            static_cast<size_t>(image.cols) * 3);
+    }
+    return rt::imageUtils::ImageData(std::move(pixels));
 }
 
 } // namespace gr00t

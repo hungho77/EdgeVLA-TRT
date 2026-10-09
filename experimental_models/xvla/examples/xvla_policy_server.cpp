@@ -15,84 +15,60 @@
  * limitations under the License.
  */
 
-//! X-VLA policy server: one JSON request per stdin line, one JSON reply per stdout line.
+//! X-VLA policy server for a robot or a simulator: one request in, one action chunk out, over stdin / stdout or
+//! TCP (--port, see vlaServer.h for the framing and the inline-frame protocol).
 //!
-//! Request:  {"cameras": {"image": "top.png", ...},     raw frames keyed by the checkpoint's camera names
-//!            "state": [...],                          raw proprio state
+//! Request:  {"frames": [{"name": "image", "height": H, "width": W, "bytes": N}, ...] + raw RGB bytes,
+//!              or "cameras": {"image": "top.png", ...},  frames keyed by the checkpoint's camera names
+//!            "state": [...],                           proprio state, zero-padded to the model's width
 //!            "task": "pick the cube",
-//!            "rtc": {"delay": 4, "horizon": 20,       optional, real-time chunking from the previous reply
+//!            "rtc": {"delay": 4, "horizon": 20,        optional, real-time chunking from the previous reply
 //!                    "start_row": 10},
-//!            "seed": 0,                               optional, reseeds x1
-//!            "reset": true}                           optional, start of an episode
+//!            "seed": 0,                                optional, reseeds x1
+//!            "reset": true}                            optional, start of an episode
 //! Reply:    {"actions": [[...], ...], "timing_ms": {...}}  or {"error": "..."}
+//! Actions are the checkpoint's own: ee6d absolute targets with the gripper channels through a sigmoid.
 
 #include "xvlaPolicy.h"
 
-#include "runtime/imageUtils.h"
-
-#include <nlohmann/json.hpp>
+#include "vlaServer.h"
 
 #include <chrono>
 #include <cstdio>
-#include <cstring>
-#include <iostream>
 #include <string>
 #include <vector>
 
 using namespace trt_edgellm;
 using Json = nlohmann::json;
 
-namespace
-{
-
-std::string argOf(int argc, char** argv, char const* flag, std::string const& fallback = "")
-{
-    for (int i = 1; i + 1 < argc; ++i)
-    {
-        if (std::strcmp(argv[i], flag) == 0)
-        {
-            return argv[i + 1];
-        }
-    }
-    return fallback;
-}
-
-} // namespace
-
 int main(int argc, char** argv)
 {
-    std::string const engineDir = argOf(argc, argv, "--engineDir");
+    std::string const engineDir = vla::argOf(argc, argv, "--engineDir");
     if (engineDir.empty())
     {
-        std::fprintf(stderr, "usage: %s --engineDir DIR [--domain ID] [--cudaGraph 1]\n", argv[0]);
+        std::fprintf(
+            stderr, "usage: %s --engineDir DIR [--domain ID] [--cudaGraph 1] [--port N [--host H]]\n", argv[0]);
         return 2;
     }
 
     cudaStream_t stream;
     cudaStreamCreate(&stream);
     xvla::XvlaPolicy policy(engineDir, stream);
-    policy.setUseCudaGraph(argOf(argc, argv, "--cudaGraph", "1") != "0");
-    std::string const domain = argOf(argc, argv, "--domain");
+    policy.setUseCudaGraph(vla::argOf(argc, argv, "--cudaGraph", "1") != "0");
+    std::string const domain = vla::argOf(argc, argv, "--domain");
     if (!domain.empty())
     {
         policy.setDomainId(std::stoi(domain));
     }
 
-    std::printf("{\"ready\":true,\"chunk\":%d,\"action_dim\":%d,\"domain\":%d}\n", policy.chunkSize(),
-        policy.actionDim(), policy.domainId());
-    std::fflush(stdout);
-
-    std::string line;
-    while (std::getline(std::cin, line))
-    {
-        if (line.empty())
-        {
-            break;
-        }
-        Json reply;
-        try
-        {
-            Json const in = Json::parse(line);
+    Json const ready = {{"ready", true}, {"family", "xvla"}, {"cameras", policy.cameras()},
+        {"state_dim", policy.proprioDim()}, {"action_dim", policy.actionDim()}, {"chunk", policy.chunkSize()},
+        {"domain", policy.domainId()}, {"rtc", "delay_horizon"}};
+    vla::PolicyServer server(argc, argv);
+    server.run(
+        ready,
+        [&](vla::ServerRequest& request) {
+            Json const& in = request.header;
             auto const t0 = std::chrono::steady_clock::now();
             if (in.value("reset", false))
             {
@@ -102,18 +78,12 @@ int main(int argc, char** argv)
             {
                 policy.setNoiseSeed(in.at("seed").get<uint64_t>());
             }
-            std::vector<rt::imageUtils::ImageData> images;
-            std::vector<std::string> names;
-            for (auto const& [camera, path] : in.at("cameras").items())
-            {
-                images.push_back(rt::imageUtils::loadRgbImageFromFile(path.get<std::string>()));
-                names.push_back(camera);
-            }
+            std::vector<vla::NamedFrame> const frames = vla::collectFrames(request, "cameras");
             std::vector<xvla::XvlaView> views;
-            for (size_t i = 0; i < images.size(); ++i)
+            for (auto const& frame : frames)
             {
-                views.push_back(xvla::XvlaView{names[i], images[i].data(), static_cast<int32_t>(images[i].height),
-                    static_cast<int32_t>(images[i].width)});
+                views.push_back(xvla::XvlaView{frame.name, frame.image.data(), static_cast<int32_t>(frame.image.height),
+                    static_cast<int32_t>(frame.image.width)});
             }
             xvla::XvlaRtc rtc;
             bool const useRtc = in.contains("rtc");
@@ -133,18 +103,14 @@ int main(int argc, char** argv)
                 rows.push_back(std::vector<float>(chunk.actions.begin() + static_cast<int64_t>(t) * policy.actionDim(),
                     chunk.actions.begin() + static_cast<int64_t>(t + 1) * policy.actionDim()));
             }
+            Json reply;
             reply["actions"] = rows;
             reply["timing_ms"] = {{"vision", chunk.visionMs}, {"encoder", chunk.encoderMs},
                 {"denoise", chunk.denoiseMs},
                 {"total", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()}};
-        }
-        catch (std::exception const& e)
-        {
-            reply = {{"error", e.what()}};
-        }
-        std::printf("%s\n", reply.dump().c_str());
-        std::fflush(stdout);
-    }
+            return reply;
+        },
+        [&] { policy.resetEpisode(); });
     cudaStreamDestroy(stream);
     return 0;
 }

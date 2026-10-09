@@ -121,6 +121,15 @@ public:
     {
         return mActionDim;
     }
+    //! The checkpoint's camera names, in the order LeRobot feeds them.
+    std::vector<std::string> const& cameras() const noexcept
+    {
+        return mCameras;
+    }
+    int32_t proprioDim() const noexcept
+    {
+        return mProprioDim;
+    }
 
     //! LeRobot's ImageNet normalization then resize_with_pad, as planar [3, size, size].
     std::vector<float> preprocessView(unsigned char const* rgb, int32_t height, int32_t width) const;

@@ -119,6 +119,15 @@ public:
     {
         return mActionDim;
     }
+    //! The dataset's camera names, in the order LeRobot feeds them.
+    std::vector<std::string> const& cameras() const noexcept
+    {
+        return mCameras;
+    }
+    int32_t stateDim() const noexcept
+    {
+        return mStateDim;
+    }
 
     //! LeRobot's resize_with_pad (bilinear, align_corners=False, zeros on top and left) then x * 2 - 1,
     //! as planar [3, size, size].

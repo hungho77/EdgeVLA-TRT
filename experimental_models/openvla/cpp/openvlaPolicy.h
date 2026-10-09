@@ -70,6 +70,16 @@ public:
     std::vector<int32_t> promptIds(std::string const& instruction) const;
     std::vector<float> decodeActions(std::vector<int32_t> const& actionIds, std::string const& unnormKey) const;
     int32_t actionDim(std::string const& unnormKey) const;
+    //! The dataset statistics the checkpoint carries (valid unnormKey values).
+    std::vector<std::string> unnormKeys() const
+    {
+        std::vector<std::string> keys;
+        for (auto const& entry : mStats)
+        {
+            keys.push_back(entry.first);
+        }
+        return keys;
+    }
 
 private:
     struct ActionStats
