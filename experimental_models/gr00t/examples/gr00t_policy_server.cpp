@@ -265,6 +265,14 @@ int main(int argc, char** argv)
                     = std::vector<float>(raw, raw + static_cast<int64_t>(processing.actionHorizon()) * cfg.actionDim);
             }
             reply["timing_ms"] = {{"backbone", backboneMs}, {"action_head", actionMs}, {"total", msSince(t0)}};
+            reply["backbone_tokens"] = features->getShape()[1];
+#ifdef GR00T_EAGLE_BACKBONE
+            if (eagle)
+            {
+                reply["timing_ms"]["visual"] = eagleBackbone->visualMs();
+                reply["timing_ms"]["prefix"] = eagleBackbone->prefixMs();
+            }
+#endif
         }
         catch (std::exception const& e)
         {
