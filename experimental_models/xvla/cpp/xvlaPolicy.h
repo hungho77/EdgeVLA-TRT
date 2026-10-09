@@ -81,7 +81,9 @@ public:
     XvlaPolicy(XvlaPolicy const&) = delete;
     XvlaPolicy& operator=(XvlaPolicy const&) = delete;
 
-    //! \p state has stateDim values; \p noise is x1, [chunk, actionDim], drawn from the seeded generator when empty.
+    //! \p state is zero-padded or truncated to the proprio width, as LeRobot's pad_vector; the dataset's stateDim
+    //! values, or what an environment processor builds (LIBERO: [eef pos, rot6d, 0] padded to 20). \p noise is x1,
+    //! [chunk, actionDim], drawn from the seeded generator when empty.
     XvlaChunk act(std::vector<XvlaView> const& views, std::vector<float> const& state, std::string const& task,
         std::vector<float> const& noise = {}, XvlaRtc const* rtc = nullptr);
 
@@ -136,6 +138,7 @@ private:
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;
 
     std::vector<std::string> mCameras;
+    int32_t mNumViews{0};
     int32_t mImageSize{224};
     int32_t mImageTokens{50};
     int32_t mMaxTokens{50};
@@ -143,7 +146,6 @@ private:
     int32_t mChunk{30};
     int32_t mActionDim{20};
     int32_t mProprioDim{20};
-    int32_t mStateDim{0};
     int32_t mNumSteps{10};
     int32_t mHidden{1024};
     std::vector<int32_t> mGripper;

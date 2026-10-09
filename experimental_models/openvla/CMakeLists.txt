@@ -28,3 +28,10 @@ target_include_directories(
 target_link_libraries(
   openvla_policy_inference PRIVATE openvlaExperimental vlaExperimental
                                    edgellmCore commonLibraryExt)
+
+add_executable(openvla_policy_server examples/openvla_policy_server.cpp)
+target_include_directories(openvla_policy_server PRIVATE ${CMAKE_SOURCE_DIR}/cpp
+                                                         ${COMMON_INCLUDE_DIRS})
+target_link_libraries(
+  openvla_policy_server PRIVATE openvlaExperimental vlaExperimental edgellmCore
+                                commonLibraryExt)

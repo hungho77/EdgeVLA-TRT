@@ -55,6 +55,12 @@ class _DenoiseExport(nn.Module):
         return inpaint(x_next, timestep + dt, x_0, rtc_seed, rtc_weight)
 
 
+def expert_intermediate_size(hidden, ffn_dim_multiplier=4, multiple_of=256):
+    """LeRobot's get_intermediate_size."""
+    hidden = int(ffn_dim_multiplier * int(2 * hidden / 3))
+    return multiple_of * ((hidden + multiple_of - 1) // multiple_of)
+
+
 def kv_names(cfg: SmolVLAConfig):
     names = []
     for i in range(cfg.num_layers):
@@ -69,7 +75,18 @@ def export_smolvla(checkpoint: str, out_dir: str, vlm_dir: str) -> None:
     cfg.chunk_size = int(policy["chunk_size"])
     cfg.max_state_dim = int(policy["max_state_dim"])
     cfg.max_action_dim = int(policy["max_action_dim"])
-    cfg.num_layers = int(policy["num_vlm_layers"])
+    # LeRobot's SmolVLMWithExpertModel: num_vlm_layers <= 0 keeps the whole text model, the expert matches the VLM's
+    # depth unless num_expert_layers says otherwise, and its width and MLP follow expert_width_multiplier.
+    text_layers = json.load(open(os.path.join(
+        vlm_dir, "config.json")))["text_config"]["num_hidden_layers"]
+    num_vlm_layers = int(policy["num_vlm_layers"])
+    cfg.num_layers = num_vlm_layers if num_vlm_layers > 0 else text_layers
+    num_expert_layers = int(policy.get("num_expert_layers", -1))
+    if num_expert_layers > 0 and num_expert_layers != cfg.num_layers:
+        raise ValueError("only an expert as deep as the VLM is supported")
+    cfg.expert_hidden = int(cfg.text_hidden *
+                            float(policy["expert_width_multiplier"]))
+    cfg.expert_intermediate = expert_intermediate_size(cfg.expert_hidden)
     cfg.self_attn_every_n_layers = int(policy["self_attn_every_n_layers"])
     if policy.get("attention_mode") != "cross_attn" or policy.get(
             "add_image_special_tokens"):

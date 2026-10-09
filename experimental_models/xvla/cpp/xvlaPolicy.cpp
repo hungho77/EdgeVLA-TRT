@@ -69,8 +69,9 @@ XvlaPolicy::XvlaPolicy(std::string const& engineDir, cudaStream_t stream)
     ELLM_CHECK(config.at("state_normalization").get<std::string>() == "IDENTITY",
         "XvlaPolicy: only identity state normalization is supported");
     mCameras = config.at("cameras").get<std::vector<std::string>>();
-    ELLM_CHECK(static_cast<int32_t>(mCameras.size()) == config.at("num_views").get<int32_t>(),
-        "XvlaPolicy: every view needs a camera name");
+    // LeRobot pads to num_image_views with masked views, which includes the checkpoint's empty cameras.
+    mNumViews = config.at("num_views").get<int32_t>();
+    ELLM_CHECK(static_cast<int32_t>(mCameras.size()) <= mNumViews, "XvlaPolicy: more cameras than views");
     auto const size = config.at("image_size").get<std::vector<int32_t>>();
     ELLM_CHECK(size.size() == 2 && size[0] == size[1], "XvlaPolicy: only square model images are supported");
     mImageSize = size[0];
@@ -81,7 +82,6 @@ XvlaPolicy::XvlaPolicy(std::string const& engineDir, cudaStream_t stream)
     mChunk = config.at("chunk_size").get<int32_t>();
     mActionDim = config.at("action_dim").get<int32_t>();
     mProprioDim = config.at("proprio_dim").get<int32_t>();
-    mStateDim = config.at("state_dim").get<int32_t>();
     mNumSteps = config.at("num_steps").get<int32_t>();
     mGripper = config.at("gripper_idx").get<std::vector<int32_t>>();
     mNumDomains = config.at("num_domains").get<int32_t>();
@@ -103,7 +103,7 @@ XvlaPolicy::XvlaPolicy(std::string const& engineDir, cudaStream_t stream)
     mContextMemory = vla::allocateSharedContextMemory({&mVision, &mEncoder, &mStep}, "xvla::contextMemory");
     mHidden = static_cast<int32_t>(mEncoder.engine().getTensorShape("vlm_features").d[2]);
 
-    auto const views = static_cast<int64_t>(mCameras.size());
+    auto const views = static_cast<int64_t>(mNumViews);
     int64_t const pixels = views * 3 * mImageSize * mImageSize;
     mPixelsHost = makeTensor({pixels}, DataType::kHALF, "xvla::pixelsHost", rt::DeviceType::kCPU);
     mPixels = makeTensor({pixels}, DataType::kHALF, "xvla::pixels");
@@ -262,7 +262,6 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
     std::vector<float> const& noise, XvlaRtc const* rtc)
 {
     XvlaChunk chunk;
-    ELLM_CHECK(static_cast<int32_t>(state.size()) == mStateDim, "XvlaPolicy: state has the wrong width");
     size_t const viewSize = static_cast<size_t>(3) * mImageSize * mImageSize;
     auto* pixels = static_cast<__half*>(mPixelsHost.rawPointer());
     // Present cameras first, in config order; LeRobot then pads the missing ones as masked views.
@@ -307,7 +306,7 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
     }
     for (int32_t d = 0; d < mProprioDim; ++d)
     {
-        stage[chunkElems + d] = __float2half(d < mStateDim ? state[d] : 0.0F);
+        stage[chunkElems + d] = __float2half(d < static_cast<int32_t>(state.size()) ? state[d] : 0.0F);
     }
 
     *static_cast<int64_t*>(mRtcHost.rawPointer()) = mDomainId;
@@ -342,7 +341,7 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
     CUDA_CHECK(
         cudaMemcpyAsync(mRtcWeight.rawPointer(), weight, mChunk * sizeof(__half), cudaMemcpyHostToDevice, mStream));
     auto* features = static_cast<char*>(mFeatures.rawPointer());
-    int64_t const missing = static_cast<int64_t>(mCameras.size()) - numPresent;
+    int64_t const missing = static_cast<int64_t>(mNumViews) - numPresent;
     if (missing > 0)
     {
         CUDA_CHECK(cudaMemsetAsync(features + numPresent * featureBytes, 0, missing * featureBytes, mStream));
