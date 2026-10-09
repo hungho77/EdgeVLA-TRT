@@ -161,3 +161,34 @@ python experimental_models/gr00t/scripts/export_gr00t_processing.py --gr00t-src 
     --checkpoint GR00T-N1.5-SO101-Multitask --n15-data-config so100_dualcam --out engines/action/processing.json
 # action head as for N1.6 (--max-backbone-tokens 1024); engines with trtexec as above, 224x224 images
 ```
+
+## Faster Eagle backbone
+
+The Eagle prefix (Qwen3 cut to `select_layer`) can run on Edge-LLM's LLM runtime with its attention plugin
+instead of the plain-op `prefix.engine`. `Gr00tEagleBackbone` uses an `llm/` engine when the backbone directory
+holds one, feeding the visual engine's features as precomputed image embeddings at the image-context tokens.
+N1.6's policy rounds Qwen3's RoPE `inv_freq` to bf16 at load; the exported config carries `rope_inv_freq_bf16`
+and the runtime rounds the same way.
+
+```bash
+python experimental_models/gr00t/scripts/extract_gr00t_eagle_llm.py --gr00t <checkpoint> \
+    --eagle-dir <Eagle model dir> --tokenizer-dir engines/backbone --out eagle_llm
+tensorrt-edgellm-export eagle_llm eagle_llm_onnx
+python experimental_models/gr00t/scripts/extract_gr00t_eagle_llm.py --patch-onnx-config eagle_llm_onnx/llm \
+    --out eagle_llm
+llm_build --onnxDir eagle_llm_onnx/llm --engineDir engines/backbone/llm --maxBatchSize 1 \
+    --maxInputLen 512 --maxKVCacheCapacity 640      # N1.5 (564 tokens for two views): 1024 / 1152
+```
+
+The host preprocessing runs the views concurrently and reuses the token ids while the task stays the same (pixels
+bit-identical). AGX Orin, LIBERO-Spatial checkpoints, one policy-server call on an idle board:
+
+| | Plain-op prefix | LLM-runtime prefix | LIBERO-Spatial |
+|---|---|---|---|
+| N1.6 | 149 ms | 120 ms (prefix 30 -> 25 ms) | 97% -> 100% |
+| N1.5, 8 denoising steps | 244 ms | 196 ms (prefix 57 -> 46 ms) | 88% |
+| N1.5, 4 denoising steps (`--denoising-steps 4`) | | 112 ms | 89% |
+
+Against the plain-op prefix on the same inputs, the backbone features keep per-token cosine >= 0.9994 and the robot
+actions move by at most 0.0009. The rest of the gap to N1.7 is the model: SigLIP2-so400m on 324 patches per view
+spends 30 of its 42 ms in GEMMs that TensorRT already runs at about 17 TFLOP/s, with attention fused (5 ms).

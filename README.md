@@ -29,8 +29,8 @@ own evaluation conventions (LIBERO-Spatial, 10 tasks x 10 episodes, fixed initia
 | Model | Public checkpoint | LIBERO-Spatial on Orin (reported) | Policy call | RTC | Async loop | Guide |
 |---|---|---|---|:---:|:---:|---|
 | GR00T N1.7 | [`nvidia/GR00T-N1.7-LIBERO`](https://huggingface.co/nvidia/GR00T-N1.7-LIBERO) | 97% (97.7%) | 101 ms | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n17) |
-| GR00T N1.6 | [`0xAnkitSingh/GR00T-N1.6-LIBERO`](https://huggingface.co/0xAnkitSingh/GR00T-N1.6-LIBERO) | 97% (96.0%) | 149 ms | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n16) |
-| GR00T N1.5 | [`youliangtan/gr00t-n1.5-libero-spatial-posttrain`](https://huggingface.co/youliangtan/gr00t-n1.5-libero-spatial-posttrain) | 88% (92%) | 244 ms | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n15) |
+| GR00T N1.6 | [`0xAnkitSingh/GR00T-N1.6-LIBERO`](https://huggingface.co/0xAnkitSingh/GR00T-N1.6-LIBERO) | 100% (96.0%) | 120 ms | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n16) |
+| GR00T N1.5 | [`youliangtan/gr00t-n1.5-libero-spatial-posttrain`](https://huggingface.co/youliangtan/gr00t-n1.5-libero-spatial-posttrain) | 88% (92%); 89% at 4 steps | 196 ms; 112 ms at 4 steps | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n15) |
 | pi0.5 | [openpi `pi05_libero`](https://github.com/Physical-Intelligence/openpi) | 100% (98.8%) | 231 ms | ✓ | ✓ | [pi0.5](experimental_models/pi05/README.md) |
 | SmolVLA | [`HuggingFaceVLA/smolvla_libero`](https://huggingface.co/HuggingFaceVLA/smolvla_libero) | 72% (90%) | 122 ms | ✓ | ✓ | [SmolVLA](experimental_models/smolvla/DESIGN.md) |
 | X-VLA | [`lerobot/xvla-libero`](https://huggingface.co/lerobot/xvla-libero) | 98% (98.2%) | 198 ms | ✓ | ✓ | [X-VLA](experimental_models/xvla/README.md) |
@@ -46,6 +46,9 @@ own evaluation conventions (LIBERO-Spatial, 10 tasks x 10 episodes, fixed initia
 - **RTC**: real-time chunking, where the next action chunk is inpainted from the unexecuted tail of the previous one,
   so chunk switches do not jump. **Async loop**: a 30 Hz control loop with the policy planning the next chunk in
   the background (`*_async_control`); InternVLA-N1 runs its planner and trajectory head at two rates in one process.
+- GR00T N1.5 / N1.6 run their Eagle prefix on the LLM runtime
+  ([GR00T guide](experimental_models/gr00t/README.md#faster-eagle-backbone)). N1.5's official LIBERO evaluation
+  denoises in 8 steps; its checkpoint default of 4 is a speed setting with the same success rate here.
 - Every model has a JSON-lines policy server (`*_policy_server`, `internvla_n1_dual_system_server`). The guides also
   cover SO101 fine-tunes (GR00T N1.5 / N1.6 / N1.7, pi0.5, SmolVLA, X-VLA) checked against the official policies.
 
