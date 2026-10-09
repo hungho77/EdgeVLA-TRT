@@ -69,3 +69,57 @@ KV reuse restores 38% of the episode's prompt tokens; `z_latents` are again bit-
 Reuse applies to VLAs with a **causal** VLM backbone (InternVLA-N1, GR00T, Alpamayo). Models whose image+text prefix
 attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 
+
+## LIBERO evaluation
+
+[`scripts/libero_eval.py`](scripts/libero_eval.py) measures a policy's LIBERO success rate in simulation. The model
+runs in its C++ policy server (one JSON request per line: `gr00t_policy_server`, `pi05_policy_server`,
+`smolvla_policy_server`, `xvla_policy_server`, `openvla_policy_server`), started as a subprocess, so the simulator
+side needs only a LIBERO Python environment (robosuite 1.4 with mujoco 2.3, `MUJOCO_GL=egl`) and no TensorRT.
+
+Protocol: LIBERO's fixed initial states (episode *i* of a task uses init state *i*), 10 no-op steps for the objects
+to settle, then the policy until success or the step limit; 256x256 renders. Each adapter follows its checkpoint's
+own LIBERO evaluation script, because these conventions move the success rate by tens of points:
+
+| Policy | Checkpoint | Following | Views | State | Rows per call | Gripper | Step limit |
+|---|---|---|---|---|---|---|---|
+| `gr00t_n17` | `nvidia/GR00T-N1.7-LIBERO` (`libero_sim`) | Isaac-GR00T `examples/LIBERO` | both flipped | xyz, axis-angle, gripper qpos | 8 of 16 | binarized, inverted | 220 |
+| `gr00t_n16` | `0xAnkitSingh/GR00T-N1.6-LIBERO` (`libero_panda`) | Isaac-GR00T | both flipped | as N1.7 | 8 of 16 | binarized, inverted | 220 |
+| `gr00t_n15` | `youliangtan/gr00t-n1.5-libero-spatial-posttrain` (`LiberoDataConfig`, 8 denoising steps) | GR00T N1.5 `examples/Libero` | both flipped | as N1.7 | 1 of 16 | binarized, inverted | 220 |
+| `pi05` | openpi `pi05_libero` (PyTorch conversion) | openpi `examples/libero` | both flipped, PIL bilinear to 224 | eef pos, axis-angle, gripper qpos | 5 of 10 | as returned | 220 |
+| `smolvla` | `HuggingFaceVLA/smolvla_libero` | LeRobot `LiberoProcessorStep` | both flipped | as pi0.5 | 1 of 50 (its `n_action_steps`) | as returned | 280 |
+| `xvla` | `lerobot/xvla-libero` | LeRobot `make_xvla_libero_pre_post_processors` | agent view flipped only | eef pos, rot6d of the controller orientation, 0, padded to 20 | 30 of 30 | `> 0.5` | 280, absolute control |
+| `openvla` | `openvla/openvla-7b-finetuned-libero-spatial` | OpenVLA `run_libero_eval.py` | agent view flipped, JPEG round trip, Lanczos to 224, 90% centre crop | none | 1 | binarized, inverted | 220 |
+
+OpenVLA's TensorFlow image steps are reproduced with OpenCV, Pillow and NumPy (`tf.image.crop_and_resize` exactly;
+JPEG and Lanczos to within a gray level).
+
+LIBERO-Spatial, 10 tasks x 10 episodes, AGX Orin 64 GB, JetPack 6.2, FP16 engines:
+
+| Policy | Success on Orin | Reported for the checkpoint |
+|---|---|---|
+| GR00T N1.7 | 97.0% | 97.65% (Isaac-GR00T, 200 episodes) |
+| GR00T N1.6 | 97.0% | 96.0% (model card, 200 episodes) |
+| GR00T N1.5 | 88.0% | 92% (Isaac-GR00T N1.5, 50 episodes) |
+| pi0.5 | 100.0% | 98.8% (openpi) |
+| SmolVLA | 72.0% | 90% (SmolVLA paper) |
+| X-VLA | 98.0% | 98.2% (X-VLA paper) |
+| OpenVLA | 85.0% | 84.7% (OpenVLA paper) |
+
+SmolVLA's engines match LeRobot on a LIBERO observation (robot actions max |Δ| 0.013 on a ±1 range, identical
+tokens), and rendering at LeRobot's default 360x360 instead did not change the hardest tasks (45% vs 50% on tasks
+3 and 9), so the gap is the public checkpoint's under this protocol rather than the runtime's.
+[`scripts/lerobot_policy_server.py`](scripts/lerobot_policy_server.py) serves LeRobot's own PyTorch policy under
+the same protocol for a direct comparison on a machine whose PyTorch build supports the GPU.
+
+```bash
+# engines: each model's guide, from the checkpoint above; N1.6 / N1.5 Eagle export with --camera-height 256
+# --camera-width 256 (LIBERO frames), N1.5's action head with --denoising-steps 8
+MUJOCO_GL=egl python experimental_models/vla/scripts/libero_eval.py --policy gr00t_n17 --suite libero_spatial \
+    --episodes 10 --max-steps 220 --server-env LD_LIBRARY_PATH=... --server-env EDGELLM_PLUGIN_PATH=... \
+    --server-cmd "gr00t_policy_server --llmEngineDir e/llm --multimodalEngineDir e --actionEngineDir e/action" \
+    --out gr00t_n17_libero_spatial.json
+```
+
+`--out` is rewritten after every episode and a rerun with the same file resumes; `--tasks` and `--rows` narrow a
+run or override the rows executed per call.

@@ -21,29 +21,33 @@ support for platforms upstream no longer targets.
 
 ## Support matrix
 
-VLA and VLN models on AGX Orin 64 GB, JetPack 6.2 (CUDA 12.6, TensorRT 10.3). Each port is verified export → engine
-build → C++ inference against the official implementation (FP32, same inputs and noise); the numbers are in each
-guide. Engines are FP16 unless noted.
+VLA and VLN models on AGX Orin 64 GB, JetPack 6.2 (CUDA 12.6, TensorRT 10.3), FP16 engines. Each row is verified on
+a public checkpoint the model's authors or community publish: export → engine build → C++ policy server, driven in
+LIBERO simulation by [`libero_eval.py`](experimental_models/vla/README.md#libero-evaluation) with each checkpoint's
+own evaluation conventions (LIBERO-Spatial, 10 tasks x 10 episodes, fixed initial states).
 
-| Model | Checkpoint verified | Latency on Orin | RTC | Async loop | Server | Guide |
-|---|---|---|:---:|:---:|:---:|---|
-| GR00T N1.7 | `GR00T-N1.7-SO101-Multitask`, `ducido/GR00T-N1.7-SO101-banana-all49` | 96.4 ms / chunk (73.1 ms W8A8 DiT) | ✓ | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n17) |
-| GR00T N1.6 | `GR00T-N1.6-SO101-Multitask` | 171.7 ms / chunk | ✓ | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n16) |
-| GR00T N1.5 | `GR00T-N1.5-SO101-Multitask` | 110.4 ms / chunk | ✓ | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n15) |
-| pi0.5 | openpi `pi05_so101` | 204.5 ms / chunk (177.9 ms INT8 prefix) | ✓ | ✓ | | [pi0.5](experimental_models/pi05/README.md#so101-pi05_so101) |
-| SmolVLA | LeRobot 0.6.1 | 83-93 ms / chunk | ✓ | ✓ | | [SmolVLA](experimental_models/smolvla/DESIGN.md) |
-| X-VLA | `lerobot/xvla-base` (LeRobot 0.6.1) | 155.8 ms / 30-step chunk | ✓ | ✓ | | [X-VLA](experimental_models/xvla/README.md) |
-| OpenVLA | `openvla/openvla-7b` | 706 ms / action | | | | [OpenVLA](experimental_models/openvla/README.md) |
-| InternVLA-N1 (VLN) | `InternVLA-N1-DualVLN` | first plan 181 ms, System-1 tick 188 ms | | dual-rate | ✓ | [InternVLA-N1](experimental_models/internvla_n1/README.md) |
+| Model | Public checkpoint | LIBERO-Spatial on Orin (reported) | Policy call | RTC | Async loop | Guide |
+|---|---|---|---|:---:|:---:|---|
+| GR00T N1.7 | [`nvidia/GR00T-N1.7-LIBERO`](https://huggingface.co/nvidia/GR00T-N1.7-LIBERO) | 97% (97.7%) | 101 ms | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n17) |
+| GR00T N1.6 | [`0xAnkitSingh/GR00T-N1.6-LIBERO`](https://huggingface.co/0xAnkitSingh/GR00T-N1.6-LIBERO) | 97% (96.0%) | 149 ms | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n16) |
+| GR00T N1.5 | [`youliangtan/gr00t-n1.5-libero-spatial-posttrain`](https://huggingface.co/youliangtan/gr00t-n1.5-libero-spatial-posttrain) | 88% (92%) | 244 ms | ✓ | ✓ | [GR00T](experimental_models/gr00t/README.md#gr00t-n15) |
+| pi0.5 | [openpi `pi05_libero`](https://github.com/Physical-Intelligence/openpi) | 100% (98.8%) | 231 ms | ✓ | ✓ | [pi0.5](experimental_models/pi05/README.md) |
+| SmolVLA | [`HuggingFaceVLA/smolvla_libero`](https://huggingface.co/HuggingFaceVLA/smolvla_libero) | 72% (90%) | 122 ms | ✓ | ✓ | [SmolVLA](experimental_models/smolvla/DESIGN.md) |
+| X-VLA | [`lerobot/xvla-libero`](https://huggingface.co/lerobot/xvla-libero) | 98% (98.2%) | 198 ms | ✓ | ✓ | [X-VLA](experimental_models/xvla/README.md) |
+| OpenVLA | [`openvla/openvla-7b-finetuned-libero-spatial`](https://huggingface.co/openvla/openvla-7b-finetuned-libero-spatial) | 85% (84.7%) | 838 ms | | | [OpenVLA](experimental_models/openvla/README.md) |
+| InternVLA-N1 (VLN) | [`InternRobotics/InternVLA-N1-DualVLN`](https://huggingface.co/InternRobotics/InternVLA-N1-DualVLN) | VLN: R2R episode in VLN-PE | first plan 181 ms, System-1 tick 188 ms | | dual-rate | [InternVLA-N1](experimental_models/internvla_n1/README.md) |
 
+- **Reported**: the success rate the checkpoint's authors or paper give for LIBERO-Spatial, usually over more
+  episodes; the [LIBERO guide](experimental_models/vla/README.md#libero-evaluation) lists the sources and the
+  conventions each run follows. SmolVLA's engines match LeRobot's policy on LIBERO observations, so its gap is the
+  checkpoint's under this protocol.
+- **Policy call**: one request to the model's policy server on a LIBERO observation (two 256x256 views; OpenVLA
+  one), image encoding to actions, median of 20 on an otherwise idle board.
 - **RTC**: real-time chunking, where the next action chunk is inpainted from the unexecuted tail of the previous one,
-  so chunk switches do not jump.
-- **Async loop**: a 30 Hz control loop with the policy planning the next chunk in the background (`*_async_control`);
-  InternVLA-N1 runs its planner and trajectory head at two rates in one process.
-- **Server**: a long-lived process answering one JSON request per line (`gr00t_policy_server`,
-  `internvla_n1_dual_system_server`).
-- Latency is one policy call, preprocessing to actions, measured with other jobs sometimes sharing the board; see
-  each guide for the breakdown and conditions.
+  so chunk switches do not jump. **Async loop**: a 30 Hz control loop with the policy planning the next chunk in
+  the background (`*_async_control`); InternVLA-N1 runs its planner and trajectory head at two rates in one process.
+- Every model has a JSON-lines policy server (`*_policy_server`, `internvla_n1_dual_system_server`). The guides also
+  cover SO101 fine-tunes (GR00T N1.5 / N1.6 / N1.7, pi0.5, SmolVLA, X-VLA) checked against the official policies.
 
 Upstream's VLA support (pi0.5 `libero` / `droid` / `aloha`, Alpamayo, Cosmos3-Edge policy) and its LLMs and VLMs
 are unchanged: [VLA examples](docs/source/user_guide/examples/vla/index.md),
