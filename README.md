@@ -35,6 +35,7 @@ own evaluation conventions (LIBERO-Spatial, 10 tasks x 10 episodes, fixed initia
 | SmolVLA | [`HuggingFaceVLA/smolvla_libero`](https://huggingface.co/HuggingFaceVLA/smolvla_libero) | 72% (90%) | 122 ms | ✓ | ✓ | [SmolVLA](experimental_models/smolvla/DESIGN.md) |
 | X-VLA | [`lerobot/xvla-libero`](https://huggingface.co/lerobot/xvla-libero) | 98% (98.2%) | 198 ms | ✓ | ✓ | [X-VLA](experimental_models/xvla/README.md) |
 | TurboVLA | [`H-EmbodVis/TurboVLA`](https://huggingface.co/H-EmbodVis/TurboVLA) (`checkpoints/libero`) | 95% (97.0%) | 32 ms | ✓ (blend) | ✓ | [TurboVLA](experimental_models/turbovla/README.md) |
+| RLDX-1 | [`RLWRLD/RLDX-1-FT-LIBERO`](https://huggingface.co/RLWRLD/RLDX-1-FT-LIBERO) | 97% (98.6% LIBERO-Short) | 297 ms | ✓ | ✓ (20 Hz) | [RLDX-1](experimental_models/rldx/README.md) |
 | OpenVLA | [`openvla/openvla-7b-finetuned-libero-spatial`](https://huggingface.co/openvla/openvla-7b-finetuned-libero-spatial) | 85% (84.7%) | 838 ms | | | [OpenVLA](experimental_models/openvla/README.md) |
 | InternVLA-N1 (VLN) | [`InternRobotics/InternVLA-N1-DualVLN`](https://huggingface.co/InternRobotics/InternVLA-N1-DualVLN) | VLN: R2R episode in VLN-PE | first plan 181 ms, System-1 tick 188 ms | | dual-rate | [InternVLA-N1](experimental_models/internvla_n1/README.md) |
 
@@ -47,6 +48,8 @@ own evaluation conventions (LIBERO-Spatial, 10 tasks x 10 episodes, fixed initia
 - **RTC**: real-time chunking, where the next action chunk is inpainted from the unexecuted tail of the previous one,
   so chunk switches do not jump. **Async loop**: a 30 Hz control loop with the policy planning the next chunk in
   the background (`*_async_control`); InternVLA-N1 runs its planner and trajectory head at two rates in one process.
+- RLDX-1 reads the frames at t-6, t-4, t-2 and t: its server takes them inline (`camera@offset`) and the Python
+  controller keeps them per tick. Its paper reports LIBERO-Short (Spatial, Object, Goal averaged), not Spatial.
 - TurboVLA regresses its chunk in one pass (no denoising to inpaint), so its server blends the new chunk with the
   previous one under the same overlap / frozen fields instead.
 - GR00T N1.5 / N1.6 run their Eagle prefix on the LLM runtime

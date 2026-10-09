@@ -85,13 +85,13 @@ TurbovlaPolicy::TurbovlaPolicy(std::string const& engineDir, cudaStream_t stream
     mActionMin = config.at("action_min").get<std::vector<float>>();
     mActionMax = config.at("action_max").get<std::vector<float>>();
     auto const mean = config.at("image_mean").get<std::vector<float>>();
-    auto const std = config.at("image_std").get<std::vector<float>>();
+    auto const stddev = config.at("image_std").get<std::vector<float>>();
     float const rescale = 1.0F / 255.0F;
     for (int32_t c = 0; c < 3; ++c)
     {
         for (int32_t v = 0; v < 256; ++v)
         {
-            mPixelLut[c][v] = (static_cast<float>(v) * rescale - mean[c]) / std[c];
+            mPixelLut[c][v] = (static_cast<float>(v) * rescale - mean[c]) / stddev[c];
         }
     }
 
@@ -324,7 +324,9 @@ TurbovlaChunk TurbovlaPolicy::act(std::vector<TurbovlaView> const& views, std::v
     if (blend != nullptr && !mPrevious.empty() && blend->overlapSteps > 0)
     {
         int32_t const startRow = blend->startRow >= 0 ? blend->startRow : mChunk - blend->overlapSteps;
-        int32_t const overlap = std::max(0, std::min(blend->overlapSteps, mChunk - startRow));
+        ELLM_CHECK(blend->overlapSteps <= mChunk && startRow >= 0 && startRow <= mChunk && blend->frozenSteps >= 0,
+            "TurbovlaPolicy: blend overlap and start row must lie inside the chunk");
+        int32_t const overlap = std::min(blend->overlapSteps, mChunk - startRow);
         std::vector<float> const weights = blendWeights(overlap, blend->frozenSteps, blend->rampRate);
         for (int32_t t = 0; t < overlap; ++t)
         {

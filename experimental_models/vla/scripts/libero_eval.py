@@ -352,6 +352,66 @@ class TurbovlaAdapter:
         return np.asarray(reply["actions"], dtype=np.float64)[:self.rows, :7]
 
 
+class RldxAdapter:
+    """rldx_policy_server, as RLDX-1's LIBERO rollout: both views flipped 180 degrees as front_view / left_wrist_view
+    with the frames of the last 7 env steps kept per episode and t-6, t-4, t-2, t sent (frame_history; the first
+    observation stands in for steps before the episode, as the official buffer repeats it at reset), state [eef
+    pos, axis-angle, gripper qpos], 8 of the 16 rows executed per call, gripper_close sent to LIBERO as
+    sign(2 g - 1)."""
+
+    control_mode = "relative"
+
+    def __init__(self, server, rows):
+        self.server = server
+        self.rows = rows
+        self.tmp = tempfile.mkdtemp(prefix="libero_eval_")
+        self.history = [int(o) for o in server.info.get("frame_history", [0])]
+        self.frames = []
+        self.first = True
+
+    def reset(self):
+        self.first = True
+        self.frames = []
+
+    def observe(self, obs):
+        self.frames.append({
+            "front_view":
+            np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]),
+            "left_wrist_view":
+            np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+        })
+        del self.frames[:-(1 - min(self.history))]
+
+    def act(self, obs, instruction):
+        if not self.frames:
+            self.observe(obs)
+        cameras = {}
+        for offset in self.history:
+            # Before the episode has that many steps the first observation stands in, as the official buffer
+            # repeats it at reset.
+            for name, frame in self.frames[max(offset - 1,
+                                               -len(self.frames))].items():
+                key = name if offset == 0 else f"{name}@{offset}"
+                path = os.path.join(self.tmp, f"{key}.png")
+                cv2.imwrite(path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                cameras[key] = path
+        state = np.concatenate([
+            obs["robot0_eef_pos"],
+            quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]
+        ])
+        reply = self.server.request({
+            "cameras": cameras,
+            "state": [float(v) for v in state],
+            "task": instruction,
+            "reset": self.first
+        })
+        self.first = False
+        actions = np.asarray(reply["actions"],
+                             dtype=np.float64)[:self.rows, :7].copy()
+        actions[:, 6] = np.sign(2.0 * actions[:, 6] - 1.0)
+        return actions
+
+
 def tf_crop_and_resize(image, box, size):
     """tf.image.crop_and_resize (bilinear) of a float [H, W, C] image to a normalized [y1, x1, y2, x2] box."""
     h, w = image.shape[:2]
@@ -435,6 +495,8 @@ POLICIES = {
     lambda server, rows: SmolvlaAdapter(server, rows=rows or 1),
     "turbovla":
     lambda server, rows: TurbovlaAdapter(server, rows=rows or 12),
+    "rldx":
+    lambda server, rows: RldxAdapter(server, rows=rows or 8),
     "openvla":
     lambda server, rows: OpenvlaAdapter(server, rows=1),
 }
@@ -565,7 +627,10 @@ def main():
                 robot.controller.use_delta = adapter.control_mode == "relative"
             adapter.reset()
             queue, calls, success, step = [], [], False, 0
+            observe = getattr(adapter, "observe", None)
             for step in range(args.max_steps):
+                if observe is not None:
+                    observe(obs)
                 if not queue:
                     obs["ee_ori_mat"] = env.robots[0].controller.ee_ori_mat
                     t0 = time.perf_counter()
