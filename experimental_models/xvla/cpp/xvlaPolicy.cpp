@@ -23,8 +23,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
+#include <future>
 
 namespace trt_edgellm
 {
@@ -151,14 +153,33 @@ XvlaPolicy::~XvlaPolicy() noexcept
     }
 }
 
-std::vector<float> XvlaPolicy::preprocessView(unsigned char const* rgb, int32_t height, int32_t width) const
+namespace
 {
-    int32_t const size = mImageSize;
-    auto normalized = [&](int32_t y, int32_t x, int32_t c) {
-        float const v = static_cast<float>(rgb[(static_cast<size_t>(y) * width + x) * 3 + c]) / 255.0F;
-        return (v - kImagenetMean[c]) / kImagenetStd[c];
-    };
-    std::vector<float> out(static_cast<size_t>(3) * size * size, 0.0F);
+
+//! (u8 / 255 - mean) / std per channel and byte value: LeRobot's ImageNet normalization, looked up.
+std::array<std::array<float, 256>, 3> const& imagenetTable()
+{
+    static auto const table = [] {
+        std::array<std::array<float, 256>, 3> t{};
+        for (int32_t c = 0; c < 3; ++c)
+        {
+            for (int32_t i = 0; i < 256; ++i)
+            {
+                t[c][i] = (static_cast<float>(i) / 255.0F - kImagenetMean[c]) / kImagenetStd[c];
+            }
+        }
+        return t;
+    }();
+    return table;
+}
+
+//! ImageNet normalization then LeRobot's resize_with_pad (bilinear in normalized space, zeros on top and left),
+//! as planar [3, size, size]; \p store converts each value.
+template <typename T, typename Store>
+void normalizeResize(unsigned char const* rgb, int32_t height, int32_t width, int32_t size, T* out, Store store)
+{
+    auto const& unit = imagenetTable();
+    std::fill_n(out, static_cast<size_t>(3) * size * size, store(0.0F));
     if (height == size && width == size)
     {
         for (int32_t c = 0; c < 3; ++c)
@@ -167,11 +188,12 @@ std::vector<float> XvlaPolicy::preprocessView(unsigned char const* rgb, int32_t 
             {
                 for (int32_t x = 0; x < size; ++x)
                 {
-                    out[(static_cast<size_t>(c) * size + y) * size + x] = normalized(y, x, c);
+                    out[(static_cast<size_t>(c) * size + y) * size + x]
+                        = store(unit[c][rgb[(static_cast<size_t>(y) * width + x) * 3 + c]]);
                 }
             }
         }
-        return out;
+        return;
     }
     double const ratio = std::max(static_cast<double>(width) / size, static_cast<double>(height) / size);
     auto const resizedH = static_cast<int32_t>(height / ratio);
@@ -180,26 +202,45 @@ std::vector<float> XvlaPolicy::preprocessView(unsigned char const* rgb, int32_t 
     int32_t const padW = std::max(0, size - resizedW);
     float const scaleH = static_cast<float>(height) / static_cast<float>(resizedH);
     float const scaleW = static_cast<float>(width) / static_cast<float>(resizedW);
+    std::vector<int32_t> x0s(resizedW), x1s(resizedW);
+    std::vector<float> lxs(resizedW);
+    for (int32_t x = 0; x < resizedW; ++x)
+    {
+        float const sx = sourceIndex(scaleW, x);
+        x0s[x] = static_cast<int32_t>(sx);
+        x1s[x] = x0s[x] + (x0s[x] < width - 1 ? 1 : 0);
+        lxs[x] = sx - static_cast<float>(x0s[x]);
+    }
     for (int32_t y = 0; y < resizedH; ++y)
     {
         float const sy = sourceIndex(scaleH, y);
         auto const y0 = static_cast<int32_t>(sy);
         int32_t const y1 = y0 + (y0 < height - 1 ? 1 : 0);
         float const ly = sy - static_cast<float>(y0);
+        unsigned char const* row0 = rgb + static_cast<size_t>(y0) * width * 3;
+        unsigned char const* row1 = rgb + static_cast<size_t>(y1) * width * 3;
         for (int32_t x = 0; x < resizedW; ++x)
         {
-            float const sx = sourceIndex(scaleW, x);
-            auto const x0 = static_cast<int32_t>(sx);
-            int32_t const x1 = x0 + (x0 < width - 1 ? 1 : 0);
-            float const lx = sx - static_cast<float>(x0);
+            int32_t const x0 = x0s[x];
+            int32_t const x1 = x1s[x];
+            float const lx = lxs[x];
             for (int32_t c = 0; c < 3; ++c)
             {
-                float const top = (1.0F - lx) * normalized(y0, x0, c) + lx * normalized(y0, x1, c);
-                float const bottom = (1.0F - lx) * normalized(y1, x0, c) + lx * normalized(y1, x1, c);
-                out[(static_cast<size_t>(c) * size + (y + padH)) * size + (x + padW)] = (1.0F - ly) * top + ly * bottom;
+                float const top = (1.0F - lx) * unit[c][row0[x0 * 3 + c]] + lx * unit[c][row0[x1 * 3 + c]];
+                float const bottom = (1.0F - lx) * unit[c][row1[x0 * 3 + c]] + lx * unit[c][row1[x1 * 3 + c]];
+                out[(static_cast<size_t>(c) * size + (y + padH)) * size + (x + padW)]
+                    = store((1.0F - ly) * top + ly * bottom);
             }
         }
     }
+}
+
+} // namespace
+
+std::vector<float> XvlaPolicy::preprocessView(unsigned char const* rgb, int32_t height, int32_t width) const
+{
+    std::vector<float> out(static_cast<size_t>(3) * mImageSize * mImageSize);
+    normalizeResize(rgb, height, width, mImageSize, out.data(), [](float v) { return v; });
     return out;
 }
 
@@ -266,6 +307,7 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
     auto* pixels = static_cast<__half*>(mPixelsHost.rawPointer());
     // Present cameras first, in config order; LeRobot then pads the missing ones as masked views.
     std::vector<int32_t> present;
+    std::vector<std::pair<XvlaView const*, __half*>> jobs;
     for (size_t c = 0; c < mCameras.size(); ++c)
     {
         auto const it
@@ -274,8 +316,7 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
         {
             continue;
         }
-        std::vector<float> const planar = preprocessView(it->rgb, it->height, it->width);
-        std::transform(planar.begin(), planar.end(), pixels + present.size() * viewSize, __float2half);
+        jobs.push_back({&*it, pixels + present.size() * viewSize});
         present.push_back(static_cast<int32_t>(c));
     }
     ELLM_CHECK(
@@ -286,7 +327,29 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
     }
     auto const numPresent = static_cast<int64_t>(present.size());
 
-    chunk.tokenIds = tokenize(task);
+    // Views are independent: each is normalized and resized straight into its FP16 slice, concurrently.
+    auto prepareView = [&](std::pair<XvlaView const*, __half*> const& job) {
+        normalizeResize(job.first->rgb, job.first->height, job.first->width, mImageSize, job.second,
+            [](float v) { return __float2half(v); });
+    };
+    std::vector<std::future<void>> pending;
+    for (size_t j = 1; j < jobs.size(); ++j)
+    {
+        pending.push_back(std::async(std::launch::async, prepareView, jobs[j]));
+    }
+    prepareView(jobs.front());
+    for (auto& view : pending)
+    {
+        view.get();
+    }
+
+    // The tokens depend only on the task, which stays fixed within an episode.
+    if (task != mLastTask)
+    {
+        mLastTokens = tokenize(task);
+        mLastTask = task;
+    }
+    chunk.tokenIds = mLastTokens;
     std::copy(chunk.tokenIds.begin(), chunk.tokenIds.end(), mTokensHost.dataPointer<int64_t>());
 
     int64_t const chunkElems = static_cast<int64_t>(mChunk) * mActionDim;

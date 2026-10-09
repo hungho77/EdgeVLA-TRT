@@ -23,8 +23,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <stdexcept>
 
 using namespace nvinfer1;
@@ -154,7 +156,26 @@ SmolvlaPolicy::~SmolvlaPolicy() noexcept
     }
 }
 
-std::vector<float> SmolvlaPolicy::preprocessView(unsigned char const* rgb, int32_t height, int32_t width, int32_t size)
+namespace
+{
+
+//! u8 / 255 for every byte value, the [0, 1] pixel LeRobot's to_tensor produces.
+float const* unitScale()
+{
+    static std::array<float, 256> const table = [] {
+        std::array<float, 256> t{};
+        for (int32_t i = 0; i < 256; ++i)
+        {
+            t[i] = static_cast<float>(i) / 255.0F;
+        }
+        return t;
+    }();
+    return table.data();
+}
+
+//! LeRobot's resize_with_pad then x * 2 - 1, as planar [3, size, size]; \p store converts each value.
+template <typename T, typename Store>
+void resizeWithPad(unsigned char const* rgb, int32_t height, int32_t width, int32_t size, T* out, Store store)
 {
     float const ratio = std::max(static_cast<float>(width) / size, static_cast<float>(height) / size);
     auto const resizedH = static_cast<int32_t>(static_cast<float>(height) / ratio);
@@ -164,33 +185,49 @@ std::vector<float> SmolvlaPolicy::preprocessView(unsigned char const* rgb, int32
     float const scaleH = static_cast<float>(height) / static_cast<float>(resizedH);
     float const scaleW = static_cast<float>(width) / static_cast<float>(resizedW);
     bool const identity = height == size && width == size;
+    float const* unit = unitScale();
 
     // Padding is 0 in [0, 1], i.e. -1 after the [-1, 1] mapping.
-    std::vector<float> out(static_cast<size_t>(3) * size * size, -1.0F);
+    std::fill_n(out, static_cast<size_t>(3) * size * size, store(-1.0F));
+    std::vector<int32_t> x0s(resizedW), x1s(resizedW);
+    std::vector<float> lxs(resizedW);
+    for (int32_t x = 0; x < resizedW; ++x)
+    {
+        float const sx = identity ? static_cast<float>(x) : sourceIndex(scaleW, x);
+        x0s[x] = static_cast<int32_t>(sx);
+        x1s[x] = x0s[x] + (x0s[x] < width - 1 ? 1 : 0);
+        lxs[x] = sx - static_cast<float>(x0s[x]);
+    }
     for (int32_t y = 0; y < resizedH; ++y)
     {
         float const sy = identity ? static_cast<float>(y) : sourceIndex(scaleH, y);
         auto const y0 = static_cast<int32_t>(sy);
         int32_t const y1 = y0 + (y0 < height - 1 ? 1 : 0);
         float const ly = sy - static_cast<float>(y0);
+        unsigned char const* row0 = rgb + static_cast<size_t>(y0) * width * 3;
+        unsigned char const* row1 = rgb + static_cast<size_t>(y1) * width * 3;
         for (int32_t x = 0; x < resizedW; ++x)
         {
-            float const sx = identity ? static_cast<float>(x) : sourceIndex(scaleW, x);
-            auto const x0 = static_cast<int32_t>(sx);
-            int32_t const x1 = x0 + (x0 < width - 1 ? 1 : 0);
-            float const lx = sx - static_cast<float>(x0);
+            int32_t const x0 = x0s[x];
+            int32_t const x1 = x1s[x];
+            float const lx = lxs[x];
             for (int32_t c = 0; c < 3; ++c)
             {
-                auto const at = [&](int32_t yy, int32_t xx) {
-                    return static_cast<float>(rgb[(static_cast<size_t>(yy) * width + xx) * 3 + c]) / 255.0F;
-                };
-                float const top = (1.0F - lx) * at(y0, x0) + lx * at(y0, x1);
-                float const bottom = (1.0F - lx) * at(y1, x0) + lx * at(y1, x1);
+                float const top = (1.0F - lx) * unit[row0[x0 * 3 + c]] + lx * unit[row0[x1 * 3 + c]];
+                float const bottom = (1.0F - lx) * unit[row1[x0 * 3 + c]] + lx * unit[row1[x1 * 3 + c]];
                 float const v = (1.0F - ly) * top + ly * bottom;
-                out[(static_cast<size_t>(c) * size + (y + padH)) * size + (x + padW)] = v * 2.0F - 1.0F;
+                out[(static_cast<size_t>(c) * size + (y + padH)) * size + (x + padW)] = store(v * 2.0F - 1.0F);
             }
         }
     }
+}
+
+} // namespace
+
+std::vector<float> SmolvlaPolicy::preprocessView(unsigned char const* rgb, int32_t height, int32_t width, int32_t size)
+{
+    std::vector<float> out(static_cast<size_t>(3) * size * size);
+    resizeWithPad(rgb, height, width, size, out.data(), [](float v) { return v; });
     return out;
 }
 
@@ -277,7 +314,13 @@ SmolvlaChunk SmolvlaPolicy::act(
     auto const views = static_cast<int64_t>(ordered.size());
 
     SmolvlaChunk chunk;
-    chunk.tokenIds = tokenize(observation.task);
+    // The tokens depend only on the task, which stays fixed within an episode.
+    if (observation.task != mLastTask)
+    {
+        mLastTokens = tokenize(observation.task);
+        mLastTask = observation.task;
+    }
+    chunk.tokenIds = mLastTokens;
     std::vector<float> const state = normalizeState(observation.state);
     auto const tokens = static_cast<int64_t>(chunk.tokenIds.size());
     int64_t const prefixLen = views * mImageTokens + tokens + 1;
@@ -285,15 +328,20 @@ SmolvlaChunk SmolvlaPolicy::act(
 
     // Pinned staging is rewritten only after the previous call drained the stream.
     int64_t const viewElems = static_cast<int64_t>(3) * mImageSize * mImageSize;
-    for (int64_t v = 0; v < views; ++v)
+    // Views are independent: each is resized straight into its FP16 slice, concurrently.
+    auto stage = [&](int64_t v) {
+        resizeWithPad(ordered[v]->rgb, ordered[v]->height, ordered[v]->width, mImageSize,
+            mPixelsHost.dataPointer<half>() + v * viewElems, [](float x) { return __float2half(x); });
+    };
+    std::vector<std::future<void>> pending;
+    for (int64_t v = 1; v < views; ++v)
     {
-        std::vector<float> const pixels
-            = preprocessView(ordered[v]->rgb, ordered[v]->height, ordered[v]->width, mImageSize);
-        half* dst = mPixelsHost.dataPointer<half>() + v * viewElems;
-        for (int64_t i = 0; i < viewElems; ++i)
-        {
-            dst[i] = __float2half(pixels[i]);
-        }
+        pending.push_back(std::async(std::launch::async, stage, v));
+    }
+    stage(0);
+    for (auto& view : pending)
+    {
+        view.get();
     }
     std::copy(chunk.tokenIds.begin(), chunk.tokenIds.end(), mTokensHost.dataPointer<int64_t>());
     std::copy(state.begin(), state.end(), mStateHost.dataPointer<float>());
