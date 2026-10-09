@@ -271,6 +271,7 @@ int main(int argc, char** argv)
             {
                 reply["timing_ms"]["visual"] = eagleBackbone->visualMs();
                 reply["timing_ms"]["prefix"] = eagleBackbone->prefixMs();
+                reply["timing_ms"]["host"] = eagleBackbone->hostMs();
             }
 #endif
         }

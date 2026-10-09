@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <optional>
 #include <ostream>
 #include <sstream>
@@ -56,6 +57,17 @@ char const* guideTypeName(GuideType type)
 namespace
 {
 
+//! Round to the nearest bf16 (ties to even), as torch's float -> bfloat16 cast.
+float roundToBf16(float value)
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7FFFU + ((bits >> 16) & 1U);
+    bits &= 0xFFFF0000U;
+    std::memcpy(&value, &bits, sizeof(bits));
+    return value;
+}
+
 bool initializeNormalRopeCosSinCacheHost(
     rt::Tensor& cosSinCache, RopeConfig const& config, cudaStream_t stream) noexcept
 {
@@ -81,6 +93,15 @@ bool initializeNormalRopeCosSinCacheHost(
             {
                 hostBuf[cosOffset] = 1.0F;
                 hostBuf[cosOffset + static_cast<size_t>(halfDim)] = 0.0F;
+            }
+            else if (config.invFreqBf16)
+            {
+                // transformers: inv_freq = 1 / theta ** (arange(0, D, 2).float() / D), FP32, then rounded to bf16.
+                float const invFreq = roundToBf16(
+                    1.0F / std::pow(config.rotaryTheta, static_cast<float>(2 * d) / static_cast<float>(rotaryDim)));
+                float const angle = static_cast<float>(pos) * invFreq * config.rotaryScale;
+                hostBuf[cosOffset] = std::cos(angle);
+                hostBuf[cosOffset + static_cast<size_t>(halfDim)] = std::sin(angle);
             }
             else
             {
@@ -305,7 +326,7 @@ bool initializeYarnRopeCosSinCache(rt::Tensor& cosSinCache, RopeConfig const& co
 
 bool canUseOptimizedNormalRopeKernel(RopeConfig const& config, int64_t rotaryDim)
 {
-    if (config.type == RopeType::kProportional)
+    if (config.type == RopeType::kProportional || config.invFreqBf16)
     {
         return false;
     }
@@ -632,6 +653,10 @@ RopeConfig collectRopeConfig(nlohmann::json const& config)
         LOG_WARNING("max_position_embeddings is not specified in the model config, using default value: %d",
             ropeConfig.maxPositionEmbeddings);
     }
+
+    ropeConfig.invFreqBf16 = config.value("rope_inv_freq_bf16", false);
+    ELLM_CHECK(!ropeConfig.invFreqBf16 || ropeConfig.type == RopeType::kDefault,
+        "rope_inv_freq_bf16 is only supported for default RoPE");
 
     LOG_INFO("Collected rope config: %s", formatRopeConfig(ropeConfig).c_str());
     return ropeConfig;

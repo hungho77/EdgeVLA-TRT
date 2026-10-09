@@ -82,7 +82,8 @@ int main(int argc, char** argv)
     if (backboneDir.empty() || actionDir.empty() || inputFile.empty())
     {
         std::fprintf(stderr,
-            "usage: %s --backboneDir DIR --actionDir DIR --inputFile request.json [--noise x0.f32] [--output "
+            "usage: %s --backboneDir DIR --actionDir DIR --inputFile request.json [--noise x0.f32] [--features f.f32] "
+            "[--output "
             "out.json]\n"
             "          [--iters N] [--cudaGraph 1]\n",
             argv[0]);
@@ -130,16 +131,28 @@ int main(int argc, char** argv)
     cudaMemcpyAsync(noise.rawPointer(), noiseHost.data(), noiseSize * sizeof(float), cudaMemcpyHostToDevice, stream);
     cudaStreamSynchronize(stream);
 
+    rt::Tensor const* features = nullptr;
     auto step = [&]() {
-        rt::Tensor const& features = backbone.encode(views, task);
-        return policy.act(features, backbone.imageMask(), state, noise, stream);
+        features = &backbone.encode(views, task);
+        return policy.act(*features, backbone.imageMask(), state, noise, stream);
     };
     std::vector<float> const actions = step();
+    std::string const featuresFile = argOf(argc, argv, "--features");
+    if (!featuresFile.empty())
+    {
+        // Backbone features as FP32 [tokens, hidden], for comparing prefix paths and references.
+        std::vector<__half> half(static_cast<size_t>(features->getShape().volume()));
+        cudaMemcpy(half.data(), features->rawPointer(), half.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+        std::vector<float> values(half.size());
+        std::transform(half.begin(), half.end(), values.begin(), [](__half v) { return __half2float(v); });
+        std::ofstream(featuresFile, std::ios::binary)
+            .write(reinterpret_cast<char const*>(values.data()), static_cast<std::streamsize>(values.size() * 4));
+    }
 
     int32_t const iters = std::stoi(argOf(argc, argv, "--iters", "0"));
     if (iters > 0)
     {
-        std::vector<float> visual, prefix, total;
+        std::vector<float> visual, prefix, host, total;
         for (int32_t i = 0; i < iters; ++i)
         {
             auto const start = std::chrono::steady_clock::now();
@@ -147,9 +160,12 @@ int main(int argc, char** argv)
             total.push_back(std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count());
             visual.push_back(backbone.visualMs());
             prefix.push_back(backbone.prefixMs());
+            host.push_back(backbone.hostMs());
         }
-        std::printf("median ms over %d calls: visual %.1f, prefix %.1f, policy step (preprocessing to actions) %.1f\n",
-            iters, median(visual), median(prefix), median(total));
+        std::printf(
+            "median ms over %d calls: host %.1f, visual %.1f, prefix %.1f, policy step (preprocessing to actions) "
+            "%.1f\n",
+            iters, median(host), median(visual), median(prefix), median(total));
     }
 
     std::string const output = argOf(argc, argv, "--output");

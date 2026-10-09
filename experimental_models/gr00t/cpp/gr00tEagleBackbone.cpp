@@ -26,8 +26,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <fstream>
+#include <future>
+#include <unordered_map>
 
 namespace trt_edgellm
 {
@@ -192,6 +195,12 @@ std::vector<float> resizeBilinearAntialiasTorch(
 
 } // namespace
 
+namespace
+{
+//! The hidden-state capture slot of an engine exported with emit_hidden_states.
+constexpr int32_t kHiddenCaptureSlot = 1;
+} // namespace
+
 Gr00tEagleBackbone::Gr00tEagleBackbone(std::string const& engineDir, cudaStream_t stream)
     : mStream(stream)
 {
@@ -231,11 +240,21 @@ Gr00tEagleBackbone::Gr00tEagleBackbone(std::string const& engineDir, cudaStream_
 
     mRuntime = vla::createTrtRuntime();
     mVisual = vla::TrtEngine(*mRuntime, engineDir + "/visual.engine", stream);
-    mPrefix = vla::TrtEngine(*mRuntime, engineDir + "/prefix.engine", stream);
-    mContextMemory = vla::allocateSharedContextMemory({&mVisual, &mPrefix}, "gr00t::eagleContextMemory");
-    mMaxTokens = std::min<int32_t>(mMaxTokens,
-        static_cast<int32_t>(
-            mPrefix.engine().getProfileShape("token_ids", 0, nvinfer1::OptProfileSelector::kMAX).d[1]));
+    if (std::ifstream(engineDir + "/llm/config.json").good())
+    {
+        mPluginHandle = loadEdgellmPluginLib();
+        std::unordered_map<std::string, std::string> const noLora;
+        mLlm = std::make_unique<rt::LLMInferenceRuntime>(engineDir + "/llm", "", noLora, stream);
+        mContextMemory = vla::allocateSharedContextMemory({&mVisual}, "gr00t::eagleContextMemory");
+    }
+    else
+    {
+        mPrefix = vla::TrtEngine(*mRuntime, engineDir + "/prefix.engine", stream);
+        mContextMemory = vla::allocateSharedContextMemory({&mVisual, &mPrefix}, "gr00t::eagleContextMemory");
+        mMaxTokens = std::min<int32_t>(mMaxTokens,
+            static_cast<int32_t>(
+                mPrefix.engine().getProfileShape("token_ids", 0, nvinfer1::OptProfileSelector::kMAX).d[1]));
+    }
 
     int64_t const pixels = static_cast<int64_t>(mMaxViews) * 3 * mImageHeight * mImageWidth;
     mPixelsHost = makeTensor({pixels}, DataType::kHALF, "gr00t::pixelsHost", rt::DeviceType::kCPU);
@@ -362,21 +381,38 @@ std::vector<float> Gr00tEagleBackbone::preprocessView(Gr00tView const& view) con
 
 rt::Tensor const& Gr00tEagleBackbone::encode(std::vector<Gr00tView> const& views, std::string const& task)
 {
+    auto const hostStart = std::chrono::steady_clock::now();
     auto const numViews = static_cast<int32_t>(views.size());
     ELLM_CHECK(numViews >= 1 && numViews <= mMaxViews, "Gr00tEagleBackbone: unsupported number of views");
     size_t const viewSize = static_cast<size_t>(3) * mImageHeight * mImageWidth;
     auto* pixels = static_cast<__half*>(mPixelsHost.rawPointer());
-    for (int32_t v = 0; v < numViews; ++v)
-    {
+    // Views are independent and preprocessView is pure, so they run concurrently into disjoint slices.
+    auto stage = [&](int32_t v) {
         std::vector<float> const planar = preprocessView(views[v]);
         for (size_t i = 0; i < viewSize; ++i)
         {
             pixels[v * viewSize + i] = __float2half(planar[i]);
         }
+    };
+    std::vector<std::future<void>> pending;
+    for (int32_t v = 1; v < numViews; ++v)
+    {
+        pending.push_back(std::async(std::launch::async, stage, v));
+    }
+    stage(0);
+    for (auto& view : pending)
+    {
+        view.get();
     }
 
-    auto const ids = mTokenizer->encode(prompt(task, numViews), /*addBos=*/false, /*addEos=*/false);
-    mTokenIds.assign(ids.begin(), ids.end());
+    // The prompt depends only on the task and the view count, which stay fixed within an episode.
+    if (task != mLastTask || numViews != mLastViews)
+    {
+        auto const ids = mTokenizer->encode(prompt(task, numViews), /*addBos=*/false, /*addEos=*/false);
+        mTokenIds.assign(ids.begin(), ids.end());
+        mLastTask = task;
+        mLastViews = numViews;
+    }
     auto const tokens = static_cast<int64_t>(mTokenIds.size());
     ELLM_CHECK(tokens >= 2 && tokens <= mMaxTokens, "Gr00tEagleBackbone: prompt length is outside the engine's range");
     mImageMask.assign(mTokenIds.size(), 0);
@@ -389,6 +425,7 @@ rt::Tensor const& Gr00tEagleBackbone::encode(std::vector<Gr00tView> const& views
     ELLM_CHECK(imageTokens == static_cast<int64_t>(numViews) * mImageTokens,
         "Gr00tEagleBackbone: the tokenizer did not produce one image-context token per image feature");
     std::copy(mTokenIds.begin(), mTokenIds.end(), mTokensHost.dataPointer<int64_t>());
+    mHostMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - hostStart).count();
 
     CUDA_CHECK(cudaMemcpyAsync(mPixels.rawPointer(), mPixelsHost.rawPointer(), numViews * viewSize * sizeof(__half),
         cudaMemcpyHostToDevice, mStream));
@@ -402,6 +439,32 @@ rt::Tensor const& Gr00tEagleBackbone::encode(std::vector<Gr00tView> const& views
     ELLM_CHECK(mVisual.enqueue(mStream), "Gr00tEagleBackbone: visual enqueue failed");
     CUDA_CHECK(cudaEventRecord(mEvents[1], mStream));
 
+    if (mLlm)
+    {
+        ELLM_CHECK(mImageFeatures.reshape(rt::Coords({imageTokens, mHidden})),
+            "Gr00tEagleBackbone: image feature reshape failed");
+        rt::LLMGenerationRequest request;
+        request.requests.resize(1);
+        rt::Message message;
+        message.role = "user";
+        message.contents.push_back({"text", ""});
+        request.requests[0].messages.push_back(std::move(message));
+        request.preTokenizedInputIds = {std::vector<int32_t>(mTokenIds.begin(), mTokenIds.end())};
+        request.precomputedImageEmbeddings = &mImageFeatures;
+        request.applyChatTemplate = false;
+        request.maxGenerateLength = 1;
+        request.acceptHiddenLayer = kHiddenCaptureSlot;
+        request.temperature = 1.0F;
+        request.topP = 1.0F;
+        request.topK = 1;
+        rt::LLMGenerationResponse response;
+        ELLM_CHECK(mLlm->handleRequest(request, response, mStream, /*outputThinkerEmbeddings=*/true),
+            "Gr00tEagleBackbone: LLM prefix request failed");
+        rt::Tensor const* hidden = mLlm->getBaseModelHiddenStates(kHiddenCaptureSlot);
+        ELLM_CHECK(hidden != nullptr && !hidden->isEmpty(), "Gr00tEagleBackbone: the LLM returned no hidden states");
+        CUDA_CHECK(cudaEventRecord(mEvents[2], mStream));
+        return *hidden;
+    }
     ELLM_CHECK(mFeatures.reshape(rt::Coords({1, tokens, mHidden})), "Gr00tEagleBackbone: feature reshape failed");
     mPrefix.setShape("token_ids", {1, tokens});
     mPrefix.setShape("image_features", {1, imageTokens, mHidden});

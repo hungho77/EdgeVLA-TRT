@@ -386,10 +386,13 @@ struct YarnParams
  */
 struct RopeConfig
 {
-    RopeType type{RopeType::kDefault};        //!< Type of RoPE to use
-    float rotaryScale{1.0F};                  //!< Scaling factor for rotary embeddings
-    float rotaryTheta{100000.0F};             //!< Base frequency for rotary embeddings
-    float partialRotaryFactor{1.0F};          //!< Fraction of head angles rotated by proportional RoPE
+    RopeType type{RopeType::kDefault}; //!< Type of RoPE to use
+    float rotaryScale{1.0F};           //!< Scaling factor for rotary embeddings
+    float rotaryTheta{100000.0F};      //!< Base frequency for rotary embeddings
+    float partialRotaryFactor{1.0F};   //!< Fraction of head angles rotated by proportional RoPE
+    //! Round inv_freq to bf16 before the angles, as a checkpoint cast to bf16 rounds its inv_freq buffer
+    //! (config "rope_inv_freq_bf16"; GR00T N1.6's Eagle was trained that way). Default RoPE only.
+    bool invFreqBf16{false};
     int32_t maxPositionEmbeddings{32768};     //!< Maximum position embeddings supported
     std::vector<int32_t> mropeSection;        //!< MRoPE frequency partition, empty for non-MRoPE
     std::optional<LongRopeParams> longRope{}; //!< Long-Rope specific parameters

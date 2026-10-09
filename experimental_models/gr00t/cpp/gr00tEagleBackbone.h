@@ -18,6 +18,8 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "common/trtUtils.h"
+#include "runtime/llmInferenceRuntime.h"
 #include "tokenizer/tokenizer.h"
 #include "vlaEngine.h"
 
@@ -48,6 +50,11 @@ struct Gr00tView
 //! N1.5: centre crop and torch's antialiased bilinear resize to 224x224 on [0, 1] floats, truncated to 8 bits,
 //! and the task after the images. Both feed [-1, 1] pixels and Eagle's chat template.
 //!
+//! The prefix (Eagle's Qwen3) runs either as the plain-op prefix.engine or, when the directory holds an llm/ engine
+//! from experimental_models/gr00t/scripts/extract_gr00t_eagle_llm.py, on Edge-LLM's LLM runtime: the visual
+//! features enter as precomputed image embeddings at the image-context tokens and the post-norm hidden states of
+//! every position come back.
+//!
 //! NOT thread-safe: one instance, one stream; every buffer is allocated at construction.
 class Gr00tEagleBackbone
 {
@@ -74,6 +81,11 @@ public:
     //! Engine time of the last encode() (synchronizes on its events).
     float visualMs() const;
     float prefixMs() const;
+    //! Host time of the last encode() before its first enqueue: image preprocessing and tokenization.
+    float hostMs() const noexcept
+    {
+        return mHostMs;
+    }
 
     //! One view as SigLIP2 sees it: planar [3, imageHeight, imageWidth] in [-1, 1].
     std::vector<float> preprocessView(Gr00tView const& view) const;
@@ -87,6 +99,8 @@ private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;
     vla::TrtEngine mVisual;
     vla::TrtEngine mPrefix;
+    std::unique_ptr<void, DlDeleter> mPluginHandle; //!< the LLM engine's attention plugin
+    std::unique_ptr<rt::LLMInferenceRuntime> mLlm;  //!< set when the prefix runs on the LLM runtime
     rt::Tensor mContextMemory;
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;
 
@@ -115,6 +129,9 @@ private:
     std::vector<uint8_t> mImageMask;
     std::vector<int64_t> mTokenIds;
     cudaEvent_t mEvents[3]{};
+    float mHostMs{0.0F};
+    std::string mLastTask; //!< the prompt mTokenIds was tokenized from
+    int32_t mLastViews{0};
 };
 
 } // namespace gr00t
