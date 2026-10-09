@@ -139,6 +139,8 @@ private:
 
     std::vector<std::string> mCameras;
     int32_t mNumViews{0};
+    std::string mLastTask; //!< the task mLastTokens was tokenized from
+    std::vector<int64_t> mLastTokens;
     int32_t mImageSize{224};
     int32_t mImageTokens{50};
     int32_t mMaxTokens{50};

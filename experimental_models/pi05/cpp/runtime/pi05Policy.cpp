@@ -29,6 +29,7 @@
 #include <cuda_fp16.h>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <limits>
 #include <nlohmann/json.hpp>
@@ -549,17 +550,18 @@ std::vector<Pi05CameraView const*> Pi05Policy::resolveActiveViews(std::vector<Pi
     return ordered;
 }
 
-double Pi05Policy::stageOneView(unsigned char const* rgb, int32_t srcH, int32_t srcW, size_t viewIdx)
+double Pi05Policy::stageOneView(
+    unsigned char const* rgb, int32_t srcH, int32_t srcW, size_t viewIdx, std::vector<float>& planar)
 {
     using Clock = std::chrono::steady_clock;
     auto const viewElems = static_cast<size_t>(3) * mContract.imageHeight * mContract.imageWidth;
-    mPlanarView.resize(viewElems);
+    planar.resize(viewElems);
     auto const start = Clock::now();
-    resizeWithPad(rgb, srcH, srcW, mContract.imageHeight, mContract.imageWidth, mPlanarView.data());
+    resizeWithPad(rgb, srcH, srcW, mContract.imageHeight, mContract.imageWidth, planar.data());
     auto* rows = mPixelValuesHost.dataPointer<__half>();
     for (size_t i = 0; i < viewElems; ++i)
     {
-        rows[viewIdx * viewElems + i] = __float2half(mPlanarView[i]);
+        rows[viewIdx * viewElems + i] = __float2half(planar[i]);
     }
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
@@ -568,30 +570,55 @@ void Pi05Policy::stagePixelValues(std::vector<Pi05CameraView const*> const& orde
 {
     using Clock = std::chrono::steady_clock;
     auto const viewElems = static_cast<size_t>(3) * mContract.imageHeight * mContract.imageWidth;
-    for (size_t v = 0; v < ordered.size(); ++v)
+    struct Staged
     {
-        Pi05CameraView const& view = *ordered[v];
-        if (view.rgb != nullptr)
-        {
-            times.resizeMs += stageOneView(view.rgb, view.height, view.width, v);
-            continue;
-        }
-        auto const decodeStart = Clock::now();
-        double preprocessMs{0.0};
+        double decodeMs{0.0};
+        double resizeMs{0.0};
         int64_t srcH{0};
         int64_t srcW{0};
+    };
+    // Views are independent: each decodes and resizes into its own buffer and FP16 slice, concurrently.
+    mPlanarViews.resize(std::max(mPlanarViews.size(), ordered.size()));
+    auto stage = [&](size_t v) {
+        Pi05CameraView const& view = *ordered[v];
+        Staged out;
+        if (view.rgb != nullptr)
+        {
+            out.resizeMs = stageOneView(view.rgb, view.height, view.width, v, mPlanarViews[v]);
+            return out;
+        }
+        auto const decodeStart = Clock::now();
         {
             // Scoped so the decoded frame's pinned host buffer is freed, and charged, here:
             // allocating and pinning it is part of the cost of being handed a file path.
             rt::imageUtils::ImageData const image = rt::imageUtils::loadRgbImageFromFile(view.imagePath);
-            srcH = image.height;
-            srcW = image.width;
-            preprocessMs = stageOneView(image.data(), static_cast<int32_t>(srcH), static_cast<int32_t>(srcW), v);
+            out.srcH = image.height;
+            out.srcW = image.width;
+            out.resizeMs = stageOneView(
+                image.data(), static_cast<int32_t>(out.srcH), static_cast<int32_t>(out.srcW), v, mPlanarViews[v]);
         }
-        times.decodeMs += std::chrono::duration<double, std::milli>(Clock::now() - decodeStart).count() - preprocessMs;
-        times.resizeMs += preprocessMs;
-        LOG_INFO("Loaded %s (%ldx%ld) -> %dx%d", view.imagePath.c_str(), srcW, srcH, mContract.imageWidth,
-            mContract.imageHeight);
+        out.decodeMs = std::chrono::duration<double, std::milli>(Clock::now() - decodeStart).count() - out.resizeMs;
+        return out;
+    };
+    std::vector<std::future<Staged>> pending;
+    for (size_t v = 1; v < ordered.size(); ++v)
+    {
+        pending.push_back(std::async(std::launch::async, stage, v));
+    }
+    std::vector<Staged> staged{stage(0)};
+    for (auto& view : pending)
+    {
+        staged.push_back(view.get());
+    }
+    for (size_t v = 0; v < ordered.size(); ++v)
+    {
+        times.decodeMs += staged[v].decodeMs;
+        times.resizeMs += staged[v].resizeMs;
+        if (ordered[v]->rgb == nullptr)
+        {
+            LOG_INFO("Loaded %s (%ldx%ld) -> %dx%d", ordered[v]->imagePath.c_str(), staged[v].srcW, staged[v].srcH,
+                mContract.imageWidth, mContract.imageHeight);
+        }
     }
     // No sync: the upload and the engines share mStream, and the previous request
     // drained it before returning, so the pinned staging is free again.
@@ -601,6 +628,11 @@ void Pi05Policy::stagePixelValues(std::vector<Pi05CameraView const*> const& orde
 
 std::vector<int32_t> Pi05Policy::tokenize(std::string const& prompt)
 {
+    // The prompt repeats within an episode (always, without discrete state input).
+    if (prompt == mLastPrompt)
+    {
+        return mLastTokenIds;
+    }
     if (mTokenizer == nullptr)
     {
         std::filesystem::path const dir = std::filesystem::path(mEngineDir) / "text_tokenizer";
@@ -633,6 +665,8 @@ std::vector<int32_t> Pi05Policy::tokenize(std::string const& prompt)
             "Prompt tokenizes to %zu tokens, truncating to the contract's %d", ids.size(), mContract.maxTokenLen);
         ids.resize(static_cast<size_t>(mContract.maxTokenLen));
     }
+    mLastPrompt = prompt;
+    mLastTokenIds = ids;
     return ids;
 }
 

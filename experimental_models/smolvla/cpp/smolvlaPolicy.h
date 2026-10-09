@@ -178,6 +178,8 @@ private:
     std::vector<float> mPrevious; //!< last normalized chunk, for RTC
 
     std::mt19937_64 mNoiseGen{0};
+    std::string mLastTask; //!< the task mLastTokens was tokenized from
+    std::vector<int64_t> mLastTokens;
     bool mUseCudaGraph{true};
     std::map<int64_t, cudaGraphExec_t> mGraphs; //!< keyed by prefix length
     cudaEvent_t mEvents[4]{};

@@ -351,7 +351,8 @@ private:
     //! \param times Accumulates the decode and preprocess halves across the views.
     void stagePixelValues(std::vector<Pi05CameraView const*> const& ordered, Pi05ObservationTimes& times);
     //! Resize-with-pad \p rgb into view slot \p viewIdx of the pinned staging. Returns its ms.
-    double stageOneView(unsigned char const* rgb, int32_t srcH, int32_t srcW, size_t viewIdx);
+    double stageOneView(
+        unsigned char const* rgb, int32_t srcH, int32_t srcW, size_t viewIdx, std::vector<float>& planar);
 
     std::string mEngineDir;
     Pi05Contract mContract;
@@ -363,8 +364,10 @@ private:
     cudaStream_t mStream{nullptr};
     //! Sized once for every slot the contract declares; a request using fewer reshapes it down.
     rt::Tensor mPixelValues;
-    rt::Tensor mPixelValuesHost;            //!< pinned staging for mPixelValues
-    std::vector<float> mPlanarView;         //!< one view's resized CHW float buffer, reused per request
+    rt::Tensor mPixelValuesHost;                  //!< pinned staging for mPixelValues
+    std::vector<std::vector<float>> mPlanarViews; //!< each view's resized CHW float buffer, reused per request
+    std::string mLastPrompt;                      //!< the prompt mLastTokenIds was tokenized from
+    std::vector<int32_t> mLastTokenIds;
     std::vector<float> mPreviousNormalized; //!< last chunk, [horizon, modelActionDim], for RTC
     std::vector<float> mPreviousRobot;      //!< last chunk in robot units, [horizon, robotActionDim]
 };

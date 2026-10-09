@@ -99,8 +99,8 @@ LIBERO-Spatial, 10 tasks x 10 episodes, AGX Orin 64 GB, JetPack 6.2, FP16 engine
 | Policy | Success on Orin | Reported for the checkpoint |
 |---|---|---|
 | GR00T N1.7 | 97.0% | 97.65% (Isaac-GR00T, 200 episodes) |
-| GR00T N1.6 | 97.0% | 96.0% (model card, 200 episodes) |
-| GR00T N1.5 | 88.0% | 92% (Isaac-GR00T N1.5, 50 episodes) |
+| GR00T N1.6 | 97.0%; 100% with the LLM-runtime prefix | 96.0% (model card, 200 episodes) |
+| GR00T N1.5 | 88.0%; 89% at 4 denoising steps | 92% (Isaac-GR00T N1.5, 50 episodes, 8 steps) |
 | pi0.5 | 100.0% | 98.8% (openpi) |
 | SmolVLA | 72.0% | 90% (SmolVLA paper) |
 | X-VLA | 98.0% | 98.2% (X-VLA paper) |
