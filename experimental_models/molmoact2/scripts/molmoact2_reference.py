@@ -39,15 +39,17 @@ import numpy as np
 import torch
 
 
-def local_checkpoint(args):
-    """A copy of the LeRobot checkpoint's small files whose base-model and tokenizer references are local."""
-    out = tempfile.mkdtemp(prefix="molmoact2_ckpt_")
+def local_checkpoint(args, out):
+    """Write into out a view of the LeRobot checkpoint whose base-model and tokenizer references are local: its
+    small files copied, its weights linked, anything else large (partial downloads) left out."""
     for name in os.listdir(args.checkpoint):
         src = os.path.join(args.checkpoint, name)
-        if name.endswith(".safetensors") and os.path.getsize(src) > 1 << 20:
-            os.symlink(os.path.abspath(src), os.path.join(out, name))
-        elif os.path.isfile(src):
+        if not os.path.isfile(src):
+            continue
+        if os.path.getsize(src) <= 1 << 20:
             shutil.copy(src, out)
+        elif name.endswith(".safetensors"):
+            os.symlink(os.path.abspath(src), os.path.join(out, name))
     config = json.load(open(os.path.join(out, "config.json")))
     config.update(checkpoint_path=os.path.abspath(args.hf),
                   discrete_action_tokenizer=os.path.abspath(args.fast),
@@ -133,7 +135,8 @@ def main():
 
     import lerobot.policies.molmoact2.processor_molmoact2  # noqa: F401 -- registers its processor steps
     from lerobot.processor import PolicyProcessorPipeline
-    checkpoint = local_checkpoint(args)
+    workdir = tempfile.TemporaryDirectory(prefix="molmoact2_ckpt_")
+    checkpoint = local_checkpoint(args, workdir.name)
     preprocessor = PolicyProcessorPipeline.from_pretrained(
         checkpoint, config_filename="policy_preprocessor.json")
     obs = np.load(args.obs)
@@ -175,7 +178,7 @@ def main():
         return captured["mask"]
 
     backbone._get_encoder_attention_mask = mask
-    backbone.model.vision_backbone.register_forward_hook(
+    backbone.vision_backbone.register_forward_hook(
         lambda m, i, o: captured.setdefault("visual", o))
     expert = backbone._require_action_expert()
     original_forward = expert.forward_with_context
