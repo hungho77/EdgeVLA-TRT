@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Robot-side client for the EdgeVLA-TRT policy servers (GR00T, pi0.5, SmolVLA, X-VLA, OpenVLA).
+"""Robot-side client for the EdgeVLA-TRT policy servers (GR00T, pi0.5, SmolVLA, X-VLA, TurboVLA, OpenVLA).
 
 Camera frames travel inline as raw RGB behind the request header (see experimental_models/vla/cpp/vlaServer.h), so
 the robot never writes image files. The client either starts the server as a subprocess (stdin / stdout) or connects

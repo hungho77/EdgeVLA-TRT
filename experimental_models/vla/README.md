@@ -74,7 +74,7 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 
 [`scripts/libero_eval.py`](scripts/libero_eval.py) measures a policy's LIBERO success rate in simulation. The model
 runs in its C++ policy server (one JSON request per line: `gr00t_policy_server`, `pi05_policy_server`,
-`smolvla_policy_server`, `xvla_policy_server`, `openvla_policy_server`), started as a subprocess, so the simulator
+`smolvla_policy_server`, `xvla_policy_server`, `turbovla_policy_server`, `openvla_policy_server`), started as a subprocess, so the simulator
 side needs only a LIBERO Python environment (robosuite 1.4 with mujoco 2.3, `MUJOCO_GL=egl`) and no TensorRT.
 
 Protocol: LIBERO's fixed initial states (episode *i* of a task uses init state *i*), 10 no-op steps for the objects
@@ -89,6 +89,7 @@ own LIBERO evaluation script, because these conventions move the success rate by
 | `pi05` | openpi `pi05_libero` (PyTorch conversion) | openpi `examples/libero` | both flipped, PIL bilinear to 224 | eef pos, axis-angle, gripper qpos | 5 of 10 | as returned | 220 |
 | `smolvla` | `HuggingFaceVLA/smolvla_libero` | LeRobot `LiberoProcessorStep` | both flipped | as pi0.5 | 1 of 50 (its `n_action_steps`) | as returned | 280 |
 | `xvla` | `lerobot/xvla-libero` | LeRobot `make_xvla_libero_pre_post_processors` | agent view flipped only | eef pos, rot6d of the controller orientation, 0, padded to 20 | 30 of 30 | `> 0.5` | 280, absolute control |
+| `turbovla` | `H-EmbodVis/TurboVLA` (`checkpoints/libero`, all four suites) | TurboVLA's VLA-Adapter-derived rollout | both flipped | as pi0.5 | 12 of 12 | as returned (+-1) | 220 |
 | `openvla` | `openvla/openvla-7b-finetuned-libero-spatial` | OpenVLA `run_libero_eval.py` | agent view flipped, JPEG round trip, Lanczos to 224, 90% centre crop | none | 1 | binarized, inverted | 220 |
 
 OpenVLA's TensorFlow image steps are reproduced with OpenCV, Pillow and NumPy (`tf.image.crop_and_resize` exactly;
@@ -104,6 +105,7 @@ LIBERO-Spatial, 10 tasks x 10 episodes, AGX Orin 64 GB, JetPack 6.2, FP16 engine
 | pi0.5 | 100.0% | 98.8% (openpi) |
 | SmolVLA | 72.0% | 90% (SmolVLA paper) |
 | X-VLA | 98.0% | 98.2% (X-VLA paper) |
+| TurboVLA | 95.0% | 97.0% (TurboVLA paper, 500 episodes) |
 | OpenVLA | 85.0% | 84.7% (OpenVLA paper) |
 
 SmolVLA's engines match LeRobot on a LIBERO observation (robot actions max |Δ| 0.013 on a ±1 range, identical
@@ -127,8 +129,8 @@ run or override the rows executed per call.
 ## Real-robot serving
 
 Every VLA family has a policy server a robot can drive directly: `gr00t_policy_server` (N1.5 / N1.6 / N1.7),
-`pi05_policy_server`, `smolvla_policy_server`, `xvla_policy_server`, `openvla_policy_server`, and
-`internvla_n1_dual_system_server` for navigation. They share one transport
+`pi05_policy_server`, `smolvla_policy_server`, `xvla_policy_server`, `turbovla_policy_server`,
+`openvla_policy_server`, and `internvla_n1_dual_system_server` for navigation. They share one transport
 ([`cpp/vlaServer.h`](cpp/vlaServer.h)):
 
 - **stdin / stdout by default**, or **TCP** with `--port N` (bound to 127.0.0.1; `--host 0.0.0.0` for the LAN). TCP
@@ -172,6 +174,7 @@ hardware.
 | pi0.5 | the contract's camera slots | robot units, the embodiment's width | robot units after openpi's output transform | action horizon (10 LIBERO, 50 SO101) | overlap / frozen |
 | SmolVLA | the dataset's camera names | the dataset's state | the dataset's actions, unnormalized | chunk (50) | delay / horizon |
 | X-VLA | the checkpoint's camera names | proprio, zero-padded to 20 | ee6d absolute targets: position, rot6d, gripper through a sigmoid | chunk (30) | delay / horizon |
+| TurboVLA | `primary`, `wrist` | the checkpoint's (LIBERO: eef pos, axis-angle, gripper qpos) | environment actions: arm deltas unnormalized, gripper +1 / -1 | chunk (12) | overlap / frozen, by blending the new chunk with the previous one (no denoising to inpaint) |
 | OpenVLA | `image` (third-person) | none | one unnormalized end-effector delta and gripper, per the `unnorm_key` dataset | 1 | none |
 
 Verified by replay and in LIBERO over TCP, not on hardware. AGX Orin, SO101 dataset frames at 30 Hz wall clock
@@ -183,6 +186,7 @@ through `replay_robot.py` over TCP with raw frames, 300 ticks each, no stalls (a
 | SmolVLA (frozen 6) | 79 ms | 3 | 0.0000 / 6.08 |
 | X-VLA (frozen 9) | 188 ms | 6 | 0.0000 / 0.036 |
 | pi0.5 (frozen 12) | 272 ms | 8-11 | 0.0000 / 6.15 |
+| TurboVLA (overlap 6, frozen 3; LIBERO checkpoint on SO101 frames, another job on the GPU) | 36-42 ms | 1-2 | 0.0000 / 2.0 |
 
 Inline frames over stdio and TCP give bit-identical actions to the same images by path for every family, and a
 LIBERO-Spatial run through a TCP server (`libero_eval.py --port`) succeeds as over stdio. OpenVLA answers about

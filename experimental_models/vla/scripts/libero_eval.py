@@ -313,6 +313,45 @@ class SmolvlaAdapter:
         return np.asarray(reply["actions"], dtype=np.float64)[:self.rows, :7]
 
 
+class TurbovlaAdapter:
+    """turbovla_policy_server, as TurboVLA's LIBERO rollout: both views flipped 180 degrees as cameras primary /
+    wrist, state [eef pos, axis-angle, gripper qpos], actions (gripper already +-1) sent to LIBERO as returned."""
+
+    control_mode = "relative"
+
+    def __init__(self, server, rows):
+        self.server = server
+        self.rows = rows
+        self.tmp = tempfile.mkdtemp(prefix="libero_eval_")
+        self.first = True
+
+    def reset(self):
+        self.first = True
+
+    def act(self, obs, instruction):
+        cameras = {}
+        for key, cam in (("primary", "agentview_image"),
+                         ("wrist", "robot0_eye_in_hand_image")):
+            path = os.path.join(self.tmp, f"{key}.png")
+            cv2.imwrite(
+                path,
+                cv2.cvtColor(np.ascontiguousarray(obs[cam][::-1, ::-1]),
+                             cv2.COLOR_RGB2BGR))
+            cameras[key] = path
+        state = np.concatenate([
+            obs["robot0_eef_pos"],
+            quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]
+        ])
+        reply = self.server.request({
+            "cameras": cameras,
+            "state": [float(v) for v in state],
+            "task": instruction,
+            "reset": self.first
+        })
+        self.first = False
+        return np.asarray(reply["actions"], dtype=np.float64)[:self.rows, :7]
+
+
 def tf_crop_and_resize(image, box, size):
     """tf.image.crop_and_resize (bilinear) of a float [H, W, C] image to a normalized [y1, x1, y2, x2] box."""
     h, w = image.shape[:2]
@@ -394,6 +433,8 @@ POLICIES = {
     lambda server, rows: Pi05Adapter(server, rows=rows or 5),
     "smolvla":
     lambda server, rows: SmolvlaAdapter(server, rows=rows or 1),
+    "turbovla":
+    lambda server, rows: TurbovlaAdapter(server, rows=rows or 12),
     "openvla":
     lambda server, rows: OpenvlaAdapter(server, rows=1),
 }
