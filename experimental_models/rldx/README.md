@@ -62,7 +62,9 @@ action steps 80 ms.
 **Control rate.** With one request in flight, a chunk is adopted one policy latency after it was planned and the
 next arrives one latency later, so a loop runs without stalls only while twice the latency in ticks stays within
 the 16-row chunk: about 300 ms fits 20 Hz (6 ticks; LIBERO's rate, which the history offsets count in) but not
-30 Hz (10 ticks). `replay_robot.py` over TCP with raw frames and the frame history runs the protocol end to end.
+30 Hz (10 ticks). `replay_robot.py` over TCP with raw frames and the frame history at 20 Hz on an idle board (200 ticks,
+`overlap=10, frozen=8`): call median 292 ms, planner lag 6-7 ticks, no stalls, switch jump 0.0000 with RTC and 0.32
+without.
 
 LIBERO-Spatial, 10 tasks x 10 episodes, this harness's protocol (fixed initial states, 10 settle steps, 220 steps)
 with the checkpoint's conventions (8 of 16 rows per call, gripper `sign(2 g - 1)`): **97%** (failures on tasks
