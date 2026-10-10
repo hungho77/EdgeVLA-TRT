@@ -110,7 +110,7 @@ LIBERO-Spatial, 10 tasks x 10 episodes, AGX Orin 64 GB, JetPack 6.2, FP16 engine
 | X-VLA | 98.0% | 98.2% (X-VLA paper) |
 | TurboVLA | 95.0% | 97.0% (TurboVLA paper, 500 episodes) |
 | RLDX-1 | 97.0% | 98.6% LIBERO-Short, the Spatial / Object / Goal average (RLDX-1 paper; random resets, 720 steps) |
-| MolmoAct2 | 100.0% | 98.4% (model card, LeRobot implementation, 50 episodes per task) |
+| MolmoAct2 | 99.0%; 100% with the official FP32 attention | 98.4% (model card, LeRobot implementation, 50 episodes per task) |
 | OpenVLA | 85.0% | 84.7% (OpenVLA paper) |
 
 SmolVLA's engines match LeRobot on a LIBERO observation (robot actions max |Δ| 0.013 on a ±1 range, identical
@@ -198,7 +198,7 @@ through `replay_robot.py` over TCP with raw frames, 300 ticks each unless noted,
 | pi0.5 (frozen 12) | 272 ms | 8-11 | 0.0000 / 6.15 |
 | TurboVLA (overlap 6, frozen 3; LIBERO checkpoint on SO101 frames, another job on the GPU) | 36-42 ms | 1-2 | 0.0000 / 2.0 |
 | RLDX-1 (overlap 10, frozen 8; LIBERO checkpoint on SO101 frames with the frame history, 20 Hz, 200 ticks) | 292 ms | 6-7 | 0.0000 / 0.32 |
-| MolmoAct2 (overlap 5, frozen 4; LIBERO checkpoint on SO101 frames, 4 Hz, 60 ticks) | 544 ms | 3 | 0.0000 / 1.95 |
+| MolmoAct2 (overlap 5, frozen 4; LIBERO checkpoint on SO101 frames, 5 Hz, 60 ticks) | 399 ms | 2-3 | 0.0000 / 1.96 |
 
 Inline frames over stdio and TCP give bit-identical actions to the same images by path for every family, and a
 LIBERO-Spatial run through a TCP server (`libero_eval.py --port`) succeeds as over stdio. OpenVLA answers about

@@ -29,8 +29,9 @@
            strength 1 everywhere is the plain Euler step, real-time chunking scales the overlap rows as GR00T does.
 
 The checkpoint's projected image features reach 1.7e4 and stay in the residual stream, and the pooling attention's
-unscaled scores reach 8e4: RMSNorm, the language model's attention scores and the ViT / pooling attention (the
-official float32_attention, kept on its SDPA path: the eager path ignores the pooling mask) run in FP32.
+unscaled scores reach 8e4: RMSNorm, the softmaxes and the pooling attention (the official float32_attention, kept on
+its SDPA path: the eager path ignores the pooling mask) run in FP32. The ViT's and the language model's scaled scores
+stay below 64, so their QK^T is FP16 unless fp32_attention is set.
 """
 
 import torch
@@ -44,12 +45,17 @@ def rotate_half(x):
 
 class Vision(nn.Module):
 
-    def __init__(self, vision_backbone, pooling_index):
+    def __init__(self, vision_backbone, pooling_index, fp32_attention=False):
         super().__init__()
         self.vb = vision_backbone
+        # The ViT's scaled scores stay below 64, so its attention can stay in FP16; the pooling attention's reach
+        # 8e4 and keep the official FP32.
+        for block in vision_backbone.image_vit.transformer.resblocks:
+            block.attention.float32_attention = fp32_attention
         # The processor numbers each image's patches from 0; the images' features are concatenated.
         groups, patches = pooling_index.shape[0] // 2, 729
-        offset = (torch.arange(pooling_index.shape[0]) // groups * patches)[:, None]
+        offset = (torch.arange(pooling_index.shape[0]) // groups *
+                  patches)[:, None]
         index = torch.where(pooling_index >= 0, pooling_index + offset,
                             pooling_index)
         self.register_buffer("index", index, persistent=False)
@@ -58,7 +64,8 @@ class Vision(nn.Module):
         """patches [N, 729, 588] FP32 -> [N * 196, D]."""
         vb = self.vb
         images = torch.round((patches + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0)
-        images = (images / 255.0 * 2.0 - 1.0).to(vb.image_projector.w1.weight.dtype)
+        images = (images / 255.0 * 2.0 - 1.0).to(
+            vb.image_projector.w1.weight.dtype)
         features = vb.encode_image(images[None])
         dim = features.shape[-1]
         valid = self.index >= 0
@@ -73,15 +80,17 @@ class Vision(nn.Module):
         return vb.image_projector(pooled.reshape(-1, pooled.shape[-1]))
 
 
-def attention_kv(attn, x, cos, sin, mask, need_output=True):
-    """MolmoAct2Attention with RoPE, QK^T and the softmax in FP32; returns the output and the cached K / V."""
+def attention_kv(attn, x, cos, sin, mask, need_output=True, fp32=False):
+    """MolmoAct2Attention returning the output and the cached K / V. ``fp32`` applies RoPE and computes QK^T in FP32;
+    otherwise they stay in FP16 with the scale on Q (scaled scores stay below 64) and only the softmax is FP32."""
     batch, length = x.shape[:2]
     shape = (batch, length, -1, attn.head_dim)
+    dtype = torch.float32 if fp32 else x.dtype
     q, k, v = attn.att_proj(x).split(attn.fused_dims, dim=-1)
-    q = attn.q_norm(q.view(shape)).transpose(1, 2).float()
-    k = attn.k_norm(k.view(shape)).transpose(1, 2).float()
+    q = attn.q_norm(q.view(shape)).transpose(1, 2).to(dtype)
+    k = attn.k_norm(k.view(shape)).transpose(1, 2).to(dtype)
     v = v.view(shape).transpose(1, 2)
-    cos, sin = cos[None, None], sin[None, None]
+    cos, sin = cos[None, None].to(dtype), sin[None, None].to(dtype)
     q = q * cos + rotate_half(q) * sin
     k = k * cos + rotate_half(k) * sin
     k_cache = k.to(v.dtype).transpose(1, 2).reshape(batch, length, -1)
@@ -89,9 +98,9 @@ def attention_kv(attn, x, cos, sin, mask, need_output=True):
     if not need_output:
         return None, k_cache, v_cache
     groups = attn.num_key_value_groups
-    scores = torch.matmul(q, k.repeat_interleave(groups, 1).transpose(
-        -1, -2)) * attn.head_dim**-0.5 + mask
-    probs = scores.softmax(-1).to(v.dtype)
+    scores = torch.matmul(q * attn.head_dim**-0.5,
+                          k.repeat_interleave(groups, 1).transpose(-1, -2))
+    probs = (scores.float() + mask).softmax(-1).to(v.dtype)
     out = torch.matmul(probs, v.repeat_interleave(groups, 1))
     return attn.attn_out(out.transpose(1, 2).reshape(batch, length,
                                                      -1)), k_cache, v_cache
@@ -99,8 +108,15 @@ def attention_kv(attn, x, cos, sin, mask, need_output=True):
 
 class Prefix(nn.Module):
 
-    def __init__(self, transformer, first, last, final, image_patch_id):
+    def __init__(self,
+                 transformer,
+                 first,
+                 last,
+                 final,
+                 image_patch_id,
+                 fp32_attention=False):
         super().__init__()
+        self.fp32_attention = fp32_attention
         self.blocks = nn.ModuleList(transformer.blocks[first:last])
         self.final = final
         self.wte = transformer.wte if first == 0 else None
@@ -133,7 +149,8 @@ class Prefix(nn.Module):
                                      cos,
                                      sin,
                                      mask,
-                                     need_output=not last)
+                                     need_output=not last,
+                                     fp32=self.fp32_attention)
             keys.append(k[0])
             values.append(v[0])
             if last:
@@ -226,17 +243,20 @@ class Step(nn.Module):
         self.register_buffer("conditioning",
                              torch.stack([c.conditioning for c in cache]),
                              persistent=False)
-        self.register_buffer("blocks",
-                             torch.stack([
-                                 torch.stack([torch.stack(m) for m in c.block_modulations])
-                                 for c in cache
-                             ]),
-                             persistent=False)
-        self.register_buffer("final",
-                             torch.stack([torch.stack(c.final_modulation) for c in cache]),
-                             persistent=False)
+        self.register_buffer(
+            "blocks",
+            torch.stack([
+                torch.stack([torch.stack(m) for m in c.block_modulations])
+                for c in cache
+            ]),
+            persistent=False)
+        self.register_buffer(
+            "final",
+            torch.stack([torch.stack(c.final_modulation) for c in cache]),
+            persistent=False)
 
-    def forward(self, x, step, dt, context_k, context_v, encoder_mask, strength):
+    def forward(self, x, step, dt, context_k, context_v, encoder_mask,
+                strength):
         """x [1, H, A]; step [1] int64; dt [1]; context K / V [L, 1, S, heads, head_dim]; encoder_mask [1, S]."""
         from lerobot.policies.molmoact2.molmoact2_hf_model.modeling_molmoact2 import (
             ActionExpertContext, ActionExpertStepModulation)
@@ -265,7 +285,9 @@ class Step(nn.Module):
         torch.nn.functional.scaled_dot_product_attention = scaled_dot_product_attention_query_scaled
         try:
             velocity = expert.forward_with_context(
-                x, modulation.conditioning, context=context,
+                x,
+                modulation.conditioning,
+                context=context,
                 modulation=modulation) * keep
         finally:
             torch.nn.functional.scaled_dot_product_attention = sdpa

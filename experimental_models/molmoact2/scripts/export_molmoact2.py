@@ -108,6 +108,10 @@ def main():
                         choices=("vision", "prefix_a", "prefix_b", "context",
                                  "step", "assets"))
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--fp32-attention",
+        action="store_true",
+        help="ViT and language-model QK^T in FP32, as the official model")
     parser.add_argument("--split",
                         type=int,
                         default=18,
@@ -133,76 +137,81 @@ def main():
         # The pooling table only depends on the 378 x 378 crop: rebuild it with the official processor.
         from lerobot.policies.molmoact2.molmoact2_hf_model.image_processing_molmoact2 import \
             arange_for_pooling
-        idx = torch.from_numpy(arange_for_pooling(torch.arange(729).reshape(27, 27).numpy(),
-                                                  2, 2)).reshape(-1, 4)
+        idx = torch.from_numpy(
+            arange_for_pooling(
+                torch.arange(729).reshape(27, 27).numpy(), 2,
+                2)).reshape(-1, 4)
         table = torch.cat([idx, idx])
-        export(M.Vision(model.vision_backbone, table),
+        export(M.Vision(model.vision_backbone, table, args.fp32_attention),
                (torch.rand(2, 729, 588) * 2 - 1, ), out("vision"), ["patches"],
                ["visual"], None)
     elif args.stage == "prefix_a":
         cos, sin = rope_example(LENGTH, head_dim)
         ids = torch.randint(0, 151000, (LENGTH, ))
         ids[10:10 + VISUAL] = config.image_patch_id
-        export(PrefixFirst(
-            M.Prefix(model.transformer, 0, args.split, False,
-                     config.image_patch_id)),
-               (ids, torch.randn(VISUAL, hidden, dtype=f16),
-                (torch.arange(LENGTH) < 400).half(), cos, sin), out("prefix_a"),
-               ["input_ids", "visual", "image_flag", "cos", "sin"],
-               ["hidden", "keys", "values"], {
-                   "input_ids": seq,
-                   "image_flag": seq,
-                   "cos": seq,
-                   "sin": seq,
-                   "hidden": {
-                       1: "sequence"
-                   },
-                   "keys": {
-                       1: "sequence"
-                   },
-                   "values": {
-                       1: "sequence"
-                   }
-               })
+        export(
+            PrefixFirst(
+                M.Prefix(model.transformer, 0, args.split, False,
+                         config.image_patch_id, args.fp32_attention)),
+            (ids, torch.randn(VISUAL, hidden, dtype=f16),
+             (torch.arange(LENGTH) < 400).half(), cos, sin), out("prefix_a"),
+            ["input_ids", "visual", "image_flag", "cos", "sin"],
+            ["hidden", "keys", "values"], {
+                "input_ids": seq,
+                "image_flag": seq,
+                "cos": seq,
+                "sin": seq,
+                "hidden": {
+                    1: "sequence"
+                },
+                "keys": {
+                    1: "sequence"
+                },
+                "values": {
+                    1: "sequence"
+                }
+            })
     elif args.stage == "prefix_b":
         cos, sin = rope_example(LENGTH, head_dim)
-        export(PrefixLater(
-            M.Prefix(model.transformer, args.split, blocks, True,
-                     config.image_patch_id)),
-               (torch.randn(1, LENGTH, hidden, dtype=f16),
-                (torch.arange(LENGTH) < 400).half(), cos, sin), out("prefix_b"),
-               ["hidden", "image_flag", "cos", "sin"], ["keys", "values"], {
-                   "hidden": {
-                       1: "sequence"
-                   },
-                   "image_flag": seq,
-                   "cos": seq,
-                   "sin": seq,
-                   "keys": {
-                       1: "sequence"
-                   },
-                   "values": {
-                       1: "sequence"
-                   }
-               })
+        export(
+            PrefixLater(
+                M.Prefix(model.transformer, args.split, blocks, True,
+                         config.image_patch_id, args.fp32_attention)),
+            (torch.randn(1, LENGTH, hidden, dtype=f16),
+             (torch.arange(LENGTH) < 400).half(), cos, sin), out("prefix_b"),
+            ["hidden", "image_flag", "cos", "sin"], ["keys", "values"], {
+                "hidden": {
+                    1: "sequence"
+                },
+                "image_flag": seq,
+                "cos": seq,
+                "sin": seq,
+                "keys": {
+                    1: "sequence"
+                },
+                "values": {
+                    1: "sequence"
+                }
+            })
     elif args.stage == "context":
-        export(M.Context(model._require_action_expert()),
-               (torch.randn(blocks, LENGTH, kv_dim, dtype=f16),
-                torch.randn(blocks, LENGTH, kv_dim, dtype=f16)), out("context"),
-               ["keys", "values"], ["context_k", "context_v"], {
-                   "keys": {
-                       1: "sequence"
-                   },
-                   "values": {
-                       1: "sequence"
-                   },
-                   "context_k": {
-                       2: "sequence"
-                   },
-                   "context_v": {
-                       2: "sequence"
-                   }
-               })
+        export(
+            M.Context(model._require_action_expert()),
+            (torch.randn(blocks, LENGTH, kv_dim, dtype=f16),
+             torch.randn(blocks, LENGTH, kv_dim, dtype=f16)), out("context"),
+            ["keys", "values"], ["context_k", "context_v"], {
+                "keys": {
+                    1: "sequence"
+                },
+                "values": {
+                    1: "sequence"
+                },
+                "context_k": {
+                    2: "sequence"
+                },
+                "context_v": {
+                    2: "sequence"
+                }
+            })
     elif args.stage == "step":
         expert = model._require_action_expert()
         heads = expert.config.num_heads
@@ -210,33 +219,34 @@ def main():
         horizon = int(config.max_action_horizon)
         dims = int(config.max_action_dim)
         steps = int(getattr(config, "flow_matching_num_steps", 10))
-        export(M.Step(expert, args_action_dim(args), horizon, steps),
-               (torch.randn(1, horizon, dims, dtype=f16),
-                torch.tensor([3]), torch.full((1, ), 0.1, dtype=f16),
-                torch.randn(blocks, 1, LENGTH, heads, head, dtype=f16),
-                torch.randn(blocks, 1, LENGTH, heads, head, dtype=f16),
-                torch.ones(1, LENGTH, dtype=f16),
-                torch.ones(1, horizon, 1, dtype=f16)), out("step"), [
-                    "x", "step", "dt", "context_k", "context_v",
-                    "encoder_mask", "strength"
-                ], ["x_next", "velocity"], {
-                    "context_k": {
-                        2: "sequence"
-                    },
-                    "context_v": {
-                        2: "sequence"
-                    },
-                    "encoder_mask": {
-                        1: "sequence"
-                    }
-                })
+        export(
+            M.Step(expert, args_action_dim(args), horizon, steps),
+            (torch.randn(1, horizon, dims, dtype=f16), torch.tensor(
+                [3]), torch.full((1, ), 0.1, dtype=f16),
+             torch.randn(blocks, 1, LENGTH, heads, head, dtype=f16),
+             torch.randn(blocks, 1, LENGTH, heads, head,
+                         dtype=f16), torch.ones(1, LENGTH, dtype=f16),
+             torch.ones(1, horizon, 1, dtype=f16)), out("step"), [
+                 "x", "step", "dt", "context_k", "context_v", "encoder_mask",
+                 "strength"
+             ], ["x_next", "velocity"], {
+                 "context_k": {
+                     2: "sequence"
+                 },
+                 "context_v": {
+                     2: "sequence"
+                 },
+                 "encoder_mask": {
+                     1: "sequence"
+                 }
+             })
 
 
 def args_action_dim(args):
     return int(
-        json.load(open(os.path.join(args.checkpoint,
-                                    "config.json")))["output_features"]
-        ["action"]["shape"][0])
+        json.load(open(os.path.join(
+            args.checkpoint,
+            "config.json")))["output_features"]["action"]["shape"][0])
 
 
 def export_assets(args):
@@ -261,26 +271,43 @@ def export_assets(args):
 
     os.makedirs(args.out, exist_ok=True)
     config = {
-        "model_family": "molmoact2",
+        "model_family":
+        "molmoact2",
         "cameras": [k.split(".")[-1] for k in ck["image_keys"]],
-        "image_size": 378,
-        "patch_size": 14,
-        "image_tokens": 196,
-        "setup": pack["setup_type"],
-        "control_mode": pack["control_mode"],
-        "state_bins": int(pack["num_state_tokens"]),
-        "action_horizon": int(ck["chunk_size"]),
-        "action_dim": args_action_dim(args),
-        "max_action_dim": int(pack["max_action_dim"]),
-        "state_dim": int(ck["input_features"]["observation.state"]["shape"][0]),
-        "flow_steps": int(hf.get("flow_matching_num_steps", 10)),
-        "head_dim": int(text.get("head_dim", 128)),
-        "rope_theta": float(text.get("rope_theta", 5000000.0)),
-        "bos_token_id": 151645,
-        "image_patch_id": int(hf["image_patch_id"]),
-        "state_normalization": stats("policy_preprocessor_step",
-                                     "observation.state"),
-        "action_normalization": stats("policy_postprocessor_step", "action"),
+        "image_size":
+        378,
+        "patch_size":
+        14,
+        "image_tokens":
+        196,
+        "setup":
+        pack["setup_type"],
+        "control_mode":
+        pack["control_mode"],
+        "state_bins":
+        int(pack["num_state_tokens"]),
+        "action_horizon":
+        int(ck["chunk_size"]),
+        "action_dim":
+        args_action_dim(args),
+        "max_action_dim":
+        int(pack["max_action_dim"]),
+        "state_dim":
+        int(ck["input_features"]["observation.state"]["shape"][0]),
+        "flow_steps":
+        int(hf.get("flow_matching_num_steps", 10)),
+        "head_dim":
+        int(text.get("head_dim", 128)),
+        "rope_theta":
+        float(text.get("rope_theta", 5000000.0)),
+        "bos_token_id":
+        151645,
+        "image_patch_id":
+        int(hf["image_patch_id"]),
+        "state_normalization":
+        stats("policy_preprocessor_step", "observation.state"),
+        "action_normalization":
+        stats("policy_postprocessor_step", "action"),
     }
     json.dump(config,
               open(os.path.join(args.out, "config.json"), "w"),

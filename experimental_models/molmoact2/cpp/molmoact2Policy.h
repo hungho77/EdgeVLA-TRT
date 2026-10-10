@@ -48,7 +48,7 @@ struct MolmoAct2Chunk
     std::vector<float> actions;    //!< [horizon, actionDim] unnormalized (masked dims raw, clamped to [-1, 1])
     std::vector<float> normalized; //!< [horizon, maxActionDim] the flow output
     int32_t promptTokens{0};
-    float hostMs{0.0F};
+    float hostMs{0.0F}; //!< frame patches, then the prompt and noise (the latter overlap the vision engine)
     float visionMs{0.0F};
     float prefixMs{0.0F};
     float actionMs{0.0F};
@@ -128,7 +128,8 @@ private:
     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;
 
     std::vector<std::string> mCameras;
-    std::string mSetup, mControlMode, mImageTokens;
+    std::string mSetup, mControlMode;
+    int32_t mImageTokenCount{196}, mImagePatchId{154626}, mImageStartId{154624};
     int32_t mImageSize{378}, mPatch{14}, mStateBins{256}, mHorizon{10}, mActionDim{7}, mMaxActionDim{32};
     int32_t mSteps{10}, mHeadDim{128}, mLayers{36}, mLayersA{18}, mKvDim{1024}, mHidden{2560};
     int32_t mContextHeads{8}, mContextHeadDim{96};
@@ -138,8 +139,9 @@ private:
 
     rt::Tensor mPatchesHost; //!< pinned FP32 [cameras, patches, patch pixels]
     rt::Tensor mPatches;
-    rt::Tensor mPromptHost; //!< pinned: ids (INT64), then flag / encoder mask (FP16), then cos / sin (FP32)
-    rt::Tensor mInputIds, mImageFlag, mEncoderMask, mCos, mSin;
+    rt::Tensor mPromptHost; //!< pinned: ids (INT64), then the image flag and encoder mask (FP16)
+    rt::Tensor mInputIds, mImageFlag, mEncoderMask;
+    rt::Tensor mCos, mSin; //!< FP32 [max S, headDim], filled once
     rt::Tensor mVisual, mHiddenState;
     rt::Tensor mKeys, mValues;       //!< FP16 [layers, S, kvDim]
     rt::Tensor mContextK, mContextV; //!< FP16 [layers, 1, S, heads, headDim]

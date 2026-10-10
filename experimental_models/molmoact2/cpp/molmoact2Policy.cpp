@@ -92,16 +92,16 @@ MolmoAct2Policy::MolmoAct2Policy(std::string const& engineDir, cudaStream_t stre
     mBos = config.at("bos_token_id").get<int32_t>();
     readRange(config.at("state_normalization"), mStateLow, mStateHigh, mStateMask);
     readRange(config.at("action_normalization"), mActionLow, mActionHigh, mActionMask);
-    int32_t const imageTokens = config.at("image_tokens").get<int32_t>();
-    mImageTokens = "<im_start>";
-    for (int32_t i = 0; i < imageTokens; ++i)
-    {
-        mImageTokens += "<im_patch>";
-    }
-    mImageTokens += "<im_end>";
+    mImageTokenCount = config.at("image_tokens").get<int32_t>();
+    mImagePatchId = config.at("image_patch_id").get<int32_t>();
 
     mTokenizer = std::make_unique<tokenizer::Tokenizer>();
     ELLM_CHECK(mTokenizer->loadFromHF(engineDir), "MolmoAct2Policy: failed to load the tokenizer");
+    auto const startIds = mTokenizer->encode("<im_start>");
+    auto const patchIds = mTokenizer->encode("<im_patch>");
+    ELLM_CHECK(startIds.size() == 1 && patchIds.size() == 1 && patchIds[0] == mImagePatchId,
+        "MolmoAct2Policy: the tokenizer lacks the image special tokens");
+    mImageStartId = startIds[0];
     mRuntime = vla::createTrtRuntime();
     mVision = vla::TrtEngine(*mRuntime, engineDir + "/vision.engine", stream);
     mPrefixA = vla::TrtEngine(*mRuntime, engineDir + "/prefix_a.engine", stream);
@@ -131,8 +131,7 @@ MolmoAct2Policy::MolmoAct2Policy(std::string const& engineDir, cudaStream_t stre
     mPatchesHost
         = makeTensor({cameras, patches, patchPixels}, DataType::kFLOAT, "molmoact2::patchesHost", rt::DeviceType::kCPU);
     mPatches = makeTensor({cameras, patches, patchPixels}, DataType::kFLOAT, "molmoact2::patches");
-    mPromptHost = makeTensor(
-        {maxS * (8 + 2 + 2 + 8 * mHeadDim)}, DataType::kUINT8, "molmoact2::promptHost", rt::DeviceType::kCPU);
+    mPromptHost = makeTensor({maxS * (8 + 2 + 2)}, DataType::kUINT8, "molmoact2::promptHost", rt::DeviceType::kCPU);
     mInputIds = makeTensor({maxS}, DataType::kINT64, "molmoact2::inputIds");
     mImageFlag = makeTensor({maxS}, DataType::kHALF, "molmoact2::imageFlag");
     mEncoderMask = makeTensor({1, maxS}, DataType::kHALF, "molmoact2::encoderMask");
@@ -165,6 +164,25 @@ MolmoAct2Policy::MolmoAct2Policy(std::string const& engineDir, cudaStream_t stre
     *reinterpret_cast<__half*>(slots + mSteps * kSlotBytes) = __float2half(1.0F / static_cast<float>(mSteps));
     CUDA_CHECK(
         cudaMemcpyAsync(mScalars.rawPointer(), slots, (mSteps + 1) * kSlotBytes, cudaMemcpyHostToDevice, stream));
+
+    // RoPE tables for every position the profiles allow; a prompt of S tokens reads their first S rows.
+    rt::Tensor ropeHost
+        = makeTensor({2, maxS, mHeadDim}, DataType::kFLOAT, "molmoact2::ropeHost", rt::DeviceType::kCPU);
+    auto* hostCos = static_cast<float*>(ropeHost.rawPointer());
+    auto* hostSin = hostCos + maxS * mHeadDim;
+    int32_t const half = mHeadDim / 2;
+    for (int32_t j = 0; j < half; ++j)
+    {
+        float const invFreq = 1.0F / std::pow(mRopeTheta, static_cast<float>(2 * j) / static_cast<float>(mHeadDim));
+        for (int64_t p = 0; p < maxS; ++p)
+        {
+            float const angle = static_cast<float>(p) * invFreq;
+            hostCos[p * mHeadDim + j] = hostCos[p * mHeadDim + j + half] = std::cos(angle);
+            hostSin[p * mHeadDim + j] = hostSin[p * mHeadDim + j + half] = std::sin(angle);
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mCos.rawPointer(), hostCos, maxS * mHeadDim * 4, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(mSin.rawPointer(), hostSin, maxS * mHeadDim * 4, cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     mVision.bind("patches", mPatches.rawPointer());
@@ -222,11 +240,21 @@ std::vector<float> MolmoAct2Policy::normalizeState(std::vector<float> const& sta
 std::vector<int32_t> MolmoAct2Policy::promptIds(
     std::string const& task, std::vector<float> const& normalizedState) const
 {
+    // Each image's patch run is spliced in after tokenizing: special tokens never merge with their neighbours, and the
+    // byte-level BPE over hundreds of them would dominate the host time.
     std::string const prompt = robotPrompt(normalizeQuestion(task), stateTokens(normalizedState, mStateBins), mSetup,
-        mControlMode, static_cast<int32_t>(mCameras.size()), mImageTokens);
+        mControlMode, static_cast<int32_t>(mCameras.size()), "<im_start><im_end>");
     auto const ids = mTokenizer->encode(prompt);
     std::vector<int32_t> out{mBos};
-    out.insert(out.end(), ids.begin(), ids.end());
+    out.reserve(ids.size() + mCameras.size() * mImageTokenCount + 1);
+    for (auto const id : ids)
+    {
+        out.push_back(id);
+        if (id == mImageStartId)
+        {
+            out.insert(out.end(), static_cast<size_t>(mImageTokenCount), mImagePatchId);
+        }
+    }
     return out;
 }
 
@@ -273,6 +301,19 @@ MolmoAct2Chunk MolmoAct2Policy::act(std::vector<MolmoAct2View> const& views, std
             [this, it, dst] { siglipPatches(it->rgb, it->height, it->width, mImageSize, mPatch, dst); }));
     }
 
+    for (auto& f : patching)
+    {
+        f.get();
+    }
+    CUDA_CHECK(cudaMemcpyAsync(mPatches.rawPointer(), mPatchesHost.rawPointer(), mPatchesHost.getMemoryCapacity(),
+        cudaMemcpyHostToDevice, mStream));
+    float const patchMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+
+    CUDA_CHECK(cudaEventRecord(mEvents[0], mStream));
+    ELLM_CHECK(mVision.enqueue(mStream), "MolmoAct2Policy: vision engine failed");
+    CUDA_CHECK(cudaEventRecord(mEvents[1], mStream));
+    // The prompt and the initial sample are prepared while the vision engine runs.
+    auto const promptStart = std::chrono::steady_clock::now();
     std::vector<int32_t> const ids = promptIds(task, normalizeState(state));
     auto const sequence = static_cast<int64_t>(ids.size());
     ELLM_CHECK(sequence <= mInputIds.getShape()[0], "MolmoAct2Policy: the prompt exceeds the engines' profile");
@@ -281,28 +322,16 @@ MolmoAct2Chunk MolmoAct2Policy::act(std::vector<MolmoAct2View> const& views, std
     auto* hostIds = reinterpret_cast<int64_t*>(stage);
     auto* hostFlag = reinterpret_cast<__half*>(stage + sequence * 8);
     auto* hostMask = hostFlag + sequence;
-    auto* hostCos = reinterpret_cast<float*>(stage + sequence * 12);
-    auto* hostSin = hostCos + sequence * mHeadDim;
-    int32_t const half = mHeadDim / 2;
     for (int64_t p = 0; p < sequence; ++p)
     {
         hostIds[p] = ids[p];
         hostFlag[p] = __float2half(isImageToken(ids[p]) ? 1.0F : 0.0F);
         // The expert cross-attends to every prompt token except the <|im_end|> ones (BOS and turn ends).
         hostMask[p] = __float2half(ids[p] == mBos ? 0.0F : 1.0F);
-        for (int32_t j = 0; j < half; ++j)
-        {
-            float const invFreq = 1.0F / std::pow(mRopeTheta, static_cast<float>(2 * j) / static_cast<float>(mHeadDim));
-            float const angle = static_cast<float>(p) * invFreq;
-            hostCos[p * mHeadDim + j] = hostCos[p * mHeadDim + j + half] = std::cos(angle);
-            hostSin[p * mHeadDim + j] = hostSin[p * mHeadDim + j + half] = std::sin(angle);
-        }
     }
     CUDA_CHECK(cudaMemcpyAsync(mInputIds.rawPointer(), hostIds, sequence * 8, cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(mImageFlag.rawPointer(), hostFlag, sequence * 2, cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(mEncoderMask.rawPointer(), hostMask, sequence * 2, cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mCos.rawPointer(), hostCos, sequence * mHeadDim * 4, cudaMemcpyHostToDevice, mStream));
-    CUDA_CHECK(cudaMemcpyAsync(mSin.rawPointer(), hostSin, sequence * mHeadDim * 4, cudaMemcpyHostToDevice, mStream));
 
     // Initial sample (padded dims zero; the step graph zeroes them too) and the RTC strengths.
     int64_t const chunkElems = static_cast<int64_t>(mHorizon) * mMaxActionDim;
@@ -341,17 +370,8 @@ MolmoAct2Chunk MolmoAct2Policy::act(std::vector<MolmoAct2View> const& views, std
     CUDA_CHECK(cudaMemcpyAsync(mX[0].rawPointer(), stageX, chunkElems * 2, cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(
         cudaMemcpyAsync(mStrength.rawPointer(), stageX + chunkElems, mHorizon * 2, cudaMemcpyHostToDevice, mStream));
-    for (auto& f : patching)
-    {
-        f.get();
-    }
-    CUDA_CHECK(cudaMemcpyAsync(mPatches.rawPointer(), mPatchesHost.rawPointer(), mPatchesHost.getMemoryCapacity(),
-        cudaMemcpyHostToDevice, mStream));
-    chunk.hostMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
-
-    CUDA_CHECK(cudaEventRecord(mEvents[0], mStream));
-    ELLM_CHECK(mVision.enqueue(mStream), "MolmoAct2Policy: vision engine failed");
-    CUDA_CHECK(cudaEventRecord(mEvents[1], mStream));
+    chunk.hostMs
+        = patchMs + std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - promptStart).count();
     size_t const layerElems = static_cast<size_t>(sequence) * mKvDim;
     mPrefixA.bind("keys", mKeys.rawPointer());
     mPrefixA.bind("values", mValues.rawPointer());

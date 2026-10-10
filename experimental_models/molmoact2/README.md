@@ -28,9 +28,11 @@ causally, and the expert cross-attends to every prompt token but the `<|im_end|>
 [-1, 1] and unnormalized on the masked dims (the gripper is returned as the model gives it).
 
 **What FP16 could not hold.** The projected image features reach 1.7e4 and stay in the language model's residual
-stream, and the pooling attention's unscaled scores reach 8e4: RMSNorm, the language model's QK^T and softmax, and
-the ViT / pooling attention (the official `float32_attention`) run in FP32, everything else in FP16; the FP32
-products are built with `--noTF32`.
+stream, and the pooling attention's unscaled scores reach 8e4: RMSNorm, every softmax and the pooling attention
+run in FP32, the FP32 products built with `--noTF32`. The official model also runs the ViT's attention in FP32
+(`float32_attention`); its scaled scores and the language model's stay below 64, so both compute QK^T in FP16 with
+the scale on Q, which takes a call from 630 to 420 ms (on a shared GPU) at the same action error.
+`export_molmoact2.py --fp32-attention` builds the official precision.
 
 **TensorRT 10.3.** The expert's self-attention reads Q, K and V out of one fused projection viewed as
 [B, S, 3, H, D], then applies per-head RMSNorm and RoPE. TensorRT 10.3 miscomputes that pattern in FP16 (the
@@ -46,26 +48,27 @@ per-step modulations depend only on the step's time, so they are precomputed int
 AGX Orin 64 GB, JetPack 6.2, against the official LeRobot policy in FP32 (CPU), two LIBERO observations with
 instructions of 17 and 3 words (497 and 482 prompt tokens), the same initial noise:
 
-| Stage | Relative error |
-|---|---|
-| Visual features (from the official `pixel_values`) | 0.13% |
-| Language-model K / V, chained | 0.4% / 1.3% |
-| Normalized chunk, context and steps on the official K / V, max \|Δ\| | 0.0008 / 0.0011 |
-| Normalized chunk, chained, max \|Δ\| | 0.0030 / 0.0017 |
-| `molmoact2_policy_server` actions from raw frames, max \|Δ\| | 0.0014 / 0.0016 |
+| Stage | FP16 QK^T (default) | `--fp32-attention` |
+|---|---|---|
+| Visual features (from the official `pixel_values`) | 0.10% / 0.27% | 0.13% / 0.14% |
+| Language-model K / V, chained | 0.7% / 2.0-2.2% | 0.4% / 1.3% |
+| Normalized chunk, context and steps on the official K / V, max \|Δ\| | 0.0008 / 0.0011 | 0.0008 / 0.0011 |
+| Normalized chunk, chained, max \|Δ\| | 0.0021 / 0.0020 | 0.0030 / 0.0017 |
+| `molmoact2_policy_server` actions from raw frames, max \|Δ\| | 0.0014 / 0.0020 | 0.0014 / 0.0016 |
 
 Inline frames give bit-identical actions to the same images by path; with and without the CUDA graph the actions
-are identical. A call takes about 560 ms on an idle board (median of 20 on a LIBERO observation): vision 143 ms,
-language model 260-280 ms, 10 expert steps 90 ms, host preprocessing 27 ms.
+are identical. A call takes about 410 ms (median of 20 on a LIBERO observation, with the desktop drawing about 20%
+of the GPU): vision 79 ms, language model and expert context 200 ms, 10 expert steps 108 ms, host 6 ms. The host
+splices each image's patch tokens in after tokenizing and prepares the prompt while the vision engine runs.
 
-**Control rate.** `replay_robot.py` over TCP with raw frames at 4 Hz (`overlap=5, frozen=4`, 60 ticks): call
-median 544 ms, planner lag 3 ticks, no stalls, switch jump 0.0000 with RTC and 1.95 without. LIBERO's 20 Hz would
+**Control rate.** `replay_robot.py` over TCP with raw frames at 5 Hz (`overlap=5, frozen=4`, 60 ticks): call
+median 399 ms, planner lag 2-3 ticks, no stalls, switch jump 0.0000 with RTC and 1.96 without. LIBERO's 20 Hz would
 need a call under about 250 ms with one request in flight (a 10-row chunk lasts 500 ms), which this model does not
 reach on Orin.
 
 LIBERO-Spatial, 10 tasks x 10 episodes, this harness's protocol (fixed initial states, 10 settle steps, 280 steps,
 256 x 256 renders) with the checkpoint's conventions (both views flipped, 10 of 10 rows per call, gripper as
-returned): **100%** (100 of 100). The checkpoint reports 98.4% over 50 episodes per task with LeRobot's `lerobot-eval`
+returned): **99%** (99 of 100; task 5 failed once at the step limit), and 100% with `--fp32-attention`. The checkpoint reports 98.4% over 50 episodes per task with LeRobot's `lerobot-eval`
 (per-episode seeds from 1000).
 
 ```bash
