@@ -198,6 +198,9 @@ class AsyncChunkedController:
         if self.scheme is None or self._last_plan_tick < 0:
             return None
         start_row = int(tick - self._last_plan_tick)
+        if start_row >= self.rows:
+            # The planner fell behind the whole chunk: nothing is left to continue from.
+            return None
         if self.scheme == "overlap_frozen":
             return {
                 "overlap": self.overlap,

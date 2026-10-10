@@ -279,6 +279,8 @@ class SmolvlaAdapter:
     as cameras image / image2, state [eef pos, axis-angle, gripper qpos], actions sent to LIBERO as returned."""
 
     control_mode = "relative"
+    cameras = (("image", "agentview_image"), ("image2",
+                                              "robot0_eye_in_hand_image"))
 
     def __init__(self, server, rows):
         self.server = server
@@ -291,8 +293,7 @@ class SmolvlaAdapter:
 
     def act(self, obs, instruction):
         cameras = {}
-        for key, cam in (("image", "agentview_image"),
-                         ("image2", "robot0_eye_in_hand_image")):
+        for key, cam in self.cameras:
             path = os.path.join(self.tmp, f"{key}.png")
             cv2.imwrite(
                 path,
@@ -350,6 +351,14 @@ class TurbovlaAdapter:
         })
         self.first = False
         return np.asarray(reply["actions"], dtype=np.float64)[:self.rows, :7]
+
+
+class Molmoact2Adapter(SmolvlaAdapter):
+    """molmoact2_policy_server with LeRobot's LIBERO processing, as SmolvlaAdapter's but with the checkpoint's
+    cameras image / wrist_image."""
+
+    cameras = (("image", "agentview_image"), ("wrist_image",
+                                              "robot0_eye_in_hand_image"))
 
 
 class RldxAdapter:
@@ -497,6 +506,8 @@ POLICIES = {
     lambda server, rows: TurbovlaAdapter(server, rows=rows or 12),
     "rldx":
     lambda server, rows: RldxAdapter(server, rows=rows or 8),
+    "molmoact2":
+    lambda server, rows: Molmoact2Adapter(server, rows=rows or 10),
     "openvla":
     lambda server, rows: OpenvlaAdapter(server, rows=1),
 }

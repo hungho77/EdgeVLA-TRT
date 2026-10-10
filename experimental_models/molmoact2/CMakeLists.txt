@@ -12,8 +12,9 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under
 # the License.
-add_library(molmoact2Experimental STATIC cpp/molmoact2Image.cpp
-                                         cpp/molmoact2Text.cpp)
+add_library(
+  molmoact2Experimental STATIC cpp/molmoact2Image.cpp cpp/molmoact2Policy.cpp
+                               cpp/molmoact2Text.cpp)
 target_include_directories(
   molmoact2Experimental
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cpp
@@ -22,7 +23,8 @@ target_include_directories(
 target_link_libraries(molmoact2Experimental PUBLIC vlaExperimental)
 set_property(TARGET molmoact2Experimental PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-foreach(example molmoact2_image_dump molmoact2_prompt_dump)
+foreach(example molmoact2_image_dump molmoact2_policy_server
+                molmoact2_prompt_dump)
   add_executable(${example} examples/${example}.cpp)
   target_include_directories(${example} PRIVATE ${CMAKE_SOURCE_DIR}/cpp
                                                 ${COMMON_INCLUDE_DIRS})

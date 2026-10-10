@@ -75,7 +75,7 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 [`scripts/libero_eval.py`](scripts/libero_eval.py) measures a policy's LIBERO success rate in simulation. The model
 runs in its C++ policy server (one JSON request per line: `gr00t_policy_server`, `pi05_policy_server`,
 `smolvla_policy_server`, `xvla_policy_server`, `turbovla_policy_server`, `rldx_policy_server`,
-`openvla_policy_server`), started as a subprocess, so the simulator
+`molmoact2_policy_server`, `openvla_policy_server`), started as a subprocess, so the simulator
 side needs only a LIBERO Python environment (robosuite 1.4 with mujoco 2.3, `MUJOCO_GL=egl`) and no TensorRT.
 
 Protocol: LIBERO's fixed initial states (episode *i* of a task uses init state *i*), 10 no-op steps for the objects
@@ -92,6 +92,7 @@ own LIBERO evaluation script, because these conventions move the success rate by
 | `xvla` | `lerobot/xvla-libero` | LeRobot `make_xvla_libero_pre_post_processors` | agent view flipped only | eef pos, rot6d of the controller orientation, 0, padded to 20 | 30 of 30 | `> 0.5` | 280, absolute control |
 | `turbovla` | `H-EmbodVis/TurboVLA` (`checkpoints/libero`, all four suites) | TurboVLA's VLA-Adapter-derived rollout | both flipped | as pi0.5 | 12 of 12 | as returned (+-1) | 220 |
 | `rldx` | `RLWRLD/RLDX-1-FT-LIBERO` (`general_embodiment`, all four suites) | RLDX-1 `run_scripts/eval/libero` | both flipped, frames t-6 / t-4 / t-2 / t | as pi0.5 | 8 of 16 | `sign(2 g - 1)` of gripper_close | 220 |
+| `molmoact2` | `allenai/MolmoAct2-LIBERO-LeRobot` (all four suites, continuous actions) | LeRobot `LiberoProcessorStep` (`lerobot-eval`) | both flipped | as pi0.5 | 10 of 10 (its `n_action_steps`) | as returned | 280 |
 | `openvla` | `openvla/openvla-7b-finetuned-libero-spatial` | OpenVLA `run_libero_eval.py` | agent view flipped, JPEG round trip, Lanczos to 224, 90% centre crop | none | 1 | binarized, inverted | 220 |
 
 OpenVLA's TensorFlow image steps are reproduced with OpenCV, Pillow and NumPy (`tf.image.crop_and_resize` exactly;
@@ -109,6 +110,7 @@ LIBERO-Spatial, 10 tasks x 10 episodes, AGX Orin 64 GB, JetPack 6.2, FP16 engine
 | X-VLA | 98.0% | 98.2% (X-VLA paper) |
 | TurboVLA | 95.0% | 97.0% (TurboVLA paper, 500 episodes) |
 | RLDX-1 | 97.0% | 98.6% LIBERO-Short, the Spatial / Object / Goal average (RLDX-1 paper; random resets, 720 steps) |
+| MolmoAct2 | 100.0% | 98.4% (model card, LeRobot implementation, 50 episodes per task) |
 | OpenVLA | 85.0% | 84.7% (OpenVLA paper) |
 
 SmolVLA's engines match LeRobot on a LIBERO observation (robot actions max |Δ| 0.013 on a ±1 range, identical
@@ -133,7 +135,8 @@ run or override the rows executed per call.
 
 Every VLA family has a policy server a robot can drive directly: `gr00t_policy_server` (N1.5 / N1.6 / N1.7),
 `pi05_policy_server`, `smolvla_policy_server`, `xvla_policy_server`, `turbovla_policy_server`,
-`rldx_policy_server`, `openvla_policy_server`, and `internvla_n1_dual_system_server` for navigation. They share one transport
+`rldx_policy_server`, `molmoact2_policy_server`, `openvla_policy_server`, and `internvla_n1_dual_system_server`
+for navigation. They share one transport
 ([`cpp/vlaServer.h`](cpp/vlaServer.h)):
 
 - **stdin / stdout by default**, or **TCP** with `--port N` (bound to 127.0.0.1; `--host 0.0.0.0` for the LAN). TCP
@@ -181,6 +184,7 @@ hardware.
 | X-VLA | the checkpoint's camera names | proprio, zero-padded to 20 | ee6d absolute targets: position, rot6d, gripper through a sigmoid | chunk (30) | delay / horizon |
 | RLDX-1 | `front_view`, `left_wrist_view`, each with `@-6`, `@-4`, `@-2` | eef position, axis-angle, gripper qpos (LIBERO) | eef position / rotation deltas and gripper_close, unnormalized | chunk (16) | overlap / frozen (GR00T's) |
 | TurboVLA | `primary`, `wrist` | the checkpoint's (LIBERO: eef pos, axis-angle, gripper qpos) | environment actions: arm deltas unnormalized, gripper +1 / -1 | chunk (12) | overlap / frozen, by blending the new chunk with the previous one (no denoising to inpaint) |
+| MolmoAct2 | the checkpoint's (LIBERO: `image`, `wrist_image`) | the checkpoint's (LIBERO: eef pos, axis-angle, gripper qpos) | the checkpoint's actions, unnormalized on the masked dims (LIBERO: deltas, gripper in [-1, 1]) | chunk (10) | overlap / frozen (GR00T's) |
 | OpenVLA | `image` (third-person) | none | one unnormalized end-effector delta and gripper, per the `unnorm_key` dataset | 1 | none |
 
 Verified by replay and in LIBERO over TCP, not on hardware. AGX Orin, SO101 dataset frames at 30 Hz wall clock
