@@ -243,6 +243,7 @@ the Orin's LAN address:
 |---|---|---|---|
 | [`twanghcmut/SmolVLA-SO101-LeftArm-Multitask`](https://huggingface.co/twanghcmut/SmolVLA-SO101-LeftArm-Multitask) | cosine 0.999998, max \|Δ\| 0.17-0.23 on a ±100 range; identical token ids | 68 ms | 79 ms per call, lag 3 ticks, no stalls; switch jump 0.0000 with RTC, 54 without |
 | [`quangnd58/smolvla-so101-left-arm-11tasks`](https://huggingface.co/quangnd58/smolvla-so101-left-arm-11tasks) | cosine 0.999997, max \|Δ\| 0.24-0.35 on a ±98 range; identical token ids | 68 ms | 86 ms per call, lag 3 ticks, no stalls; switch jump 0.0000 with RTC, 61 without |
+| [`twanghcmut/TurboVLA-SO101-LeftArm-Multitask`](https://huggingface.co/twanghcmut/TurboVLA-SO101-LeftArm-Multitask) | max \|Δ\| 0.08-0.11 on a ±98 range (the official bf16 vs FP32: 0.27-0.31); open loop 1.55 (card 1.53) | 31 ms | |
 | [`twanghcmut/pi05-so101-left-arm-multitask`](https://huggingface.co/twanghcmut/pi05-so101-left-arm-multitask) | cosine 0.99999, max \|Δ\| 0.32-0.83 on a ±95 range (openpi's own bf16 vs FP32: 0.16-0.28) | 265 ms | 278 ms per call, lag 8-12 ticks, no stalls; switch jump 0.0000 within 12 frozen rows (8.6 at the one switch that landed later), 55 without |
 
 Pass the tasks verbatim from the model cards, trailing periods included. A closed SO101 gripper can read below

@@ -86,12 +86,86 @@ Coefficients pilCoefficients(int32_t inSize, int32_t outSize)
     return c;
 }
 
+//! Triangle-filter weights for one axis, normalized per output position: row o holds the weights of the inputs
+//! [first[o], first[o] + count[o]).
+struct FloatCoefficients
+{
+    std::vector<int32_t> first, count;
+    std::vector<std::vector<double>> weights;
+};
+
+FloatCoefficients triangleCoefficients(int32_t inSize, int32_t outSize)
+{
+    double const scale = static_cast<double>(inSize) / outSize;
+    double const filterScale = std::max(scale, 1.0);
+    double const support = filterScale;
+    FloatCoefficients c;
+    for (int32_t o = 0; o < outSize; ++o)
+    {
+        double const center = (o + 0.5) * scale;
+        int32_t const lo = std::max(static_cast<int32_t>(center - support + 0.5), 0);
+        int32_t const hi = std::min(static_cast<int32_t>(center + support + 0.5), inSize);
+        std::vector<double> w;
+        double sum = 0.0;
+        for (int32_t x = lo; x < hi; ++x)
+        {
+            w.push_back(std::max(0.0, 1.0 - std::abs((x - center + 0.5) / filterScale)));
+            sum += w.back();
+        }
+        for (double& v : w)
+        {
+            v = sum != 0.0 ? v / sum : v;
+        }
+        c.first.push_back(lo);
+        c.count.push_back(hi - lo);
+        c.weights.push_back(std::move(w));
+    }
+    return c;
+}
+
 inline unsigned char clip8(int32_t value)
 {
     return static_cast<unsigned char>(std::clamp(value >> kPrecisionBits, 0, 255));
 }
 
 } // namespace
+
+std::vector<float> resizeBilinearAntialias(
+    unsigned char const* rgb, int32_t height, int32_t width, int32_t outHeight, int32_t outWidth)
+{
+    FloatCoefficients const cx = triangleCoefficients(width, outWidth);
+    FloatCoefficients const cy = triangleCoefficients(height, outHeight);
+    std::vector<double> horizontal(static_cast<size_t>(height) * outWidth * 3);
+    for (int32_t y = 0; y < height; ++y)
+    {
+        for (int32_t xx = 0; xx < outWidth; ++xx)
+        {
+            for (int32_t ch = 0; ch < 3; ++ch)
+            {
+                double sum = 0.0;
+                for (int32_t x = 0; x < cx.count[xx]; ++x)
+                {
+                    sum += rgb[(static_cast<size_t>(y) * width + cx.first[xx] + x) * 3 + ch] * cx.weights[xx][x];
+                }
+                horizontal[(static_cast<size_t>(y) * outWidth + xx) * 3 + ch] = sum;
+            }
+        }
+    }
+    std::vector<float> out(static_cast<size_t>(outHeight) * outWidth * 3);
+    for (int32_t yy = 0; yy < outHeight; ++yy)
+    {
+        for (int32_t x = 0; x < outWidth * 3; ++x)
+        {
+            double sum = 0.0;
+            for (int32_t y = 0; y < cy.count[yy]; ++y)
+            {
+                sum += horizontal[static_cast<size_t>(cy.first[yy] + y) * outWidth * 3 + x] * cy.weights[yy][y];
+            }
+            out[static_cast<size_t>(yy) * outWidth * 3 + x] = static_cast<float>(sum);
+        }
+    }
+    return out;
+}
 
 std::vector<unsigned char> resizeBicubicPil(
     unsigned char const* rgb, int32_t height, int32_t width, int32_t outHeight, int32_t outWidth)
