@@ -245,6 +245,7 @@ public:
     {
         mPreviousNormalized.clear();
         mPreviousRobot.clear();
+        mStateBelowRangeWarned.clear();
     }
 
     //! \brief Run already-canonical tensors, skipping the observation adapters.
@@ -368,8 +369,9 @@ private:
     std::vector<std::vector<float>> mPlanarViews; //!< each view's resized CHW float buffer, reused per request
     std::string mLastPrompt;                      //!< the prompt mLastTokenIds was tokenized from
     std::vector<int32_t> mLastTokenIds;
-    std::vector<float> mPreviousNormalized; //!< last chunk, [horizon, modelActionDim], for RTC
-    std::vector<float> mPreviousRobot;      //!< last chunk in robot units, [horizon, robotActionDim]
+    std::vector<float> mPreviousNormalized;           //!< last chunk, [horizon, modelActionDim], for RTC
+    std::vector<float> mPreviousRobot;                //!< last chunk in robot units, [horizon, robotActionDim]
+    mutable std::vector<bool> mStateBelowRangeWarned; //!< per state dim, this episode
 };
 
 //! \brief The contract's camera order on one line, for help text and diagnostics.
