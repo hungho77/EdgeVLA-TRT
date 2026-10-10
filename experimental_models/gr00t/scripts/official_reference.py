@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Official GR00T N1.5 / N1.6 reference for one raw dataset observation.
+"""Official GR00T N1.5 / N1.6 / N1.7 reference for one raw dataset observation.
 
 Runs the GR00T source tree's own ``Gr00tPolicy`` on the CPU from a seeded x_0, in FP32 (the
 policy's bf16 weights, FP32 activations) or with --bf16 as the policy serves (the precision floor), and
@@ -24,13 +24,20 @@ prediction and the absolute actions.
         --modality-config GR00T-N1.6-SO101-Multitask/so101_config.py --dataset so101-multitask \\
         --frame 300 --eager-attention --out ref_f300.npz
 
+N1.7 checkpoints take the N1.7 source tree and the same policy API as N1.6. Some fine-tunes record the fine-tuner's
+local path of the VLM as ``model_name``; --base-model names the VLM to load instead (e.g. nvidia/Cosmos-Reason2-2B),
+through a temporary view of the checkpoint (weights linked, configs rewritten) that leaves the checkpoint untouched.
+
 N1.5 checkpoints take the N1.5 source tree and policy API: pass --n15-data-config with the data config the
 checkpoint was fine-tuned with (e.g. so100_dualcam); its video keys are fed the dataset cameras in --video-keys
 order.
 """
 
 import argparse
+import json
+import os
 import sys
+import tempfile
 
 import numpy as np
 
@@ -53,6 +60,29 @@ def load_frame(dataset, frame, video_keys):
                        dtype=np.float32)
     tasks = pd.read_parquet(f"{dataset}/meta/tasks.parquet")
     return frames, state, tasks.index[int(table["task_index"].iloc[frame])]
+
+
+def checkpoint_view(checkpoint, base_model, out):
+    """``checkpoint`` as seen from ``out``, with its recorded ``model_name`` replaced by ``base_model`` in every
+    config file; other files are linked."""
+    recorded = json.load(open(os.path.join(checkpoint,
+                                           "config.json")))["model_name"]
+    for root, _, files in os.walk(checkpoint):
+        target = os.path.join(out, os.path.relpath(root, checkpoint))
+        os.makedirs(target, exist_ok=True)
+        for name in files:
+            src = os.path.join(root, name)
+            dst = os.path.join(target, name)
+            if name.endswith(
+                (".json", ".yaml")) and os.path.getsize(src) < (64 << 20):
+                with open(src) as f:
+                    text = f.read()
+                if recorded in text:
+                    with open(dst, "w") as f:
+                        f.write(text.replace(recorded, base_model))
+                    continue
+            os.symlink(os.path.abspath(src), dst)
+    return out
 
 
 def _packed_eager(eager):
@@ -91,6 +121,11 @@ def main():
         "--modality-config",
         help="python file that registers the embodiment's modality config")
     parser.add_argument("--embodiment", default="new_embodiment")
+    parser.add_argument(
+        "--base-model",
+        help=
+        "the VLM to load in place of the checkpoint's recorded model_name (N1.7)"
+    )
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--frame", type=int, default=300)
     parser.add_argument("--video-keys", nargs="+", default=["top", "wrist"])
@@ -121,6 +156,11 @@ def main():
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     n15 = args.n15_data_config is not None
+    checkpoint = args.checkpoint
+    if args.base_model:
+        view = tempfile.TemporaryDirectory(prefix="gr00t_ckpt_")
+        checkpoint = checkpoint_view(args.checkpoint, args.base_model,
+                                     view.name)
 
     sys.path.insert(0, args.gr00t_src)
     from unittest import mock
@@ -151,14 +191,14 @@ def main():
             GR00TTransform._prepare_language = lambda self, data: str(
                 np.asarray(prepare_language(self, data)).reshape(-1)[0])
         data_config = load_data_config(args.n15_data_config)
-        policy = gr00t_policy.Gr00tPolicy(args.checkpoint,
+        policy = gr00t_policy.Gr00tPolicy(checkpoint,
                                           args.embodiment,
                                           data_config.modality_config(),
                                           data_config.transform(),
                                           device="cpu")
     else:
         policy = gr00t_policy.Gr00tPolicy(EmbodimentTag(args.embodiment),
-                                          args.checkpoint,
+                                          checkpoint,
                                           device="cpu")
     if not args.bf16:
         policy.model.float()
