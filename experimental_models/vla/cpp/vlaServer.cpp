@@ -26,7 +26,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -158,6 +160,7 @@ std::string argOf(int argc, char** argv, char const* flag, std::string const& fa
 PolicyServer::PolicyServer(int argc, char** argv)
     : mPort(std::stoi(argOf(argc, argv, "--port", "0")))
     , mHost(argOf(argc, argv, "--host", "127.0.0.1"))
+    , mTimingEvery(std::stoi(argOf(argc, argv, "--timingEvery", "20")))
 {
 }
 
@@ -173,6 +176,11 @@ void PolicyServer::serveSession(Stream& stream, Json const& ready, Handler const
         {
             return;
         }
+        auto const start = std::chrono::steady_clock::now();
+        auto const msSince = [](std::chrono::steady_clock::time_point t) {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+        };
+        double receiveMs = 0.0;
         Json reply;
         try
         {
@@ -192,14 +200,68 @@ void PolicyServer::serveSession(Stream& stream, Json const& ready, Handler const
                 request.frames.push_back(NamedFrame{frame.value("name", std::to_string(request.frames.size())),
                     rt::imageUtils::ImageData(std::move(pixels))});
             }
+            receiveMs = msSince(start);
             reply = handle(request);
         }
         catch (std::exception const& e)
         {
             reply = {{"error", e.what()}};
         }
+        if (reply.contains("timing_ms") && reply["timing_ms"].is_object())
+        {
+            reply["timing_ms"]["receive"] = receiveMs;
+            reply["timing_ms"]["server"] = msSince(start);
+            recordTiming(reply["timing_ms"]);
+        }
         stream.writeLine(reply.dump());
     }
+}
+
+void PolicyServer::recordTiming(Json const& timing)
+{
+    if (mTimingEvery <= 0)
+    {
+        return;
+    }
+    for (auto const& [key, value] : timing.items())
+    {
+        if (value.is_number())
+        {
+            mTimings[key].push_back(value.get<double>());
+        }
+    }
+    auto const count = mTimings.count("server") ? mTimings["server"].size() : 0;
+    if (count < static_cast<size_t>(mTimingEvery))
+    {
+        return;
+    }
+    // The pipeline's stages first, then whatever else a family reports.
+    std::vector<std::string> order{"server", "receive", "total", "host", "vision", "llm", "action"};
+    for (auto const& [key, values] : mTimings)
+    {
+        if (std::find(order.begin(), order.end(), key) == order.end())
+        {
+            order.push_back(key);
+        }
+    }
+    std::string line = "vla server: timing over " + std::to_string(count) + " requests, ms p50 (p95):";
+    for (auto const& key : order)
+    {
+        auto it = mTimings.find(key);
+        if (it == mTimings.end() || it->second.empty())
+        {
+            continue;
+        }
+        std::vector<double>& v = it->second;
+        std::sort(v.begin(), v.end());
+        auto const at = [&v](double q) { return v[static_cast<size_t>(q * static_cast<double>(v.size() - 1))]; };
+        char buffer[96];
+        std::snprintf(buffer, sizeof(buffer), " %s %.1f (%.1f)", key.c_str(), at(0.5), at(0.95));
+        line += buffer;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    std::fflush(stderr);
+    mTimings.clear();
 }
 
 void PolicyServer::run(Json const& ready, Handler const& handle, std::function<void()> const& onSessionStart)

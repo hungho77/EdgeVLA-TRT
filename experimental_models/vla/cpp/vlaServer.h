@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -69,6 +70,9 @@ public:
 
     //! Serve until stdin closes (stdio) or forever (TCP). \p ready is sent when a session starts, after
     //! \p onSessionStart (e.g. a policy's episode reset). A handler exception becomes an {"error"} reply.
+    //! Each reply's "timing_ms" gains "receive" (reading the request and its frames) and "server" (request line
+    //! read to reply ready); every --timingEvery replies (default 20, 0: never) the median and p95 of each
+    //! timing over those replies go to stderr.
     void run(nlohmann::json const& ready, Handler const& handle, std::function<void()> const& onSessionStart = {});
 
     bool tcp() const noexcept
@@ -79,9 +83,12 @@ public:
 private:
     class Stream;
     void serveSession(Stream& stream, nlohmann::json const& ready, Handler const& handle);
+    void recordTiming(nlohmann::json const& timing);
 
     int32_t mPort{0};
     std::string mHost{"127.0.0.1"};
+    int32_t mTimingEvery{20};
+    std::map<std::string, std::vector<double>> mTimings; //!< per key, the replies since the last report
 };
 
 //! The request's frames by name: the inline frames, or else the image files a path field names. \p pathsKey is

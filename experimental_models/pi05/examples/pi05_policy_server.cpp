@@ -122,7 +122,10 @@ int main(int argc, char** argv)
             }
             Json reply;
             reply["actions"] = rows;
-            reply["timing_ms"] = {{"engines", chunk.timings.engineMs}, {"total", chunk.timings.policyMs}};
+            auto const& stages = chunk.timings.stages;
+            reply["timing_ms"] = {{"host", chunk.timings.observation.totalMs}, {"vision", stages.visualMs},
+                {"llm", stages.assembleMs + stages.prefixMs}, {"action", stages.actionMs},
+                {"engines", chunk.timings.engineMs}, {"total", chunk.timings.policyMs}};
             return reply;
         },
         [&] { policy.resetEpisode(); });
