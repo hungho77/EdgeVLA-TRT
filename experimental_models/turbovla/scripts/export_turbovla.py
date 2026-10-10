@@ -97,6 +97,55 @@ class Policy(nn.Module):
         return model.action_head(torch.cat([visual, text], dim=1), state)
 
 
+def length_free_attention(model):
+    """Every nn.MultiheadAttention written so the text length stays a graph dimension (the text layers attend over
+    the text, the action head over the visual, text and state tokens): the legacy exporter records
+    F.multi_head_attention_forward's reshapes with the example length. Separate Q / K / V projections and the scale
+    on Q (TensorRT 10.3 miscomputes a scaled K split out of a fused projection)."""
+    for module in model.modules():
+        if not isinstance(module, nn.MultiheadAttention):
+            continue
+
+        def forward(query,
+                    key,
+                    value,
+                    attn_mask=None,
+                    key_padding_mask=None,
+                    need_weights=True,
+                    mha=module,
+                    **kw):
+            if mha.batch_first:
+                query, key, value = (t.transpose(0, 1)
+                                     for t in (query, key, value))
+            embed, heads = mha.embed_dim, mha.num_heads
+            head_dim = embed // heads
+            w, b = mha.in_proj_weight, mha.in_proj_bias
+            q = nn.functional.linear(query, w[:embed],
+                                     b[:embed]) * head_dim**-0.5
+            k = nn.functional.linear(key, w[embed:2 * embed],
+                                     b[embed:2 * embed])
+            v = nn.functional.linear(value, w[2 * embed:], b[2 * embed:])
+            batch_heads = query.shape[1] * heads
+            q, k, v = (t.reshape(-1, batch_heads, head_dim).transpose(0, 1)
+                       for t in (q, k, v))
+            scores = torch.matmul(q, k.transpose(1, 2))
+            if attn_mask is not None:
+                scores = scores.masked_fill(attn_mask, float("-inf")) if attn_mask.dtype == torch.bool \
+                    else scores + attn_mask
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(
+                    key_padding_mask.repeat_interleave(heads, 0)[:, None, :],
+                    float("-inf"))
+            out = mha.out_proj(
+                torch.matmul(scores.softmax(-1),
+                             v).transpose(0,
+                                          1).reshape(-1, query.shape[1],
+                                                     embed))
+            return (out.transpose(0, 1) if mha.batch_first else out), None
+
+        module.forward = forward
+
+
 def freeze_rope(model, size):
     """DINOv3's RoPE cos / sin depend only on the image size; computed once in FP32 (as the module does) they replace
     the coordinate arithmetic, whose shape-dependent branch TensorRT cannot parse."""
@@ -142,8 +191,9 @@ def text_inputs(ref, i, length, dtype):
     self_attention[0, :own, :own] = torch.from_numpy(
         ref[f"self_attention_{i}"][0].astype(np.float32))
     hidden_valid[0, :own] = 1
-    attention = torch.from_numpy(
-        (~ref[f"key_padding_{i}"]).astype(np.float32)).to(dtype)
+    valid = (~ref[f"key_padding_{i}"][0]).astype(np.float32)
+    attention = torch.zeros(1, length, dtype=dtype)
+    attention[0, :valid.shape[0]] = torch.from_numpy(valid)
     return ids, positions, self_attention, hidden_valid, attention
 
 
@@ -184,6 +234,9 @@ def main():
         "--check",
         help="turbovla_reference.py output: compare the split graphs first")
     parser.add_argument("--obs", help="the observations --check was made from")
+    parser.add_argument(
+        "--embodiment",
+        help="starVLA runs: the statistics key (default: the only one)")
     parser.add_argument("--check-dtype",
                         default="float32",
                         choices=("float32", "float16"))
@@ -200,6 +253,10 @@ def main():
     text, graph = Text(model).eval(), Policy(model).eval()
 
     if args.check:
+        if not hasattr(policy, "_build_batch"):
+            raise SystemExit(
+                "--check compares the released LIBERO checkpoint; check a starVLA run with "
+                "run_turbovla_engines.py instead")
         dtype = getattr(torch, args.check_dtype)
         check(policy, text.to(dtype), graph.to(dtype), args.check, args.obs,
               length, dtype, args.device)
@@ -213,35 +270,75 @@ def main():
         fp32_attention_scores(model)
         f16 = torch.float16
         hidden = int(config.interaction.hidden_dim)
-        export = lambda m, a, name, i, o: torch.onnx.export(
+        # An instruction padded to the longest of its batch keeps its own token count at batch 1, and the action head
+        # attends to every text token, padding included: such a run's graphs take the instruction's length.
+        longest = config.text.padding_length is None and not config.text.padding_length_by_instruction
+        text_axes = {
+            "input_ids": {
+                1: "length"
+            },
+            "position_ids": {
+                1: "length"
+            },
+            "self_attention": {
+                1: "length",
+                2: "length"
+            },
+            "hidden_valid": {
+                1: "length"
+            },
+            "attention": {
+                1: "length"
+            },
+            "text_tokens": {
+                1: "length"
+            },
+        } if longest else None
+        policy_axes = {
+            "text_tokens": {
+                1: "length"
+            },
+            "attention": {
+                1: "length"
+            },
+            "self_attention": {
+                1: "length",
+                2: "length"
+            },
+        } if longest else None
+        example = min(length, 32) if longest else length
+        if longest:
+            length_free_attention(model)
+        export = lambda m, a, name, i, o, axes: torch.onnx.export(
             m,
             a,
             os.path.join(args.out, f"{name}.onnx"),
             input_names=i,
             output_names=o,
+            dynamic_axes=axes,
             opset_version=17,
             dynamo=False)
         # The text graph runs once per instruction (the runtime caches its output), so it keeps FP32 weights and
         # math behind FP16 inputs and outputs; it is exported before the shared model goes to FP16.
         # Distinct example tensors: the exporter merges inputs that are the same object.
-        export(text, (torch.zeros(
-            1, length, dtype=torch.int64), torch.arange(length)[None].clone(),
-                      torch.eye(length, dtype=f16)[None].clone(),
-                      torch.ones(1, length, dtype=f16),
-                      torch.ones(1, length, dtype=f16) * 0.5), "text", [
+        export(text, (torch.zeros(1, example, dtype=torch.int64),
+                      torch.arange(example)[None].clone(),
+                      torch.eye(example, dtype=f16)[None].clone(),
+                      torch.ones(1, example, dtype=f16),
+                      torch.ones(1, example, dtype=f16) * 0.5), "text", [
                           "input_ids", "position_ids", "self_attention",
                           "hidden_valid", "attention"
-                      ], ["text_tokens"])
+                      ], ["text_tokens"], text_axes)
         graph = graph.half()
         export(
             graph, (torch.randn(1, views, 3, size, size, dtype=f16),
-                    torch.randn(1, length, hidden,
-                                dtype=f16), torch.ones(1, length, dtype=f16),
-                    torch.eye(length, dtype=f16)[None].clone(),
+                    torch.randn(1, example, hidden,
+                                dtype=f16), torch.ones(1, example, dtype=f16),
+                    torch.eye(example, dtype=f16)[None].clone(),
                     torch.randn(1, int(config.action.state_dim), dtype=f16)),
             "policy",
             ["pixels", "text_tokens", "attention", "self_attention", "state"],
-            ["actions"])
+            ["actions"], policy_axes)
         rewrites = {
             name:
             apply_trt103_workarounds(os.path.join(args.out, f"{name}.onnx"))
@@ -260,44 +357,49 @@ def stage_runtime_assets(args, policy, length):
                 os.path.join(args.out, "tokenizer.json"))
     preprocessor = json.load(
         open(os.path.join(args.dinov3, "preprocessor_config.json")))
-    json.dump(
-        {
-            "model_family":
-            "turbovla",
-            "cameras": ["primary", "wrist"],
-            "num_views":
-            int(config.vision.num_views),
-            "image_size":
-            int(config.vision.image_size),
-            "image_mean":
-            preprocessor.get("image_mean", [0.485, 0.456, 0.406]),
-            "image_std":
-            preprocessor.get("image_std", [0.229, 0.224, 0.225]),
-            "text_length":
-            length,
-            "text_length_by_instruction":
-            dict(config.text.padding_length_by_instruction),
-            "split_tokens":
-            [int(t) for t in policy.model.text_encoder.special_tokens],
-            "hidden_dim":
-            int(config.interaction.hidden_dim),
-            "chunk_size":
-            int(config.action.horizon),
-            "action_dim":
-            int(config.action.action_dim),
-            "state_dim":
-            int(config.action.state_dim),
-            "state_mean": [float(v) for v in policy.proprio_mean],
-            "state_std": [float(v) for v in policy.proprio_std],
-            "action_min": [float(v) for v in policy.action_min],
-            "action_max": [float(v) for v in policy.action_max],
-            "binary_gripper_index":
-            int(config.action.action_dim) - 1,
-            "tokenizer_lowercase":
-            bool(getattr(tokenizer, "do_lower_case", True)),
-        },
-        open(os.path.join(args.out, "config.json"), "w"),
-        indent=1)
+    config_json = {
+        "model_family":
+        "turbovla",
+        "cameras": ["primary", "wrist"],
+        "num_views":
+        int(config.vision.num_views),
+        "image_size":
+        int(config.vision.image_size),
+        "image_mean":
+        preprocessor.get("image_mean", [0.485, 0.456, 0.406]),
+        "image_std":
+        preprocessor.get("image_std", [0.229, 0.224, 0.225]),
+        "text_length":
+        length,
+        "text_length_by_instruction":
+        dict(config.text.padding_length_by_instruction),
+        "split_tokens":
+        [int(t) for t in policy.model.text_encoder.special_tokens],
+        "hidden_dim":
+        int(config.interaction.hidden_dim),
+        "chunk_size":
+        int(config.action.horizon),
+        "action_dim":
+        int(config.action.action_dim),
+        "state_dim":
+        int(config.action.state_dim),
+        "state_mean": [float(v) for v in policy.proprio_mean],
+        "state_std": [float(v) for v in policy.proprio_std],
+        "action_min": [float(v) for v in policy.action_min],
+        "action_max": [float(v) for v in policy.action_max],
+        "binary_gripper_index":
+        int(config.action.action_dim) - 1,
+        "tokenizer_lowercase":
+        bool(getattr(tokenizer, "do_lower_case", True)),
+    }
+    if config.text.padding_length is None and not config.text.padding_length_by_instruction:
+        # The official text encoder pads to the longest instruction of the batch: at batch 1, none.
+        config_json["text_padding"] = "longest"
+    if hasattr(policy, "runtime_config"):
+        config_json.update(policy.runtime_config())
+    json.dump(config_json,
+              open(os.path.join(args.out, "config.json"), "w"),
+              indent=1)
 
 
 if __name__ == "__main__":
