@@ -55,17 +55,17 @@ instructions of 17 and 3 words (497 and 482 prompt tokens), the same initial noi
 | `molmoact2_policy_server` actions from raw frames, max \|Δ\| | 0.0014 / 0.0016 |
 
 Inline frames give bit-identical actions to the same images by path; with and without the CUDA graph the actions
-are identical. A call takes about 560-620 ms while another job shares the GPU (vision 170 ms, language model 340 ms,
-10 expert steps 120 ms, host 27 ms); an idle-board measurement is pending.
+are identical. A call takes about 560 ms on an idle board (median of 20 on a LIBERO observation): vision 143 ms,
+language model 260-280 ms, 10 expert steps 90 ms, host preprocessing 27 ms.
 
-**Control rate.** At about 560-850 ms per call the planner lags 3 ticks at 4 Hz, which the async controller
-covers with `overlap=5, frozen=4` (no held ticks after the first chunk, every switch inpainted). LIBERO's 20 Hz
-would need a call well under the 10-row chunk's 500 ms (under about 250 ms with one request in flight), which this
-model does not reach on Orin.
+**Control rate.** `replay_robot.py` over TCP with raw frames at 4 Hz (`overlap=5, frozen=4`, 60 ticks): call
+median 544 ms, planner lag 3 ticks, no stalls, switch jump 0.0000 with RTC and 1.95 without. LIBERO's 20 Hz would
+need a call under about 250 ms with one request in flight (a 10-row chunk lasts 500 ms), which this model does not
+reach on Orin.
 
 LIBERO-Spatial, 10 tasks x 10 episodes, this harness's protocol (fixed initial states, 10 settle steps, 280 steps,
 256 x 256 renders) with the checkpoint's conventions (both views flipped, 10 of 10 rows per call, gripper as
-returned): **100%** (100 of 100; policy call median 561 ms with another job on the GPU). The checkpoint reports 98.4% over 50 episodes per task with LeRobot's `lerobot-eval`
+returned): **100%** (100 of 100). The checkpoint reports 98.4% over 50 episodes per task with LeRobot's `lerobot-eval`
 (per-episode seeds from 1000).
 
 ```bash
