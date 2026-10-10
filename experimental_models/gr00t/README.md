@@ -36,10 +36,18 @@ PyTorch) with the same noise:
 | Policy step p50, CUDA graph (backbone 26.5 ms) | 96.4 ms | 73.1 ms |
 
 A VLA-OPT quantization job shared the board during the timing runs. [`ducido/GR00T-N1.7-SO101-banana-all49`](https://huggingface.co/ducido/GR00T-N1.7-SO101-banana-all49) built
-the same way matches the official policy within 0.13 (0.24 with RTC); its `config.json` names the fine-tuner's
-local path as `model_name`, so the official reference needs a copy with `nvidia/Cosmos-Reason2-2B` there.
+the same way matches the official policy within 0.13 (0.24 with RTC), and
+[`ducido/GR00T-N1.7-SO101-11tasks`](https://huggingface.co/ducido/GR00T-N1.7-SO101-11tasks) (11 left-arm tasks)
+within 0.22. Their `config.json` names the fine-tuner's local path as `model_name`; `official_reference.py
+--base-model nvidia/Cosmos-Reason2-2B` loads the official policy through a view of the checkpoint with that name
+replaced. The network predicts 40 rows (`action_horizon` 40, shared by every embodiment); an SO101 fine-tune trains
+and returns the first 16, its modality config's `action.delta_indices`, as the official policy does.
 
 ```bash
+# official reference: one dataset frame, seeded x_0, FP32 on the CPU (needs the GR00T N1.7 source)
+python experimental_models/gr00t/scripts/official_reference.py --gr00t-src <dir holding gr00t/> \
+    --checkpoint GR00T-N1.7-SO101-Multitask [--base-model nvidia/Cosmos-Reason2-2B] --dataset <LeRobot v3 root> \
+    --frame 150 --out ref.npz
 # backbone
 python experimental_models/gr00t/scripts/extract_gr00t_n1_7_backbone.py --gr00t GR00T-N1.7-SO101-Multitask \
     --base <Cosmos-Reason2-2B snapshot> --out gr00t_backbone

@@ -131,7 +131,7 @@ int main(int argc, char** argv)
                     static_cast<int32_t>(chunk.normalized.size()) / policy.chunkSize());
             }
             reply["prompt_tokens"] = chunk.promptTokens;
-            reply["timing_ms"] = {{"host", chunk.hostMs}, {"vision", chunk.visionMs}, {"prefix", chunk.prefixMs},
+            reply["timing_ms"] = {{"host", chunk.hostMs}, {"vision", chunk.visionMs}, {"llm", chunk.prefixMs},
                 {"action", chunk.actionMs},
                 {"total", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()}};
             return reply;

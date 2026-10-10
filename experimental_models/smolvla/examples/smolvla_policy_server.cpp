@@ -100,7 +100,7 @@ int main(int argc, char** argv)
             }
             Json reply;
             reply["actions"] = rows;
-            reply["timing_ms"] = {{"visual", chunk.visualMs}, {"prefix", chunk.prefixMs}, {"denoise", chunk.denoiseMs},
+            reply["timing_ms"] = {{"vision", chunk.visualMs}, {"llm", chunk.prefixMs}, {"action", chunk.denoiseMs},
                 {"total", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()}};
             return reply;
         },

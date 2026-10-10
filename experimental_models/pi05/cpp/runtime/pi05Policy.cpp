@@ -899,10 +899,15 @@ std::string Pi05Policy::buildPrompt(std::string const& task, std::vector<float> 
         int32_t const bin = digitize(normalized, mContract.numBins);
         if (bin < 0)
         {
-            LOG_WARNING(
-                "pi0.5 state dim %d normalizes to %.4f, below the discretization range; the prompt "
-                "carries the reference's out-of-range bin -1",
-                d, normalized);
+            mStateBelowRangeWarned.resize(static_cast<size_t>(mContract.stateDim), false);
+            if (!mStateBelowRangeWarned[static_cast<size_t>(d)])
+            {
+                mStateBelowRangeWarned[static_cast<size_t>(d)] = true;
+                LOG_WARNING(
+                    "pi0.5 state dim %d normalizes to %.4f, below the discretization range; the prompt "
+                    "carries the reference's out-of-range bin -1 (reported once per episode)",
+                    d, normalized);
+            }
         }
         bins << (d ? " " : "") << bin;
     }

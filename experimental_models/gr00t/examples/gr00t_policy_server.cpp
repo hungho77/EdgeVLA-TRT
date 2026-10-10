@@ -43,6 +43,8 @@
 
 #include "common/tensor.h"
 #include "common/trtUtils.h"
+#include "profiling/metrics.h"
+#include "profiling/timer.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "vlaBackbone.h"
@@ -93,6 +95,14 @@ std::string formalizeLanguage(std::string const& text)
     return out;
 }
 
+//! The GPU time of one of the core runtime's profiled stages since the last gTimer.reset(); 0 when it did not run
+//! (the vision encoder is skipped for images the runtime has cached).
+double stageMs(std::string const& stage)
+{
+    auto const data = gTimer.getTimingData(stage);
+    return data ? data->getTotalGpuTimeMs() : 0.0;
+}
+
 double msSince(std::chrono::steady_clock::time_point t0)
 {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -133,6 +143,8 @@ int main(int argc, char** argv)
         pluginHandle = loadEdgellmPluginLib();
         std::unordered_map<std::string, std::string> const noLora;
         backbone = std::make_unique<rt::LLMInferenceRuntime>(llmDir, visDir, noLora, stream);
+        // The core runtime times its vision encoder and LLM prefill (CUDA events) only with profiling on.
+        setProfilingEnabled(true);
     }
 #ifdef GR00T_EAGLE_BACKBONE
     std::unique_ptr<gr00t::Gr00tEagleBackbone> eagleBackbone;
@@ -218,8 +230,8 @@ int main(int argc, char** argv)
                 }
                 features = &eagleBackbone->encode(views, instruction);
                 imageMask = eagleBackbone->imageMask();
-                timing["visual"] = eagleBackbone->visualMs();
-                timing["prefix"] = eagleBackbone->prefixMs();
+                timing["vision"] = eagleBackbone->visualMs();
+                timing["llm"] = eagleBackbone->prefixMs();
                 timing["host"] = eagleBackbone->hostMs();
             }
 #endif
@@ -256,6 +268,10 @@ int main(int argc, char** argv)
                     throw std::runtime_error("backbone request failed");
                 }
                 imageMask = vla::tokenMask(*backbone, imageTokenId);
+                cudaStreamSynchronize(stream);
+                timing["vision"] = stageMs(metrics::StageNames::kVISION_ENCODER);
+                timing["llm"] = stageMs(metrics::StageNames::kLLM_PREFILL);
+                gTimer.reset();
             }
             cudaStreamSynchronize(stream);
             double const backboneMs = msSince(t0);
@@ -292,7 +308,7 @@ int main(int argc, char** argv)
                     = std::vector<float>(raw, raw + static_cast<int64_t>(processing.actionHorizon()) * cfg.actionDim);
             }
             timing["backbone"] = backboneMs;
-            timing["action_head"] = actionMs;
+            timing["action"] = actionMs;
             timing["total"] = msSince(t0);
             reply["timing_ms"] = timing;
             reply["backbone_tokens"] = features->getShape()[1];

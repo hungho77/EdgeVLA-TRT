@@ -150,6 +150,11 @@ for navigation. They share one transport
   chunk size and the RTC scheme; `frame_history` when the policy also reads past frames (RLDX-1: [-6, -4, -2, 0]),
   which travel as `camera@offset` frames. `AsyncChunkedController` then keeps the frames of every tick and sends
   those at the offsets, so its loop should tick at the training data's rate.
+- **Timing in every reply**: `timing_ms` names the stages the same way across families where they apply, `vision`,
+  `llm` (the VLM / prefix), `action` (the action head over all its denoising steps) and `host` (CPU pre- and
+  post-processing), plus `total` (the policy call) and, from the transport, `receive` (reading the request and its
+  frames) and `server` (request read to reply ready). Every `--timingEvery` replies (default 20, 0: never) the
+  server prints their median and p95 to stderr; a client's round trip minus `server` is the network.
 
 The Python side is [`scripts/vla_policy_client.py`](scripts/vla_policy_client.py):
 
@@ -203,3 +208,46 @@ through `replay_robot.py` over TCP with raw frames, 300 ticks each unless noted,
 Inline frames over stdio and TCP give bit-identical actions to the same images by path for every family, and a
 LIBERO-Spatial run through a TCP server (`libero_eval.py --port`) succeeds as over stdio. OpenVLA answers about
 once per second, so it suits slow, synchronous stepping rather than a 30 Hz loop.
+
+### Robot on another machine
+
+When the arm and its cameras hang off a PC, the Orin serves the policy over the LAN and the PC runs the control
+loop. [`scripts/robot_client_template.py`](scripts/robot_client_template.py) is that loop with the robot's I/O
+left as three hooks (`read_cameras`, `read_state`, `send_action`); with
+[`scripts/vla_policy_client.py`](scripts/vla_policy_client.py) it needs only NumPy on the PC.
+
+```bash
+# Orin
+smolvla_policy_server --engineDir smolvla/engines --port 5555 --host 0.0.0.0      # or pi05_policy_server
+# Robot PC: fill in the Robot hooks, check the commands, then drive the arm
+python robot_client_template.py --host <orin-ip> --port 5555 \
+    --task "Pick up the red cube and place it into the steel pot." --dry-run
+python robot_client_template.py --host <orin-ip> --port 5555 --task "..."
+```
+
+The loop ticks at the training data's rate (30 Hz for the SO101 datasets) with the next chunk planned in the
+background and inpainted at the switch (real-time chunking: without it a SmolVLA switch jumped up to 54 joint
+units in replay). Every command moves each joint at most `--max-step` (8 units; the SO101 left-arm data moves
+at most 7.4 per tick) from the previous one, starting from the measured state, and `--dry-run` prints the
+commands instead of sending them. The template maps the robot's `top` / `wrist` cameras onto each family's
+names and sets the RTC rows per family (SmolVLA overlap 10 / frozen 6, pi0.5 20 / 14); `frozen` must exceed the
+planner latency in ticks, LAN round trip included. A request carries the raw frames (1.6 MB for a 360x640 and a
+480x640 view), so use wired Ethernet: about 13 ms on gigabit, several times that over Wi-Fi.
+
+Checked on AGX Orin for the SO101 left-arm checkpoints (11 tasks, 6 joints, cameras `top` 360x640 and
+`wrist` 480x640), against the official policies in FP32 on two frames of
+`hungho77/so101_left_arm_pick_red_cube_into_pot` with the same x_0, and by `replay_robot.py` at 30 Hz through
+the Orin's LAN address:
+
+| Checkpoint | Robot actions vs official | Engines per call | Replay at 30 Hz |
+|---|---|---|---|
+| [`twanghcmut/SmolVLA-SO101-LeftArm-Multitask`](https://huggingface.co/twanghcmut/SmolVLA-SO101-LeftArm-Multitask) | cosine 0.999998, max \|Δ\| 0.17-0.23 on a ±100 range; identical token ids | 68 ms | 79 ms per call, lag 3 ticks, no stalls; switch jump 0.0000 with RTC, 54 without |
+| [`quangnd58/smolvla-so101-left-arm-11tasks`](https://huggingface.co/quangnd58/smolvla-so101-left-arm-11tasks) | cosine 0.999997, max \|Δ\| 0.24-0.35 on a ±98 range; identical token ids | 68 ms | 86 ms per call, lag 3 ticks, no stalls; switch jump 0.0000 with RTC, 61 without |
+| [`twanghcmut/pi05-so101-left-arm-multitask`](https://huggingface.co/twanghcmut/pi05-so101-left-arm-multitask) | cosine 0.99999, max \|Δ\| 0.32-0.83 on a ±95 range (openpi's own bf16 vs FP32: 0.16-0.28) | 265 ms | 278 ms per call, lag 8-12 ticks, no stalls; switch jump 0.0000 within 12 frozen rows (8.6 at the one switch that landed later), 55 without |
+
+Pass the tasks verbatim from the model cards, trailing periods included. A closed SO101 gripper can read below
+the pi0.5 statistics' 1st percentile; its state token then takes openpi's out-of-range bin -1, as the reference
+does, and the server reports it once per episode. The pi0.5 release exports through a
+directory holding the openpi model fields next to its weights and assets, as for `pi05_so101`
+([pi0.5 SO101](../pi05/README.md#so101-pi05_so101)); its statistics live under a different asset id, which the
+runtime finds on its own.
