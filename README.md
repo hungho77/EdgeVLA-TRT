@@ -79,7 +79,6 @@ are unchanged: [VLA examples](docs/source/user_guide/examples/vla/index.md),
 | SO101 left-arm fine-tunes (SmolVLA, pi0.5, GR00T N1.7, TurboVLA) | served, matched to the official policies; real-robot runs in progress | see [robot on another machine](experimental_models/vla/README.md#robot-on-another-machine) | real SO101 |
 | [LingBot-VLA v2](https://github.com/robbyant/lingbot-vla-v2) | planned | community LIBERO fine-tune | LIBERO-Spatial |
 | [Xiaomi-Robotics-1](https://github.com/XiaomiRobotics/Xiaomi-Robotics-1) | planned | no LIBERO checkpoint | RoboCasa |
-| [Evo-1](https://arxiv.org/abs/2511.04555) | planned | [`MINT-SJTU/Evo1_LIBERO`](https://huggingface.co/MINT-SJTU/Evo1_LIBERO) | LIBERO-Spatial |
 
 Each port aims at the same bar as the rows above: export → engine build → C++ policy server, actions matched to
 the official policy, RTC and the async loop, and a simulation run on a public checkpoint.
