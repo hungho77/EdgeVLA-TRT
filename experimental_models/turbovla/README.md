@@ -94,10 +94,10 @@ parameters derive from DINOv3 and are distributed under the
 [DINOv3 License](https://huggingface.co/H-EmbodVis/TurboVLA/blob/main/DINOv3_LICENSE.md), which carries over to the
 engines built from it.
 
-## Runs trained with the starVLA trainer (SO101)
+## Runs trained with the TurboVLA repo's LeRobot trainer (SO101)
 
-The TurboVLA repo's starVLA trainer (`third_party/starvla_runtime`) builds the same core model and saves a run
-directory instead: `config.yaml`, `checkpoints/*.pt` (the EMA weights), the run's data config, `modality.json` and
+The TurboVLA repo's trainer for LeRobot datasets (entry point `experiments/robotwin/train.py`, on the StarVLA runtime
+it vendors in `third_party/starvla_runtime`) builds the same core model and saves a run directory instead: `config.yaml`, `checkpoints/*.pt` (the EMA weights), the run's data config, `modality.json` and
 `dataset_statistics.json`, e.g. [`twanghcmut/TurboVLA-SO101-LeftArm-Multitask`](https://huggingface.co/twanghcmut/TurboVLA-SO101-LeftArm-Multitask)
 (11 SO101 left-arm tasks, 6 joints, cameras `top` 640x360 and `wrist` 640x480, 16-row chunk).
 `turbovla_reference.py` and `export_turbovla.py` take such a directory as `--checkpoint` and follow its

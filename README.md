@@ -60,11 +60,25 @@ own evaluation conventions (LIBERO-Spatial, 10 tasks x 10 episodes, fixed initia
 - Every model has a policy server for a real robot: raw camera frames in over stdin or TCP, action chunks out, with a
   Python client and an asynchronous real-time-chunking control loop
   ([real-robot serving](experimental_models/vla/README.md#real-robot-serving)). The guides also cover SO101
-  fine-tunes (GR00T N1.5 / N1.6 / N1.7, pi0.5, SmolVLA, X-VLA) checked against the official policies.
+  fine-tunes (GR00T N1.5 / N1.6 / N1.7, pi0.5, SmolVLA, X-VLA, TurboVLA from its LeRobot trainer) checked against
+  the official policies, and serving them to a robot on another machine over the LAN
+  ([robot on another machine](experimental_models/vla/README.md#robot-on-another-machine)).
 
 Upstream's VLA support (pi0.5 `libero` / `droid` / `aloha`, Alpamayo, Cosmos3-Edge policy) and its LLMs and VLMs
 are unchanged: [VLA examples](docs/source/user_guide/examples/vla/index.md),
 [supported models](docs/source/user_guide/getting_started/supported-models.md).
+
+## Roadmap
+
+| Model | Status | Public checkpoint | Evaluation |
+|---|---|---|---|
+| SO101 left-arm fine-tunes (SmolVLA, pi0.5, GR00T N1.7, TurboVLA) | served, matched to the official policies; real-robot runs in progress | see [robot on another machine](experimental_models/vla/README.md#robot-on-another-machine) | real SO101 |
+| [LingBot-VLA v2](https://github.com/robbyant/lingbot-vla-v2) | planned | community LIBERO fine-tune | LIBERO-Spatial |
+| [Xiaomi-Robotics-1](https://github.com/XiaomiRobotics/Xiaomi-Robotics-1) | planned | no LIBERO checkpoint | RoboCasa |
+| [Evo-1](https://arxiv.org/abs/2511.04555) | planned | [`MINT-SJTU/Evo1_LIBERO`](https://huggingface.co/MINT-SJTU/Evo1_LIBERO) | LIBERO-Spatial |
+
+Each port aims at the same bar as the rows above: export → engine build → C++ policy server, actions matched to
+the official policy, RTC and the async loop, and a simulation run on a public checkpoint.
 
 ## Runtime features
 
