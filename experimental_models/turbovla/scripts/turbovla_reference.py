@@ -29,7 +29,7 @@ masks, the projected text tokens, the projected visual tokens, the fused conditi
 environment actions. ``fp32`` runs every module in FP32; ``bf16`` is the official evaluation default; ``official-fp32``
 is the official FP32 mode, which still autocasts DINOv3 to BF16 on CUDA.
 
-A run trained with the repo's starVLA trainer (--checkpoint holding config.yaml, checkpoints/*.pt, the run's
+A run of the repo's LeRobot-dataset trainer (experiments/robotwin/train.py; --checkpoint holding config.yaml, checkpoints/*.pt, the run's
 *data_config*.py, modality.json and dataset_statistics.json, e.g. an SO101 fine-tune) goes through its own
 predict_action instead: the cameras in modality.json's video order, state and actions normalized as the data config
 declares (min_max over the statistics' min / max; a dim whose min equals its max passes through raw; actions clipped
@@ -80,8 +80,8 @@ def from_config(config):
         AutoConfig.from_pretrained(config.model_name_or_path))
 
 
-def starvla_weights(checkpoint):
-    """The EMA (else latest) weights of a starVLA run directory, or None for the released LIBERO layout."""
+def run_weights(checkpoint):
+    """The EMA (else latest) weights of a training-recipe run directory, or None for the released LIBERO layout."""
     if not os.path.exists(os.path.join(checkpoint, "config.yaml")):
         return None
     weights = sorted(glob.glob(os.path.join(checkpoint, "checkpoints",
@@ -92,7 +92,7 @@ def starvla_weights(checkpoint):
 
 def data_config_modes(checkpoint):
     """normalization_modes of the run's data config ({"state.single_arm": "min_max", ...}), read from its source:
-    importing it would pull in the whole starVLA dataloader."""
+    importing it would pull in the recipe's whole dataloader."""
     import ast
     path = (glob.glob(os.path.join(checkpoint, "*data_config*.py"))
             or [None])[0]
@@ -116,8 +116,8 @@ def data_config_modes(checkpoint):
     return modes
 
 
-class StarvlaPolicy:
-    """A starVLA-trained TurboVLA run with its data config's normalization."""
+class RunPolicy:
+    """A TurboVLA run directory with its data config's normalization."""
 
     def __init__(self, args, weights):
         from omegaconf import OmegaConf
@@ -208,7 +208,7 @@ class StarvlaPolicy:
 def load_policy(args):
     sys.path.insert(0, os.path.abspath(args.repo))
     stub_timm()
-    weights = starvla_weights(args.checkpoint)
+    weights = run_weights(args.checkpoint)
     if weights is not None:
         sys.path.insert(
             0,
@@ -217,7 +217,7 @@ def load_policy(args):
         from turbovla.models import text_encoder, vision_encoder
         text_encoder._load_pretrained_model = from_config
         vision_encoder._load_pretrained_model = from_config
-        policy = StarvlaPolicy(args, weights)
+        policy = RunPolicy(args, weights)
         if args.precision == "fp32":
             policy.model.vision_encoder.config.compute_precision = "fp32"
             policy.model.config.interaction.compute_precision = "fp32"
@@ -262,10 +262,11 @@ def main():
     parser.add_argument(
         "--obs-json",
         nargs="+",
-        help="starVLA runs: {task, state, cameras: {name: image}} per sample")
+        help="run directories: {task, state, cameras: {name: image}} per sample"
+    )
     parser.add_argument(
         "--embodiment",
-        help="starVLA runs: the statistics key (default: the only one)")
+        help="run directories: the statistics key (default: the only one)")
     parser.add_argument("--out", required=True)
     parser.add_argument("--precision",
                         default="fp32",
@@ -296,7 +297,7 @@ def main():
     model.text_encoder._tokenize_group = tokenize
 
     out = {}
-    if isinstance(policy, StarvlaPolicy):
+    if isinstance(policy, RunPolicy):
         from PIL import Image
         original_inputs = policy.framework._model_inputs
 

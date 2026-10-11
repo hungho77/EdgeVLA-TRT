@@ -236,7 +236,7 @@ def main():
     parser.add_argument("--obs", help="the observations --check was made from")
     parser.add_argument(
         "--embodiment",
-        help="starVLA runs: the statistics key (default: the only one)")
+        help="run directories: the statistics key (default: the only one)")
     parser.add_argument("--check-dtype",
                         default="float32",
                         choices=("float32", "float16"))
@@ -255,7 +255,7 @@ def main():
     if args.check:
         if not hasattr(policy, "_build_batch"):
             raise SystemExit(
-                "--check compares the released LIBERO checkpoint; check a starVLA run with "
+                "--check compares the released LIBERO checkpoint; check a run directory with "
                 "run_turbovla_engines.py instead")
         dtype = getattr(torch, args.check_dtype)
         check(policy, text.to(dtype), graph.to(dtype), args.check, args.obs,

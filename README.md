@@ -60,7 +60,7 @@ own evaluation conventions (LIBERO-Spatial, 10 tasks x 10 episodes, fixed initia
 - Every model has a policy server for a real robot: raw camera frames in over stdin or TCP, action chunks out, with a
   Python client and an asynchronous real-time-chunking control loop
   ([real-robot serving](experimental_models/vla/README.md#real-robot-serving)). The guides also cover SO101
-  fine-tunes (GR00T N1.5 / N1.6 / N1.7, pi0.5, SmolVLA, X-VLA, TurboVLA from the starVLA trainer) checked against
+  fine-tunes (GR00T N1.5 / N1.6 / N1.7, pi0.5, SmolVLA, X-VLA, TurboVLA from its LeRobot trainer) checked against
   the official policies, and serving them to a robot on another machine over the LAN
   ([robot on another machine](experimental_models/vla/README.md#robot-on-another-machine)).
 

@@ -17,7 +17,7 @@ policy engine on the official text tokens, then the two chained.
 
     python run_turbovla_engines.py --engines engines --reference ref.npz [--obs obs.npz]
 
-A starVLA run's reference carries the official pixel values and normalized state (``pixels_<i>``, ``state_<i>``),
+A run directory's reference carries the official pixel values and normalized state (``pixels_<i>``, ``state_<i>``),
 which are fed as they are; the released LIBERO checkpoint's are rebuilt from --obs.
 """
 
