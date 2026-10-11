@@ -436,6 +436,50 @@ def tf_crop_and_resize(image, box, size):
     return top * (1 - ly) + bottom * ly
 
 
+class Evo1Adapter:
+    """evo1_policy_server, as Evo-1's libero_client_4tasks.py: both views flipped 180 degrees as image_1 / image_2
+    (rendered at the client's 448 x 448), state [eef pos, axis-angle, gripper qpos], 14 of the 50 rows executed per
+    call, the gripper sent to LIBERO as -1 above 0.5 and +1 otherwise, the objects settled with zero actions."""
+
+    control_mode = "relative"
+    settle_action = [0.0] * 7
+
+    def __init__(self, server, rows):
+        self.server = server
+        self.rows = rows
+        self.tmp = tempfile.mkdtemp(prefix="libero_eval_")
+        self.first = True
+
+    def reset(self):
+        self.first = True
+
+    def act(self, obs, instruction):
+        cameras = {}
+        for key, cam in (("image_1", "agentview_image"),
+                         ("image_2", "robot0_eye_in_hand_image")):
+            path = os.path.join(self.tmp, f"{key}.png")
+            cv2.imwrite(
+                path,
+                cv2.cvtColor(np.ascontiguousarray(obs[cam][::-1, ::-1]),
+                             cv2.COLOR_RGB2BGR))
+            cameras[key] = path
+        state = np.concatenate([
+            obs["robot0_eef_pos"],
+            quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"]
+        ])
+        reply = self.server.request({
+            "cameras": cameras,
+            "state": [float(v) for v in state],
+            "task": instruction,
+            "reset": self.first
+        })
+        self.first = False
+        actions = np.asarray(reply["actions"],
+                             dtype=np.float64)[:self.rows, :7].copy()
+        actions[:, 6] = np.where(actions[:, 6] > 0.5, -1.0, 1.0)
+        return actions
+
+
 class OpenvlaAdapter:
     """openvla_policy_server with OpenVLA's LIBERO evaluation (experiments/robot/libero/run_libero_eval.py), its
     TensorFlow image steps reproduced in NumPy / OpenCV / Pillow: agent view flipped 180 degrees, JPEG round trip
@@ -508,6 +552,8 @@ POLICIES = {
     lambda server, rows: RldxAdapter(server, rows=rows or 8),
     "molmoact2":
     lambda server, rows: Molmoact2Adapter(server, rows=rows or 10),
+    "evo1":
+    lambda server, rows: Evo1Adapter(server, rows=rows or 14),
     "openvla":
     lambda server, rows: OpenvlaAdapter(server, rows=1),
 }
@@ -594,7 +640,7 @@ def main():
         env.reset()
         obs = env.set_init_state(suite.get_task_init_states(0)[0])
         for _ in range(SETTLE_STEPS):
-            obs, _, _, _ = env.step(NO_OP)
+            obs, _, _, _ = env.step(getattr(adapter, "settle_action", NO_OP))
         obs["ee_ori_mat"] = env.robots[0].controller.ee_ori_mat
         times = []
         for _ in range(args.bench_calls + 3):
@@ -633,7 +679,8 @@ def main():
             env.reset()
             obs = env.set_init_state(init_states[episode])
             for _ in range(SETTLE_STEPS):
-                obs, _, _, _ = env.step(NO_OP)
+                obs, _, _, _ = env.step(
+                    getattr(adapter, "settle_action", NO_OP))
             for robot in env.robots:
                 robot.controller.use_delta = adapter.control_mode == "relative"
             adapter.reset()
