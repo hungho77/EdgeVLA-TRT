@@ -74,7 +74,8 @@ TurbovlaPolicy::TurbovlaPolicy(std::string const& engineDir, cudaStream_t stream
         "TurbovlaPolicy: one camera name per view");
     mImageSize = config.at("image_size").get<int32_t>();
     mTextLength = config.at("text_length").get<int32_t>();
-    mTextLengthByInstruction = config.at("text_length_by_instruction").get<std::map<std::string, int32_t>>();
+    mTextLengthByInstruction = config.value("text_length_by_instruction", std::map<std::string, int32_t>{});
+    mTextPadLongest = config.value("text_padding", std::string("fixed")) == "longest";
     mSplitTokens = config.at("split_tokens").get<std::vector<int64_t>>();
     mHidden = config.at("hidden_dim").get<int32_t>();
     mChunk = config.at("chunk_size").get<int32_t>();
@@ -84,8 +85,19 @@ TurbovlaPolicy::TurbovlaPolicy(std::string const& engineDir, cudaStream_t stream
     mStateStd = config.at("state_std").get<std::vector<float>>();
     mActionMin = config.at("action_min").get<std::vector<float>>();
     mActionMax = config.at("action_max").get<std::vector<float>>();
+    mStateMinMax = config.value("state_normalization", std::string("mean_std")) == "min_max";
+    if (mStateMinMax)
+    {
+        mStateMin = config.at("state_min").get<std::vector<float>>();
+        mStateMax = config.at("state_max").get<std::vector<float>>();
+    }
+    mBinaryGripper = config.value("binary_gripper", true);
+    mClipActions = config.value("clip_actions", false);
+    mResizeBilinear = config.value("resize", std::string("pil_bicubic")) == "bilinear_antialias";
     auto const mean = config.at("image_mean").get<std::vector<float>>();
     auto const stddev = config.at("image_std").get<std::vector<float>>();
+    std::copy_n(mean.begin(), 3, mImageMean.begin());
+    std::copy_n(stddev.begin(), 3, mImageStd.begin());
     float const rescale = 1.0F / 255.0F;
     for (int32_t c = 0; c < 3; ++c)
     {
@@ -153,15 +165,24 @@ TurbovlaPolicy::~TurbovlaPolicy() noexcept
 TurbovlaTextInputs TurbovlaPolicy::textInputs(std::string const& task) const
 {
     auto const layout = mTextLengthByInstruction.find(task);
-    int32_t const own = layout == mTextLengthByInstruction.end() ? mTextLength : layout->second;
+    int32_t own = layout == mTextLengthByInstruction.end() ? mTextLength : layout->second;
     ELLM_CHECK(own <= mTextLength, "TurbovlaPolicy: instruction padding length exceeds the text length");
-    auto const L = static_cast<size_t>(mTextLength);
 
     TurbovlaTextInputs in;
     std::vector<uint8_t> ownAttention;
     std::vector<int64_t> const ids = mTokenizer->encode(task, own, &ownAttention);
+    size_t L = static_cast<size_t>(mTextLength);
+    if (mTextPadLongest)
+    {
+        // Batch-1 "longest" padding: the engines run at the instruction's own token count. The action head attends
+        // to every text token, so padding would change the actions.
+        own = static_cast<int32_t>(std::count(ownAttention.begin(), ownAttention.end(), uint8_t{1}));
+        L = static_cast<size_t>(own);
+        ownAttention.resize(L);
+    }
+    in.length = static_cast<int32_t>(L);
     in.inputIds.assign(L, 0);
-    std::copy(ids.begin(), ids.end(), in.inputIds.begin());
+    std::copy_n(ids.begin(), std::min(ids.size(), L), in.inputIds.begin());
     in.positionIds.assign(L, 0);
     in.selfAttention.assign(L * L, 0);
     for (size_t i = 0; i < L; ++i)
@@ -223,6 +244,20 @@ std::vector<float> TurbovlaPolicy::blendWeights(int32_t overlap, int32_t frozen,
 
 void TurbovlaPolicy::stageView(int32_t view, unsigned char const* rgb, int32_t height, int32_t width)
 {
+    size_t const pixels = static_cast<size_t>(mImageSize) * mImageSize;
+    if (mResizeBilinear)
+    {
+        std::vector<float> const resized = vla::resizeBilinearAntialias(rgb, height, width, mImageSize, mImageSize);
+        auto* out = static_cast<__half*>(mPixelsHost.rawPointer()) + static_cast<size_t>(view) * 3 * pixels;
+        for (size_t p = 0; p < pixels; ++p)
+        {
+            for (int32_t c = 0; c < 3; ++c)
+            {
+                out[c * pixels + p] = __float2half((resized[p * 3 + c] / 255.0F - mImageMean[c]) / mImageStd[c]);
+            }
+        }
+        return;
+    }
     std::vector<unsigned char> resized;
     if (height != mImageSize || width != mImageSize)
     {
@@ -264,15 +299,33 @@ TurbovlaChunk TurbovlaPolicy::act(std::vector<TurbovlaView> const& views, std::v
     auto* stateHost = static_cast<__half*>(mStateHost.rawPointer());
     for (int32_t i = 0; i < mStateDim; ++i)
     {
-        stateHost[i] = __float2half((state[i] - mStateMean[i]) / (mStateStd[i] + 1e-6F));
+        float normalized = (state[i] - mStateMean[i]) / (mStateStd[i] + 1e-6F);
+        if (mStateMinMax)
+        {
+            // A dim the statistics never saw move passes through raw, as the official normalize_state does.
+            float const range = mStateMax[i] - mStateMin[i];
+            normalized = range != 0.0F ? (state[i] - mStateMin[i]) / range * 2.0F - 1.0F : state[i];
+        }
+        stateHost[i] = __float2half(normalized);
     }
 
     TurbovlaChunk chunk;
     chunk.textCached = task == mLastTask;
-    int64_t const length = mTextLength;
     if (!chunk.textCached)
     {
         TurbovlaTextInputs const in = textInputs(task);
+        int64_t const length = in.length;
+        if (mTextPadLongest)
+        {
+            mText.setShape("input_ids", {1, length});
+            mText.setShape("position_ids", {1, length});
+            mText.setShape("self_attention", {1, length, length});
+            mText.setShape("hidden_valid", {1, length});
+            mText.setShape("attention", {1, length});
+            mPolicy.setShape("text_tokens", {1, length, mHidden});
+            mPolicy.setShape("attention", {1, length});
+            mPolicy.setShape("self_attention", {1, length, length});
+        }
         auto* ids = static_cast<int64_t*>(mTextHost.rawPointer());
         std::copy(in.inputIds.begin(), in.inputIds.end(), ids);
         std::copy(in.positionIds.begin(), in.positionIds.end(), ids + length);
@@ -341,13 +394,13 @@ TurbovlaChunk TurbovlaPolicy::act(std::vector<TurbovlaView> const& views, std::v
     mPrevious = chunk.normalized;
 
     chunk.actions.resize(elems);
-    int32_t const gripper = mActionDim - 1;
+    int32_t const gripper = mBinaryGripper ? mActionDim - 1 : -1;
     for (int32_t t = 0; t < mChunk; ++t)
     {
         for (int32_t d = 0; d < mActionDim; ++d)
         {
             size_t const i = static_cast<size_t>(t) * mActionDim + d;
-            float const v = chunk.normalized[i];
+            float const v = mClipActions ? std::clamp(chunk.normalized[i], -1.0F, 1.0F) : chunk.normalized[i];
             chunk.actions[i] = d == gripper ? (v < 0.0F ? -1.0F : 1.0F)
                                             : 0.5F * (v + 1.0F) * (mActionMax[d] - mActionMin[d]) + mActionMin[d];
         }

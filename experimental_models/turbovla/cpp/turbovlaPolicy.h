@@ -69,6 +69,7 @@ struct TurbovlaBlend
 //! The text graph's inputs for one instruction, as the official encoder builds them.
 struct TurbovlaTextInputs
 {
+    int32_t length{0};                  //!< L: the engines' text length, or the instruction's own token count
     std::vector<int64_t> inputIds;      //!< [L]
     std::vector<int64_t> positionIds;   //!< [L]
     std::vector<uint8_t> selfAttention; //!< [L, L]
@@ -136,14 +137,21 @@ private:
 
     std::vector<std::string> mCameras;
     int32_t mImageSize{256};
-    int32_t mTextLength{21};
+    int32_t mTextLength{21}; //!< the text engine's length, or with "longest" padding the longest instruction
     int32_t mHidden{256};
     int32_t mChunk{12};
     int32_t mActionDim{7};
     int32_t mStateDim{8};
     std::map<std::string, int32_t> mTextLengthByInstruction;
+    bool mTextPadLongest{false}; //!< an instruction keeps its own token count (the official batch-1 "longest")
     std::vector<int64_t> mSplitTokens;
     std::vector<float> mStateMean, mStateStd, mActionMin, mActionMax;
+    bool mStateMinMax{false}; //!< state to [-1, 1] over state_min / state_max, else (x - mean) / std
+    std::vector<float> mStateMin, mStateMax;
+    bool mBinaryGripper{true};   //!< the last action dim is a sign, else every dim is min-max
+    bool mClipActions{false};    //!< clip the normalized chunk to [-1, 1] before unnormalizing
+    bool mResizeBilinear{false}; //!< antialiased bilinear in float (HF fast processor), else Pillow bicubic
+    std::array<float, 3> mImageMean{}, mImageStd{};
     std::array<std::array<float, 256>, 3> mPixelLut{}; //!< u8 -> (u8 * rescale - mean) / std, per channel
 
     std::string mLastTask;  //!< the task mText's output in mTextTokens belongs to

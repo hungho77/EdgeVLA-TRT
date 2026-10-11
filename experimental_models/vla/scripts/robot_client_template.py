@@ -33,23 +33,21 @@ import time
 import numpy as np
 from vla_policy_client import AsyncChunkedController, VlaPolicyClient
 
-# Robot camera -> server camera, per policy family, for the SO101 checkpoints (cameras "top" and "wrist").
+# Robot camera -> server camera for families whose servers rename them; the others name the cameras as the SO101
+# datasets record them ("top", "wrist").
 CAMERA_NAMES = {
-    "smolvla": {
-        "top": "top",
-        "wrist": "wrist"
-    },
     "pi05": {
         "top": "observation/image",
         "wrist": "observation/wrist_image"
     },
-    "gr00t_n17": {
-        "top": "top",
-        "wrist": "wrist"
-    },
 }
 # (overlap, frozen) in ticks: frozen must exceed the planner latency in ticks (LAN round trip included).
-RTC_DEFAULTS = {"smolvla": (10, 6), "pi05": (20, 14), "gr00t_n17": (10, 7)}
+RTC_DEFAULTS = {
+    "smolvla": (10, 6),
+    "pi05": (20, 14),
+    "gr00t_n17": (10, 7),
+    "turbovla": (6, 3)
+}
 
 
 class Robot:
@@ -98,7 +96,14 @@ def main():
     client = VlaPolicyClient(host=args.host, port=args.port)
     family = client.info["family"]
     print("server:", client.info, flush=True)
-    names = CAMERA_NAMES[family]
+    names = CAMERA_NAMES.get(family, {"top": "top", "wrist": "wrist"})
+    missing = [
+        n for n in names.values() if n not in client.info.get("cameras", [])
+    ]
+    if missing:
+        raise SystemExit(
+            f"the server expects cameras {client.info.get('cameras')}; set CAMERA_NAMES for {family}"
+        )
     overlap, frozen = RTC_DEFAULTS.get(family, (10, 6))
     overlap = args.overlap if args.overlap is not None else overlap
     frozen = args.frozen if args.frozen is not None else frozen

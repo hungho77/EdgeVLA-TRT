@@ -15,7 +15,10 @@
 """Run the TurboVLA engines on the inputs ``turbovla_reference.py`` captured, stage by stage: the text engine, the
 policy engine on the official text tokens, then the two chained.
 
-    python run_turbovla_engines.py --engines engines --reference ref.npz --obs obs.npz
+    python run_turbovla_engines.py --engines engines --reference ref.npz [--obs obs.npz]
+
+A starVLA run's reference carries the official pixel values and normalized state (``pixels_<i>``, ``state_<i>``),
+which are fed as they are; the released LIBERO checkpoint's are rebuilt from --obs.
 """
 
 import argparse
@@ -80,7 +83,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--engines", required=True)
     parser.add_argument("--reference", required=True)
-    parser.add_argument("--obs", required=True)
+    parser.add_argument(
+        "--obs",
+        help="LIBERO references: the observations they were made from")
     args = parser.parse_args()
 
     import tensorrt as trt
@@ -90,7 +95,8 @@ def main():
     text = Engine(os.path.join(args.engines, "text.engine"), trt, logger)
     policy = Engine(os.path.join(args.engines, "policy.engine"), trt, logger)
     stream = torch.cuda.Stream()
-    ref, obs = np.load(args.reference), np.load(args.obs)
+    ref = np.load(args.reference)
+    obs = np.load(args.obs) if args.obs else None
     mean = np.asarray(config["image_mean"], np.float32)
     std = np.asarray(config["image_std"], np.float32)
     state_mean = np.asarray(config["state_mean"], np.float32)
@@ -99,6 +105,8 @@ def main():
 
     count = len([k for k in ref.files if k.startswith("normalized_")])
     for i in range(count):
+        if config.get("text_padding") == "longest":
+            length = ref[f"input_ids_{i}"].shape[1]
         ids, positions, self_attention, hidden_valid, attention = text_inputs(
             ref, i, length, torch.float16)
         tokens = text(
@@ -109,31 +117,38 @@ def main():
                 "hidden_valid": hidden_valid,
                 "attention": attention
             }, stream)["text_tokens"]
-        views = [
-            policy_rotate(obs[f"{camera}_{i}"])
-            for camera in ("agentview", "wrist")
-        ]
-        pixels = np.stack([
-            ((v.astype(np.float32) * np.float32(1 / 255.0)) - mean) / std
-            for v in views
-        ]).transpose(0, 3, 1, 2)
-        state = (obs[f"state_{i}"] - state_mean) / (state_std + 1e-6)
+        if f"pixels_{i}" in ref.files:
+            pixels, state = ref[f"pixels_{i}"][0], ref[f"state_{i}"][0]
+        else:
+            views = [
+                policy_rotate(obs[f"{camera}_{i}"])
+                for camera in ("agentview", "wrist")
+            ]
+            pixels = np.stack([
+                ((v.astype(np.float32) * np.float32(1 / 255.0)) - mean) / std
+                for v in views
+            ]).transpose(0, 3, 1, 2)
+            state = (obs[f"state_{i}"] - state_mean) / (state_std + 1e-6)
+        own = ref[f"text_{i}"].shape[1]
         common = {
             "pixels": torch.from_numpy(np.ascontiguousarray(pixels[None])),
             "attention": attention,
             "self_attention": self_attention,
             "state": torch.from_numpy(state[None].astype(np.float32))
         }
+        official_tokens = np.zeros((1, length, ref[f"text_{i}"].shape[2]),
+                                   np.float32)
+        official_tokens[:, :own] = ref[f"text_{i}"]
         on_ref = policy(
             {
-                **common, "text_tokens": torch.from_numpy(ref[f"text_{i}"])
+                **common, "text_tokens": torch.from_numpy(official_tokens)
             }, stream)["actions"][0]
         chained = policy({
             **common, "text_tokens": torch.from_numpy(tokens)
         }, stream)["actions"][0]
         expected = ref[f"normalized_{i}"]
         print(
-            f"sample {i}: text tokens max|d| {np.abs(tokens - ref[f'text_{i}']).max():.3e}; actions max|d| "
+            f"sample {i}: text tokens max|d| {np.abs(tokens[:, :own] - ref[f'text_{i}']).max():.3e}; actions max|d| "
             f"policy on official text {np.abs(on_ref - expected).max():.3e}, chained "
             f"{np.abs(chained - expected).max():.3e}")
 
