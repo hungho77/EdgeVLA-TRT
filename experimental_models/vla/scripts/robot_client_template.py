@@ -40,13 +40,18 @@ CAMERA_NAMES = {
         "top": "observation/image",
         "wrist": "observation/wrist_image"
     },
+    "evo1": {
+        "top": "image_1",
+        "wrist": "image_2"
+    },
 }
 # (overlap, frozen) in ticks: frozen must exceed the planner latency in ticks (LAN round trip included).
 RTC_DEFAULTS = {
     "smolvla": (10, 6),
     "pi05": (20, 14),
     "gr00t_n17": (10, 7),
-    "turbovla": (6, 3)
+    "turbovla": (6, 3),
+    "evo1": (20, 14)
 }
 
 
