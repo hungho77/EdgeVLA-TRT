@@ -75,7 +75,7 @@ attends bidirectionally (pi0.5, SmolVLA) can only skip repeated vision encoding.
 [`scripts/libero_eval.py`](scripts/libero_eval.py) measures a policy's LIBERO success rate in simulation. The model
 runs in its C++ policy server (one JSON request per line: `gr00t_policy_server`, `pi05_policy_server`,
 `smolvla_policy_server`, `xvla_policy_server`, `turbovla_policy_server`, `rldx_policy_server`,
-`molmoact2_policy_server`, `evo1_policy_server`, `openvla_policy_server`), started as a subprocess, so the simulator
+`molmoact2_policy_server`, `evo1_policy_server`, `lingbot_policy_server`, `openvla_policy_server`), started as a subprocess, so the simulator
 side needs only a LIBERO Python environment (robosuite 1.4 with mujoco 2.3, `MUJOCO_GL=egl`) and no TensorRT.
 
 Protocol: LIBERO's fixed initial states (episode *i* of a task uses init state *i*), 10 no-op steps for the objects
@@ -94,6 +94,7 @@ own LIBERO evaluation script, because these conventions move the success rate by
 | `rldx` | `RLWRLD/RLDX-1-FT-LIBERO` (`general_embodiment`, all four suites) | RLDX-1 `run_scripts/eval/libero` | both flipped, frames t-6 / t-4 / t-2 / t | as pi0.5 | 8 of 16 | `sign(2 g - 1)` of gripper_close | 220 |
 | `molmoact2` | `allenai/MolmoAct2-LIBERO-LeRobot` (all four suites, continuous actions) | LeRobot `LiberoProcessorStep` (`lerobot-eval`) | both flipped | as pi0.5 | 10 of 10 (its `n_action_steps`) | as returned | 280 |
 | `evo1` | `MINT-SJTU/Evo1_LIBERO` (all four suites) | Evo-1 `LIBERO_evaluation/libero_client_4tasks.py` | both flipped, 448x448 renders | as pi0.5 | 14 of 50 | `-1` above 0.5, else `+1`; settled with zero actions | 350 (its 25 calls), seed 42 |
+| `lingbot_vla_v2` | `openroboto-ai/lingbot-vla-v2-6b-libero` (community, all four suites) | the fine-tune's own screen (`evaluation/screen_summary.json`: steps vs policy calls) | both flipped | as pi0.5 | 5 of 50 | as returned | 220 |
 | `openvla` | `openvla/openvla-7b-finetuned-libero-spatial` | OpenVLA `run_libero_eval.py` | agent view flipped, JPEG round trip, Lanczos to 224, 90% centre crop | none | 1 | binarized, inverted | 220 |
 
 OpenVLA's TensorFlow image steps are reproduced with OpenCV, Pillow and NumPy (`tf.image.crop_and_resize` exactly;
@@ -113,6 +114,7 @@ LIBERO-Spatial, 10 tasks x 10 episodes, AGX Orin 64 GB, JetPack 6.2, FP16 engine
 | RLDX-1 | 97.0% | 98.6% LIBERO-Short, the Spatial / Object / Goal average (RLDX-1 paper; random resets, 720 steps) |
 | MolmoAct2 | 99.0%; 100% with the official FP32 attention | 98.4% (model card, LeRobot implementation, 50 episodes per task) |
 | Evo-1 | 87.0%; 89% with the November 2025 sampler | 92.7% (Evo-1 paper, five runs of 10 episodes per task) |
+| LingBot-VLA 2.0 | 97.0% | 94% (the community fine-tune's screen, 5 episodes per task) |
 | OpenVLA | 85.0% | 84.7% (OpenVLA paper) |
 
 SmolVLA's engines match LeRobot on a LIBERO observation (robot actions max |Δ| 0.013 on a ±1 range, identical
@@ -193,6 +195,7 @@ hardware.
 | TurboVLA | `primary`, `wrist` | the checkpoint's (LIBERO: eef pos, axis-angle, gripper qpos) | environment actions: arm deltas unnormalized, gripper +1 / -1 | chunk (12) | overlap / frozen, by blending the new chunk with the previous one (no denoising to inpaint) |
 | MolmoAct2 | the checkpoint's (LIBERO: `image`, `wrist_image`) | the checkpoint's (LIBERO: eef pos, axis-angle, gripper qpos) | the checkpoint's actions, unnormalized on the masked dims (LIBERO: deltas, gripper in [-1, 1]) | chunk (10) | overlap / frozen (GR00T's) |
 | Evo-1 | `image_1` (third-person), `image_2` (wrist); a missing third view is black and masked | the checkpoint's (LIBERO: eef pos, axis-angle, gripper qpos), zero-padded to 24 | the checkpoint's actions, unnormalized (LIBERO: deltas, gripper in [0, 1]) | chunk (50) | overlap / frozen (GR00T's) |
+| LingBot-VLA 2.0 | the checkpoint's dataset image keys (LIBERO: `observation.images.image`, `observation.images.image2`) | the dataset's state vector (LIBERO: eef pos, axis-angle, gripper qpos) | the dataset's action vector, unnormalized per feature | chunk (50) | overlap / frozen (pi0.5's inpainting) |
 | OpenVLA | `image` (third-person) | none | one unnormalized end-effector delta and gripper, per the `unnorm_key` dataset | 1 | none |
 
 Verified by replay and in LIBERO over TCP, not on hardware. AGX Orin, SO101 dataset frames at 30 Hz wall clock
@@ -208,6 +211,7 @@ through `replay_robot.py` over TCP with raw frames, 300 ticks each unless noted,
 | RLDX-1 (overlap 10, frozen 8; LIBERO checkpoint on SO101 frames with the frame history, 20 Hz, 200 ticks) | 292 ms | 6-7 | 0.0000 / 0.32 |
 | MolmoAct2 (overlap 5, frozen 4; LIBERO checkpoint on SO101 frames, 5 Hz, 60 ticks) | 399 ms | 2-3 | 0.0000 / 1.96 |
 | Evo-1 (overlap 20, frozen 14; LIBERO checkpoint on SO101 frames) | 255 ms | 7-8 | 0.0000 / 1.01 |
+| LingBot-VLA 2.0 (overlap 34, frozen 24; LIBERO fine-tune on SO101 frames) | 681 ms | 20-22 | 0.0000 / 2.02 |
 
 Inline frames over stdio and TCP give bit-identical actions to the same images by path for every family, and a
 LIBERO-Spatial run through a TCP server (`libero_eval.py --port`) succeeds as over stdio. OpenVLA answers about
