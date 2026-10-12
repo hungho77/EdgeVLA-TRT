@@ -436,6 +436,14 @@ def tf_crop_and_resize(image, box, size):
     return top * (1 - ly) + bottom * ly
 
 
+class LingbotAdapter(SmolvlaAdapter):
+    """lingbot_policy_server on a LeRobot-LIBERO fine-tune, as SmolvlaAdapter with the checkpoint's dataset image
+    keys; 5 rows per call, the step counts the fine-tune's own evaluation records."""
+
+    cameras = (("observation.images.image", "agentview_image"),
+               ("observation.images.image2", "robot0_eye_in_hand_image"))
+
+
 class Evo1Adapter:
     """evo1_policy_server, as Evo-1's libero_client_4tasks.py: both views flipped 180 degrees as image_1 / image_2
     (rendered at the client's 448 x 448), state [eef pos, axis-angle, gripper qpos], 14 of the 50 rows executed per
@@ -554,6 +562,8 @@ POLICIES = {
     lambda server, rows: Molmoact2Adapter(server, rows=rows or 10),
     "evo1":
     lambda server, rows: Evo1Adapter(server, rows=rows or 14),
+    "lingbot_vla_v2":
+    lambda server, rows: LingbotAdapter(server, rows=rows or 5),
     "openvla":
     lambda server, rows: OpenvlaAdapter(server, rows=1),
 }

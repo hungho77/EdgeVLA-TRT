@@ -38,6 +38,7 @@ own evaluation conventions (LIBERO-Spatial, 10 tasks x 10 episodes, fixed initia
 | RLDX-1 | [`RLWRLD/RLDX-1-FT-LIBERO`](https://huggingface.co/RLWRLD/RLDX-1-FT-LIBERO) | 97% (98.6% LIBERO-Short) | 297 ms | ✓ | ✓ (20 Hz) | [RLDX-1](experimental_models/rldx/README.md) |
 | MolmoAct2 | [`allenai/MolmoAct2-LIBERO-LeRobot`](https://huggingface.co/allenai/MolmoAct2-LIBERO-LeRobot) | 99% (98.4%) | 413 ms | ✓ | ✓ (5 Hz) | [MolmoAct2](experimental_models/molmoact2/README.md) |
 | Evo-1 | [`MINT-SJTU/Evo1_LIBERO`](https://huggingface.co/MINT-SJTU/Evo1_LIBERO) | 87% (92.7%) | 248 ms | ✓ | ✓ | [Evo-1](experimental_models/evo1/README.md) |
+| LingBot-VLA 2.0 | [`openroboto-ai/lingbot-vla-v2-6b-libero`](https://huggingface.co/openroboto-ai/lingbot-vla-v2-6b-libero) (community) | 97% (94%) | 675 ms (520 ms on a quieter GPU) | ✓ | ✓ | [LingBot-VLA 2.0](experimental_models/lingbot/README.md) |
 | OpenVLA | [`openvla/openvla-7b-finetuned-libero-spatial`](https://huggingface.co/openvla/openvla-7b-finetuned-libero-spatial) | 85% (84.7%) | 838 ms | | | [OpenVLA](experimental_models/openvla/README.md) |
 | InternVLA-N1 (VLN) | [`InternRobotics/InternVLA-N1-DualVLN`](https://huggingface.co/InternRobotics/InternVLA-N1-DualVLN) | VLN: R2R episode in VLN-PE | first plan 181 ms, System-1 tick 188 ms | | dual-rate | [InternVLA-N1](experimental_models/internvla_n1/README.md) |
 
@@ -52,7 +53,9 @@ own evaluation conventions (LIBERO-Spatial, 10 tasks x 10 episodes, fixed initia
   the background (`*_async_control`); InternVLA-N1 runs its planner and trajectory head at two rates in one process.
 - RLDX-1 reads the frames at t-6, t-4, t-2 and t: its server takes them inline (`camera@offset`) and the Python
   controller keeps them per tick. Its paper reports LIBERO-Short (Spatial, Object, Goal averaged), not Spatial.
-- MolmoAct2's async loop keeps up at 5 Hz at its latency, not LIBERO's 20 Hz.
+- MolmoAct2's async loop keeps up at 5 Hz at its latency, not LIBERO's 20 Hz. LingBot-VLA 2.0 (6B, a sparse-MoE
+  expert run for 10 steps) plans about twice a second; its 30 Hz loop holds through 24 frozen rows. Its policy call
+  was measured with the desktop drawing about 20% of the GPU; 520 ms is a quieter median of 8.
 - Evo-1 follows its official client: 448x448 renders, 14 of 50 rows per call. Its head reads the language model's
   padded positions, so the export reproduces the FlashAttention-2 the official setup runs
   ([Evo-1 guide](experimental_models/evo1/README.md)).
@@ -77,7 +80,6 @@ are unchanged: [VLA examples](docs/source/user_guide/examples/vla/index.md),
 | Model | Status | Public checkpoint | Evaluation |
 |---|---|---|---|
 | SO101 left-arm fine-tunes (SmolVLA, pi0.5, GR00T N1.7, TurboVLA) | served, matched to the official policies; real-robot runs in progress | see [robot on another machine](experimental_models/vla/README.md#robot-on-another-machine) | real SO101 |
-| [LingBot-VLA v2](https://github.com/robbyant/lingbot-vla-v2) | planned | community LIBERO fine-tune | LIBERO-Spatial |
 | [Xiaomi-Robotics-1](https://github.com/XiaomiRobotics/Xiaomi-Robotics-1) | planned | no LIBERO checkpoint | RoboCasa |
 
 Each port aims at the same bar as the rows above: export → engine build → C++ policy server, actions matched to

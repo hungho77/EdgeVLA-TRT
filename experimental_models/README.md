@@ -23,6 +23,7 @@ It is built only when `-DBUILD_EXPERIMENTAL_MODELS=ON` is passed to CMake.
 | TurboVLA | `turbovla/` | single-pass regression policy (DINOv3 + BERT); H-EmbodVis and starVLA-trainer checkpoints |
 | RLDX-1 | `rldx/` | truncated Qwen3-VL-8B backbone + action expert, frame history |
 | MolmoAct2 | `molmoact2/` | Molmo2 VLM prefix + flow-matching action expert |
+| LingBot-VLA 2.0 | `lingbot/` | Qwen3-VL-4B prefix + 36-layer sparse-MoE action expert over its K / V (dense-evaluated, concatenated experts) |
 | Evo-1 | `evo1/` | InternVL3-1B (14 language layers) + cross-modulated flow-matching head; FlashAttention-2 padding semantics |
 | InternVLA-N1 | `internvla_n1/` | dual-system vision-language navigation (Qwen2.5-VL planner served by the core runtime + flow-matching trajectory expert; asynchronous in-process handoff) |
 
