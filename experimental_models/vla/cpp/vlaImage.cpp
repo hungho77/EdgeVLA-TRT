@@ -45,6 +45,22 @@ double bicubicFilter(double x)
     return 0.0;
 }
 
+double bilinearFilter(double x)
+{
+    x = std::abs(x);
+    return x < 1.0 ? 1.0 - x : 0.0;
+}
+
+//! A Pillow resampling filter and its support at scale 1.
+struct PilFilter
+{
+    double (*weight)(double);
+    double support;
+};
+
+constexpr PilFilter kBicubic{bicubicFilter, 2.0};
+constexpr PilFilter kBilinear{bilinearFilter, 1.0};
+
 //! Pillow's precompute_coeffs + normalize_coeffs_8bpc for one axis.
 struct Coefficients
 {
@@ -53,11 +69,11 @@ struct Coefficients
     std::vector<int32_t> weights; //!< [out, ksize], fixed point
 };
 
-Coefficients pilCoefficients(int32_t inSize, int32_t outSize)
+Coefficients pilCoefficients(int32_t inSize, int32_t outSize, PilFilter const& filter)
 {
     double const scale = static_cast<double>(inSize) / outSize;
     double const filterScale = std::max(scale, 1.0);
-    double const support = 2.0 * filterScale;
+    double const support = filter.support * filterScale;
     Coefficients c;
     c.ksize = static_cast<int32_t>(std::ceil(support)) * 2 + 1;
     c.bounds.resize(static_cast<size_t>(outSize) * 2);
@@ -71,7 +87,7 @@ Coefficients pilCoefficients(int32_t inSize, int32_t outSize)
         double sum = 0.0;
         for (int32_t x = 0; x < xmax; ++x)
         {
-            k[x] = bicubicFilter((x + xmin - center + 0.5) / filterScale);
+            k[x] = filter.weight((x + xmin - center + 0.5) / filterScale);
             sum += k[x];
         }
         for (int32_t x = 0; x < xmax; ++x)
@@ -167,8 +183,11 @@ std::vector<float> resizeBilinearAntialias(
     return out;
 }
 
-std::vector<unsigned char> resizeBicubicPil(
-    unsigned char const* rgb, int32_t height, int32_t width, int32_t outHeight, int32_t outWidth)
+namespace
+{
+
+std::vector<unsigned char> resizePil(unsigned char const* rgb, int32_t height, int32_t width, int32_t outHeight,
+    int32_t outWidth, PilFilter const& filter)
 {
     if (height == outHeight && width == outWidth)
     {
@@ -180,7 +199,7 @@ std::vector<unsigned char> resizeBicubicPil(
     unsigned char const* source = rgb;
     if (width != outWidth)
     {
-        Coefficients const c = pilCoefficients(width, outWidth);
+        Coefficients const c = pilCoefficients(width, outWidth, filter);
         horizontal.resize(static_cast<size_t>(height) * outWidth * 3);
         for (int32_t y = 0; y < height; ++y)
         {
@@ -206,7 +225,7 @@ std::vector<unsigned char> resizeBicubicPil(
     {
         return horizontal;
     }
-    Coefficients const c = pilCoefficients(height, outHeight);
+    Coefficients const c = pilCoefficients(height, outHeight, filter);
     std::vector<unsigned char> out(static_cast<size_t>(outHeight) * outWidth * 3);
     for (int32_t yy = 0; yy < outHeight; ++yy)
     {
@@ -224,6 +243,20 @@ std::vector<unsigned char> resizeBicubicPil(
         }
     }
     return out;
+}
+
+} // namespace
+
+std::vector<unsigned char> resizeBicubicPil(
+    unsigned char const* rgb, int32_t height, int32_t width, int32_t outHeight, int32_t outWidth)
+{
+    return resizePil(rgb, height, width, outHeight, outWidth, kBicubic);
+}
+
+std::vector<unsigned char> resizeBilinearPil(
+    unsigned char const* rgb, int32_t height, int32_t width, int32_t outHeight, int32_t outWidth)
+{
+    return resizePil(rgb, height, width, outHeight, outWidth, kBilinear);
 }
 
 } // namespace vla
