@@ -30,6 +30,10 @@ namespace vla
 std::vector<unsigned char> resizeBicubicPil(
     unsigned char const* rgb, int32_t height, int32_t width, int32_t outHeight, int32_t outWidth);
 
+//! PIL's Image.resize(BILINEAR) on 8-bit RGB [height, width, 3], the same fixed-point path as resizeBicubicPil.
+std::vector<unsigned char> resizeBilinearPil(
+    unsigned char const* rgb, int32_t height, int32_t width, int32_t outHeight, int32_t outWidth);
+
 //! Antialiased bilinear resize of 8-bit RGB [height, width, 3] to float RGB [outHeight, outWidth, 3] in [0, 255],
 //! without 8-bit rounding: Pillow's triangle-filter coefficients (support scaled by the downscale factor), applied
 //! separably in float. Matches transformers' fast image processors (torchvision resize, antialias=True, BILINEAR).

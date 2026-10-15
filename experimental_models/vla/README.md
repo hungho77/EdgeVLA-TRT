@@ -196,6 +196,7 @@ hardware.
 | MolmoAct2 | the checkpoint's (LIBERO: `image`, `wrist_image`) | the checkpoint's (LIBERO: eef pos, axis-angle, gripper qpos) | the checkpoint's actions, unnormalized on the masked dims (LIBERO: deltas, gripper in [-1, 1]) | chunk (10) | overlap / frozen (GR00T's) |
 | Evo-1 | `image_1` (third-person), `image_2` (wrist); a missing third view is black and masked | the checkpoint's (LIBERO: eef pos, axis-angle, gripper qpos), zero-padded to 24 | the checkpoint's actions, unnormalized (LIBERO: deltas, gripper in [0, 1]) | chunk (50) | overlap / frozen (GR00T's) |
 | LingBot-VLA 2.0 | the checkpoint's dataset image keys (LIBERO: `observation.images.image`, `observation.images.image2`) | the dataset's state vector (LIBERO: eef pos, axis-angle, gripper qpos) | the dataset's action vector, unnormalized per feature | chunk (50) | overlap / frozen (pi0.5's inpainting) |
+| Xiaomi-Robotics-1 | `robot0_agentview_left`, `robot0_agentview_right`, `robot0_eye_in_hand` (RoboCasa's names) | the robot state, zero-padded to 60 (RoboCasa: 7 joints, gripper) | the robot type's active dims decoded with its mean / std (RoboCasa: 7) | chunk (10) | overlap / frozen (pi0.5's inpainting, flow from t = 0) |
 | OpenVLA | `image` (third-person) | none | one unnormalized end-effector delta and gripper, per the `unnorm_key` dataset | 1 | none |
 
 Verified by replay and in LIBERO over TCP, not on hardware. AGX Orin, SO101 dataset frames at 30 Hz wall clock
