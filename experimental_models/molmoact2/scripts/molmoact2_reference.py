@@ -52,13 +52,16 @@ def local_checkpoint(args, out):
         elif name.endswith(".safetensors"):
             os.symlink(os.path.abspath(src), os.path.join(out, name))
     config = json.load(open(os.path.join(out, "config.json")))
-    config.update(
-        checkpoint_path=os.path.abspath(args.hf),
-        discrete_action_tokenizer=os.path.abspath(args.fast),
-        inference_action_mode="continuous",
-        device=args.device,
-        model_dtype="bfloat16" if args.precision == "bf16" else "float32",
-        enable_inference_cuda_graph=False)
+    config.update(checkpoint_path=os.path.abspath(args.hf),
+                  discrete_action_tokenizer=os.path.abspath(args.fast),
+                  inference_action_mode="continuous",
+                  device=args.device,
+                  enable_inference_cuda_graph=False)
+    # LeRobot after 0.6.1 names the policy's dtype "dtype" and can torch.compile it.
+    config["dtype" if "dtype" in config else "model_dtype"] = \
+        "bfloat16" if args.precision == "bf16" else "float32"
+    if "compile_model" in config:
+        config["compile_model"] = False
     json.dump(config, open(os.path.join(out, "config.json"), "w"), indent=1)
     pre = json.load(open(os.path.join(out, "policy_preprocessor.json")))
     for step in pre["steps"]:
@@ -158,9 +161,10 @@ def main():
         batch = preprocessor(
             observation(obs, i, config["image_keys"], not args.no_flip))
         batches.append(batch)
-        for key in ("input_ids", "token_type_ids", "pixel_values",
-                    "image_token_pooling", "image_grids", "image_num_crops",
-                    "action_dim_is_pad", "observation.state"):
+        for key in ("input_ids", "attention_mask", "token_type_ids",
+                    "pixel_values", "image_token_pooling", "image_grids",
+                    "image_num_crops", "action_dim_is_pad",
+                    "observation.state"):
             value = batch.get(key)
             if torch.is_tensor(value):
                 out[f"{key.replace('.', '_')}_{i}"] = value.detach().cpu(
