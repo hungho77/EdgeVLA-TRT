@@ -12,18 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Golden actions from LeRobot's MolmoAct2 policy (allenai/MolmoAct2-LIBERO-LeRobot), stage by stage.
+"""Golden actions from a LeRobot MolmoAct2 policy (allenai/MolmoAct2-LIBERO-LeRobot or a fine-tune), stage by stage.
 
-Runs the checkpoint's own preprocessor, policy (continuous inference) and postprocessor on LIBERO observations with a
-fixed initial noise. LeRobot resolves the policy's HF base checkpoint and the FAST action tokenizer by name; --hf and
+Runs the checkpoint's own preprocessor, policy (continuous inference) and postprocessor on recorded observations with
+a fixed initial noise. LeRobot resolves the policy's HF base checkpoint and the FAST action tokenizer by name; --hf and
 --fast point them at local copies holding only their config, processor and tokenizer files (the LeRobot weights
 replace the base model's, so it is built from its config).
 
     python molmoact2_reference.py --checkpoint MolmoAct2-LIBERO-LeRobot --hf MolmoAct2-LIBERO-hf \\
-        --fast MolmoAct2-FAST-Tokenizer --obs obs.npz --out ref.npz [--precision fp32|bf16] [--preprocess-only]
+        --fast MolmoAct2-FAST-Tokenizer --obs obs.npz --out ref.npz [--precision fp32|bf16] [--no-flip] [--preprocess-only]
 
-obs.npz holds agentview_<i> / wrist_<i> (raw LIBERO renders, [H, W, 3] or a stack whose last entry is used; flipped
-180 degrees here as LeRobot's LIBERO processor does), state_<i> ([eef pos, axis-angle, gripper qpos]) and task_<i>.
+obs.npz holds one frame per camera of the checkpoint's image_keys, named by the key's last part (<camera>_<i>, LIBERO's
+also as agentview_<i> / wrist_<i>; [H, W, 3] or a stack whose last entry is used), state_<i> and task_<i>. The frames
+are flipped 180 degrees as LeRobot's LIBERO processor does unless --no-flip (robot recordings, e.g. SO101).
 Per sample the output holds the packed model inputs, the visual features added to the image-patch tokens, every
 layer's K / V, the action expert's cross-attention mask, the noise, each step's velocity, the normalized chunk and
 the environment actions. ``bf16`` is the official setting (BF16 weights under autocast).
@@ -51,20 +52,20 @@ def local_checkpoint(args, out):
         elif name.endswith(".safetensors"):
             os.symlink(os.path.abspath(src), os.path.join(out, name))
     config = json.load(open(os.path.join(out, "config.json")))
-    config.update(checkpoint_path=os.path.abspath(args.hf),
-                  discrete_action_tokenizer=os.path.abspath(args.fast),
-                  inference_action_mode="continuous",
-                  device=args.device,
-                  model_dtype="bfloat16"
-                  if args.precision == "bf16" else "float32",
-                  enable_inference_cuda_graph=False)
+    config.update(
+        checkpoint_path=os.path.abspath(args.hf),
+        discrete_action_tokenizer=os.path.abspath(args.fast),
+        inference_action_mode="continuous",
+        device=args.device,
+        model_dtype="bfloat16" if args.precision == "bf16" else "float32",
+        enable_inference_cuda_graph=False)
     json.dump(config, open(os.path.join(out, "config.json"), "w"), indent=1)
     pre = json.load(open(os.path.join(out, "policy_preprocessor.json")))
     for step in pre["steps"]:
         if step["registry_name"] == "molmoact2_pack_inputs":
-            step["config"].update(
-                checkpoint_path=os.path.abspath(args.hf),
-                discrete_action_tokenizer=os.path.abspath(args.fast))
+            step["config"].update(checkpoint_path=os.path.abspath(args.hf),
+                                  discrete_action_tokenizer=os.path.abspath(
+                                      args.fast))
         if step["registry_name"] == "device_processor":
             step["config"]["device"] = args.device
     json.dump(pre,
@@ -93,23 +94,27 @@ def from_config_only():
     lm._strict_load_safetensors_weights = lambda model, location: None
 
 
-def observation(obs, i):
+LIBERO_NAMES = {"image": "agentview", "wrist_image": "wrist"}
+
+
+def observation(obs, i, image_keys, flip):
 
     def frame(key):
-        image = obs[f"{key}_{i}"]
+        name = key.split(".")[-1]
+        if f"{name}_{i}" not in obs.files:
+            name = LIBERO_NAMES.get(name, name)
+        image = obs[f"{name}_{i}"]
         image = image[-1] if image.ndim == 4 else image
-        flipped = np.ascontiguousarray(image[::-1, ::-1])
-        return torch.from_numpy(flipped).permute(2, 0, 1).float()[None] / 255
+        if flip:
+            image = image[::-1, ::-1]
+        image = np.ascontiguousarray(image)
+        return torch.from_numpy(image).permute(2, 0, 1).float()[None] / 255
 
-    return {
-        "observation.images.image":
-        frame("agentview"),
-        "observation.images.wrist_image":
-        frame("wrist"),
-        "observation.state":
-        torch.from_numpy(obs[f"state_{i}"].astype(np.float32))[None],
-        "task": [str(obs[f"task_{i}"])],
-    }
+    batch = {key: frame(key) for key in image_keys}
+    batch["observation.state"] = torch.from_numpy(obs[f"state_{i}"].astype(
+        np.float32))[None]
+    batch["task"] = [str(obs[f"task_{i}"])]
+    return batch
 
 
 def main():
@@ -130,6 +135,9 @@ def main():
                         choices=("fp32", "bf16"))
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no-flip",
+                        action="store_true",
+                        help="feed the frames upright (not LIBERO renders)")
     parser.add_argument("--preprocess-only", action="store_true")
     args = parser.parse_args()
 
@@ -139,12 +147,16 @@ def main():
     checkpoint = local_checkpoint(args, workdir.name)
     preprocessor = PolicyProcessorPipeline.from_pretrained(
         checkpoint, config_filename="policy_preprocessor.json")
+    config = json.load(open(os.path.join(checkpoint, "config.json")))
+    noise_shape = (int(config["chunk_size"]),
+                   int(config.get("expected_max_action_dim", 32)))
     obs = np.load(args.obs)
     count = len([k for k in obs.files if k.startswith("state_")])
     out = {}
     batches = []
     for i in range(count):
-        batch = preprocessor(observation(obs, i))
+        batch = preprocessor(
+            observation(obs, i, config["image_keys"], not args.no_flip))
         batches.append(batch)
         for key in ("input_ids", "token_type_ids", "pixel_values",
                     "image_token_pooling", "image_grids", "image_num_crops",
@@ -152,9 +164,11 @@ def main():
             value = batch.get(key)
             if torch.is_tensor(value):
                 out[f"{key.replace('.', '_')}_{i}"] = value.detach().cpu(
-                ).float().numpy() if value.is_floating_point(
-                ) else value.cpu().numpy()
-        print(f"{i}: {str(obs[f'task_{i}'])!r}  {batch['input_ids'].shape[1]} tokens")
+                ).float().numpy() if value.is_floating_point() else value.cpu(
+                ).numpy()
+        print(
+            f"{i}: {str(obs[f'task_{i}'])!r}  {batch['input_ids'].shape[1]} tokens"
+        )
     if args.preprocess_only:
         np.savez(args.out, **out)
         print(f"{count} samples (preprocessing) -> {args.out}")
@@ -193,16 +207,18 @@ def main():
     generator = torch.Generator().manual_seed(args.seed)
 
     def fixed_noise(*size, **kwargs):
-        shape = tuple(kwargs.get("size", size[0] if len(size) == 1 and
-                                 isinstance(size[0], tuple) else size))
-        if len(shape) == 3 and shape[1:] == (10, 32):
+        shape = tuple(
+            kwargs.get(
+                "size", size[0]
+                if len(size) == 1 and isinstance(size[0], tuple) else size))
+        if len(shape) == 3 and shape[1:] == noise_shape:
             return captured["noise"].to(kwargs.get("device"),
                                         kwargs.get("dtype"))
         return randn(*size, **kwargs)
 
     for i, batch in enumerate(batches):
         captured.clear()
-        captured["noise"] = randn((1, 10, 32), generator=generator)
+        captured["noise"] = randn((1, ) + noise_shape, generator=generator)
         torch.randn = fixed_noise
         try:
             with torch.no_grad():
@@ -215,8 +231,8 @@ def main():
             return t.detach().float().cpu().numpy()
 
         visual = captured["visual"]
-        out[f"visual_{i}"] = np32(visual[0] if isinstance(
-            visual, (tuple, list)) else visual)
+        out[f"visual_{i}"] = np32(
+            visual[0] if isinstance(visual, (tuple, list)) else visual)
         out[f"k_{i}"] = np.stack([np32(k) for k, _ in captured["kv"]])
         out[f"v_{i}"] = np.stack([np32(v) for _, v in captured["kv"]])
         out[f"encoder_mask_{i}"] = captured["mask"].cpu().numpy()
