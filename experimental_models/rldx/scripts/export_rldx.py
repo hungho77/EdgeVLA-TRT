@@ -35,6 +35,12 @@ import rldx_llm  # noqa: E402
 LLM_PREFIX = "backbone.qwen_model.model.language_model."
 
 
+def processor_file(checkpoint, name):
+    """The official loader reads the processor files from processor/ when the checkpoint has one."""
+    subdir = os.path.join(checkpoint, "processor")
+    return os.path.join(subdir if os.path.isdir(subdir) else checkpoint, name)
+
+
 def export_llm_a(args, text_config):
     weights = rldx_llm.load_tensors(args.checkpoint, LLM_PREFIX)
     weights = {
@@ -148,8 +154,8 @@ def export_action(args, text_config):
     model, config = rldx_action.build_action_model(args.checkpoint)
     rldx_action.mixed_precision(model)
     embodiment = json.load(
-        open(os.path.join(args.checkpoint,
-                          "embodiment_id.json")))[args.embodiment]
+        open(processor_file(args.checkpoint,
+                            "embodiment_id.json")))[args.embodiment]
     step = rldx_action.Step(model.half(), embodiment_id=int(embodiment)).eval()
     horizon, dim = 16, int(config.max_action_dim)
     f16 = torch.float16
@@ -183,24 +189,42 @@ def export_assets(args, text_config):
     vlm = AutoConfig.from_pretrained(args.vlm)
     model = AutoConfig.from_pretrained(args.checkpoint, trust_remote_code=True)
     processor = json.load(
-        open(os.path.join(args.checkpoint, "processor_config.json")))
-    modality = processor["processor_kwargs"]["modality_configs"][
-        args.embodiment]
-    stats = json.load(open(os.path.join(args.checkpoint,
-                                        "statistics.json")))[args.embodiment]
+        open(processor_file(args.checkpoint, "processor_config.json")))
+    kwargs = processor["processor_kwargs"]
+    modality = kwargs["modality_configs"][args.embodiment]
+    stats = json.load(open(processor_file(args.checkpoint,
+                                          "statistics.json")))[args.embodiment]
+    low, high = ("q01",
+                 "q99") if kwargs.get("use_percentiles", True) else ("min",
+                                                                     "max")
 
     def ranges(group):
         keys = modality[group]["modality_keys"]
         return [{
             "key": k,
-            "q01": stats[group][k]["q01"],
-            "q99": stats[group][k]["q99"]
+            "q01": stats[group][k][low],
+            "q99": stats[group][k][high]
         } for k in keys]
+
+    def action_ranges():
+        """RELATIVE groups are unnormalized with the relative statistics' per-step min / max (they replace the
+        absolute ones wholesale, percentiles or not) and added to the raw state of the same key."""
+        groups = ranges("action")
+        configs = modality["action"].get("action_configs") or []
+        relative = kwargs.get("use_relative_action", False)
+        for group, config in zip(groups, configs):
+            if relative and config["rep"].upper() == "RELATIVE":
+                key = group["key"]
+                group.update(rep="relative",
+                             state_key=config.get("state_key") or key,
+                             q01=stats["relative_action"][key]["min"],
+                             q99=stats["relative_action"][key]["max"])
+        return groups
 
     merge = vlm.vision_config.spatial_merge_size
     grid = args.image_size // vlm.vision_config.patch_size // merge
     embodiments = json.load(
-        open(os.path.join(args.checkpoint, "embodiment_id.json")))
+        open(processor_file(args.checkpoint, "embodiment_id.json")))
     os.makedirs(args.out, exist_ok=True)
     config = {
         "model_family": "rldx",
@@ -220,7 +244,7 @@ def export_assets(args, text_config):
         "max_state_dim": int(model.max_state_dim),
         "denoising_steps": 4,
         "state": ranges("state"),
-        "action": ranges("action"),
+        "action": action_ranges(),
     }
     json.dump(config,
               open(os.path.join(args.out, "config.json"), "w"),

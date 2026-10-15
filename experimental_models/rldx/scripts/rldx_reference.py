@@ -19,10 +19,13 @@ the frames at t-6, t-4, t-2 and t, the state as x/y/z, roll/pitch/yaw (axis-angl
 task. The initial noise is fixed (saved with the outputs) so the engines can be fed the same one.
 
     RLDX_ATTN_IMPL=sdpa PYTHONPATH=RLDX-1 python rldx_reference.py --checkpoint RLDX-1-FT-LIBERO --obs obs.npz \\
-        --out ref.npz [--precision bf16|fp32]
+        --out ref.npz [--precision bf16|fp32] [--robot]
 
 obs.npz holds agentview_<i> / wrist_<i> ([7, H, W, 3] raw LIBERO renders of consecutive steps, the last being t;
-rotated 180 degrees here as the official env does), state_<i> and task_<i>. Per sample the output holds the
+rotated 180 degrees here as the official env does), state_<i> and task_<i>. With --robot the observation follows the
+checkpoint's modality config instead (RLDXPolicy's nested format): <camera>_<i> holds upright frames of consecutive
+data steps, the last being t, and state_<i> the state groups concatenated in the config's order; the actions come
+back decoded by the official processor (RELATIVE groups added to the state). Per sample the output holds the
 processor's input_ids, pixel_values and image_grid_thw, the visual embeddings and deepstack features, the hidden
 state after LLM layer 3 (before the video-token compression) and after the last layer (compressed), the 64
 cognition features the action model reads, the state features, each Euler step's input and velocity, the
@@ -62,6 +65,55 @@ def load_policy(args):
     return policy, RLDXSimPolicyWrapper(policy, strict=False)
 
 
+def libero_observation(obs, i):
+    views = {
+        name: np.stack([obs[f"{key}_{i}"][h][::-1, ::-1]
+                        for h in HISTORY])[None]
+        for name, key in (("video.image", "agentview"), ("video.wrist_image",
+                                                         "wrist"))
+    }
+    state = obs[f"state_{i}"].astype(np.float64)
+    return {
+        **views,
+        "state.x": state[None, None, 0:1],
+        "state.y": state[None, None, 1:2],
+        "state.z": state[None, None, 2:3],
+        "state.roll": state[None, None, 3:4],
+        "state.pitch": state[None, None, 4:5],
+        "state.yaw": state[None, None, 5:6],
+        "state.gripper": state[None, None, 6:8],
+        "annotation.human.action.task_description": (str(obs[f"task_{i}"]), ),
+    }
+
+
+def robot_observation(policy, obs, i):
+    """RLDXPolicy's nested observation from the checkpoint's modality config; returns it and the action keys."""
+    configs = policy.get_modality_config()
+    norm = policy.processor.state_action_processor.norm_params[
+        policy.embodiment_tag.value]
+    video = {}
+    for camera in configs["video"].modality_keys:
+        frames = obs[f"{camera}_{i}"]
+        video[camera] = np.stack([
+            frames[len(frames) - 1 + d] for d in configs["video"].delta_indices
+        ])[None]
+    flat = obs[f"state_{i}"].astype(np.float32)
+    state, offset = {}, 0
+    for key in configs["state"].modality_keys:
+        dim = int(norm["state"][key]["dim"])
+        state[key] = flat[offset:offset + dim].reshape(1, 1, dim)
+        offset += dim
+    language = configs["language"].modality_keys[0]
+    observation = {
+        "video": video,
+        "state": state,
+        "language": {
+            language: [[str(obs[f"task_{i}"])]]
+        },
+    }
+    return observation, list(configs["action"].modality_keys)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -74,6 +126,11 @@ def main():
                         choices=("bf16", "fp32"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--robot",
+        action="store_true",
+        help=
+        "observations in the checkpoint's own modality layout, not LIBERO's")
     args = parser.parse_args()
 
     policy, wrapper = load_policy(args)
@@ -124,31 +181,19 @@ def main():
     for i in range(count):
         captured.clear()
         captured["noise"] = randn((1, 16, 64), generator=generator)
-        views = {
-            name:
-            np.stack([obs[f"{key}_{i}"][h][::-1, ::-1] for h in HISTORY])[None]
-            for name, key in (("video.image", "agentview"),
-                              ("video.wrist_image", "wrist"))
-        }
-        state = obs[f"state_{i}"].astype(np.float64)
-        observation = {
-            **views,
-            "state.x": state[None, None, 0:1],
-            "state.y": state[None, None, 1:2],
-            "state.z": state[None, None, 2:3],
-            "state.roll": state[None, None, 3:4],
-            "state.pitch": state[None, None, 4:5],
-            "state.yaw": state[None, None, 5:6],
-            "state.gripper": state[None, None, 6:8],
-            "annotation.human.action.task_description":
-            (str(obs[f"task_{i}"]), ),
-        }
+        options = {"reset_memory": [True], "session_ids": ["golden"]}
         torch.randn = fixed_noise
         try:
-            actions, _ = wrapper.get_action(observation, {
-                "reset_memory": [True],
-                "session_ids": ["golden"]
-            })
+            if args.robot:
+                observation, action_keys = robot_observation(policy, obs, i)
+                actions, _ = policy.get_action(observation, options)
+            else:
+                actions, _ = wrapper.get_action(libero_observation(obs, i),
+                                                options)
+                action_keys = [
+                    f"action.{k}"
+                    for k in ("x", "y", "z", "roll", "pitch", "yaw", "gripper")
+                ]
         finally:
             torch.randn = randn
 
@@ -175,10 +220,8 @@ def main():
             [np32(x) for x in captured["step_input"]])
         out[f"step_velocity_{i}"] = np.stack(
             [np32(v[:, -16:]) for v in captured["step_velocity"]])
-        out[f"actions_{i}"] = np.concatenate([
-            np.asarray(actions[f"action.{k}"], np.float32)[0]
-            for k in ("x", "y", "z", "roll", "pitch", "yaw", "gripper")
-        ], -1)
+        out[f"actions_{i}"] = np.concatenate(
+            [np.asarray(actions[k], np.float32)[0] for k in action_keys], -1)
         print(
             f"{i}: {str(obs[f'task_{i}'])!r}  {out[f'input_ids_{i}'].shape[1]} tokens, "
             f"action row 0 {np.round(out[f'actions_{i}'][0], 4)}")

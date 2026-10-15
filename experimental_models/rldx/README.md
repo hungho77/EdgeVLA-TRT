@@ -42,6 +42,13 @@ camera's oldest frame in the request, as the official evaluation buffer repeats 
 offsets are in the training data's steps; `AsyncChunkedController` keeps the frames per tick when a server
 advertises a history, so the control loop should run at the dataset's rate.
 
+**Relative actions.** A checkpoint can predict some action groups relative to the state (the processor's
+`use_relative_action` and a `RELATIVE` action config, e.g. the SO101 fine-tune's `single_arm`). The official
+processor then replaces that group's statistics wholesale by `relative_action`'s per-step min / max (not q01 / q99,
+whatever `use_percentiles` says) and adds the raw state of the same key after unnormalizing. The assets write
+those ranges per chunk row with the state key, and `RldxPolicy` adds the request's raw state. Checkpoints saved by
+the official trainer keep the processor files in `processor/`, which the export reads as the official loader does.
+
 ## Accuracy and speed
 
 AGX Orin 64 GB, JetPack 6.2, against the official policy in FP32 on the board's GPU, two LIBERO observations with
@@ -71,6 +78,15 @@ with the checkpoint's conventions (8 of 16 rows per call, gripper `sign(2 g - 1)
 1, 4 and 5, all at the step limit; policy call median 297 ms). The paper
 reports 98.6% on LIBERO-Short (the Spatial, Object and Goal average; no per-suite number) over 50 episodes per task,
 with the official rollout's random resets, no settle steps and a 720-step limit.
+
+**SO101.** [`twanghcmut/RLDX-1-SO101-LeftArm-Multitask`](https://huggingface.co/twanghcmut/RLDX-1-SO101-LeftArm-Multitask)
+(one SO-101 left arm, cameras `top` 360 x 640 and `wrist` 480 x 640, 6 joints with `single_arm` relative, frames
+t-6, t-4, t-2, t at 30 fps) builds with the same commands. On two dataset observations against the official policy
+in FP32 (`rldx_reference.py --robot`) the server's actions are within 0.21 / 0.26 degrees on values up to 88. Open
+loop on the model card's 11 trajectories (episode 0 of each task, a call every 16 steps, the 16 predicted rows
+against the recorded actions, up to 400 steps): MAE 4.50 against the card's 4.55; holding the action at each call
+scores 3.25, as the card notes. A call takes about 300 ms (8 images of 60 or 48 tokens), more than a 16-row
+chunk allows at 30 Hz with one request in flight.
 
 ```bash
 # Reference env: RLDX's code on a CUDA PyTorch with transformers 4.57.0 (its pinned version)

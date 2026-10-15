@@ -52,7 +52,7 @@ struct RldxFrame
 
 struct RldxChunk
 {
-    std::vector<float> actions;    //!< [horizon, actionDim] unnormalized: eef position / rotation deltas, gripper_close
+    std::vector<float> actions;    //!< [horizon, actionDim] unnormalized, RELATIVE groups added to the raw state
     std::vector<float> normalized; //!< [horizon, maxActionDim] the flow output, before unnormalization
     int32_t historyFilled{0};      //!< history frames the request lacked, filled from its oldest frame per camera
     float hostMs{0.0F};
@@ -121,7 +121,7 @@ public:
     }
     int32_t actionDim() const noexcept
     {
-        return static_cast<int32_t>(mActionLow.size());
+        return static_cast<int32_t>(mActionStateIndex.size());
     }
     int32_t chunkSize() const noexcept
     {
@@ -155,7 +155,9 @@ private:
     int32_t mMaxStateDim{64};
     int32_t mSteps{4};
     RldxTextGeometry mGeometry;
-    std::vector<float> mStateLow, mStateHigh, mActionLow, mActionHigh;
+    std::vector<float> mStateLow, mStateHigh;
+    std::vector<float> mActionLow, mActionHigh; //!< [horizon, actionDim]
+    std::vector<int32_t> mActionStateIndex;     //!< per action dim: the state dim a RELATIVE value adds to, else -1
 
     std::string mLastTask;
     std::vector<std::pair<int32_t, int32_t>> mLastGrids;
