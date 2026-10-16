@@ -134,8 +134,8 @@ int main(int argc, char** argv)
             out["pixel_values"] = pixels;
             std::ofstream(output) << out.dump();
         }
-        std::printf("chunk %d x %d, first action:", policy.chunkSize(), policy.actionDim());
-        for (int32_t d = 0; d < policy.actionDim(); ++d)
+        std::printf("chunk %d x %d, first action:", policy.chunkSize(), policy.outputDim());
+        for (int32_t d = 0; d < policy.outputDim(); ++d)
         {
             std::printf(" %.3f", chunk.actions[d]);
         }

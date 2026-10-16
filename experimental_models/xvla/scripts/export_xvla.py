@@ -12,9 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Export a LeRobot X-VLA checkpoint as vision / encoder / step ONNX graphs (FP16, batch 1).
+"""Export an X-VLA checkpoint as vision / encoder / step ONNX graphs (FP16, batch 1).
 
-LeRobot's own modules provide every layer; the legacy TorchScript exporter lowers their attention to standard
+A LeRobot checkpoint (ee6d action space) runs on LeRobot's modules; with --xvla-src, a checkpoint fine-tuned in the
+official repository (``auto`` action space, min-max normalized actions, e.g. twanghcmut/X-VLA-SO101-LeftArm-Multitask)
+runs on that repository's modules. The model code provides every layer; the legacy TorchScript exporter lowers their attention to standard
 ops, which TensorRT 10.3 builds (``trtexec --stronglyTyped``).
 
   vision.onnx   views [V, 3, 224, 224] (ImageNet-normalized) -> Florence-2 image features [V, tokens, D]
@@ -29,6 +31,8 @@ otherwise hits a TensorRT 10.3 miscompilation (actions off by up to 0.04 on a 0.
 Writes config.json (shapes, steps, action space, state / action normalization) and the BART tokenizer.
 
     python export_xvla.py --checkpoint xvla-base --out xvla_onnx [--check ref.npz]
+    python export_xvla.py --xvla-src X-VLA --checkpoint X-VLA-SO101-LeftArm-Multitask --stats stats.json \
+        --cameras top wrist --domain-id 19 --delta-dims 0 1 2 3 4 --out xvla_onnx [--check ref.npz]
 """
 
 import argparse
@@ -48,30 +52,36 @@ from tensorrt_edgellm.onnx.trt_workarounds import \
 
 class Vision(nn.Module):
 
-    def __init__(self, model):
+    def __init__(self, model, native):
         super().__init__()
         self.vlm = model.vlm
+        self.native = native
 
     def forward(self, images):
+        if self.native:
+            return self.vlm._encode_image(images)
         return self.vlm.get_image_features(images).pooler_output
 
 
 class Encoder(nn.Module):
 
-    def __init__(self, model):
+    def __init__(self, model, native):
         super().__init__()
         self.vlm = model.vlm
+        self.native = native
 
     def forward(self, primary, token_ids):
         # BartEncoder.forward without its mask construction, which does not trace: X-VLA attends to every position
         # (an all-ones mask), the same as passing no mask to the layers.
         embeds = torch.cat(
             [primary, self.vlm.get_input_embeddings()(token_ids)], dim=1)
-        encoder = self.vlm.language_model.encoder
+        language = self.vlm.language_model
+        encoder = language.model.encoder if self.native else language.encoder
         hidden = encoder.layernorm_embedding(
             embeds + encoder.embed_positions(embeds[:, :, -1]))
         for layer in encoder.layers:
-            hidden = layer(hidden, None)
+            hidden = layer(hidden, None, None) if self.native else layer(
+                hidden, None)
             hidden = hidden[0] if isinstance(hidden, tuple) else hidden
         return hidden
 
@@ -112,6 +122,37 @@ class Step(nn.Module):
         return predicted + rtc_weight * (rtc_seed - predicted)
 
 
+class NativeModel:
+    """The attributes of LeRobot's XVLA model that the export reads, on the official repository's model."""
+
+    def __init__(self, model):
+        self.vlm, self.transformer, self.action_space = model.vlm, model.transformer, model.action_space
+        self.config = model.config
+        self.chunk_size = model.num_actions
+        self.dim_action = model.action_space.dim_action
+        self.dim_proprio = getattr(model.action_space, "dim_proprio",
+                                   self.dim_action)
+        if not hasattr(self.action_space, "gripper_idx"):
+            self.action_space.gripper_idx = ()
+
+
+def load_native(src, checkpoint):
+    sys.path.insert(0, os.path.abspath(src))
+    from models.modeling_xvla import XVLA
+
+    model = XVLA.from_pretrained(checkpoint).to(torch.float32).eval()
+    if model.config.action_mode.lower() != "auto":
+        raise ValueError(
+            f"--xvla-src supports the auto action space, got {model.config.action_mode}"
+        )
+    for module in model.modules():
+        module_config = getattr(module, "config", None)
+        if module_config is not None and hasattr(module_config,
+                                                 "_attn_implementation"):
+            module_config._attn_implementation = "eager"
+    return model
+
+
 def load_policy(checkpoint):
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
@@ -133,18 +174,20 @@ def load_policy(checkpoint):
     return policy
 
 
-def run_chain(vision, encoder, step, ref, steps):
-    images = torch.from_numpy(ref["image_input"])
-    mask = torch.from_numpy(ref["image_mask"])
+def run_chain(vision, encoder, step, ref, steps, suffix=""):
+    images = torch.from_numpy(ref["image_input" + suffix])
+    mask = torch.from_numpy(ref["image_mask" + suffix])
     feats = vision(images[mask])
     all_feats = feats.new_zeros((images.shape[0], *feats.shape[1:]))
     all_feats[mask] = feats
-    vlm = encoder(all_feats[:1], torch.from_numpy(ref["input_ids"])[None])
+    vlm = encoder(all_feats[:1],
+                  torch.from_numpy(ref["input_ids" + suffix])[None])
     aux = all_feats[1:].reshape(1, -1, all_feats.shape[-1])
-    x1 = torch.from_numpy(ref["noise"])
+    x1 = torch.from_numpy(ref["noise" + suffix])
+    x1 = x1 if x1.dim() == 3 else x1[None]
     action = torch.zeros_like(x1)
-    proprio = torch.from_numpy(ref["proprio"])[None]
-    domain = torch.tensor([int(ref["domain_id"])])
+    proprio = torch.from_numpy(ref["proprio" + suffix])[None]
+    domain = torch.tensor([int(ref["domain_id" + suffix])])
     for i in range(steps, 0, -1):
         action = step(x1, action, torch.full((1, ), i / steps), proprio,
                       domain, vlm, aux)
@@ -159,37 +202,71 @@ def main():
     parser.add_argument("--out")
     parser.add_argument(
         "--check",
-        help="lerobot_xvla_reference.py output: compare the split modules first"
+        help=
+        "lerobot_xvla_reference.py / xvla_reference.py output: compare the split modules first"
     )
+    native = parser.add_argument_group(
+        "official-repository checkpoints (--xvla-src)")
+    native.add_argument("--xvla-src",
+                        help="a github.com/2toinf/X-VLA checkout")
+    native.add_argument("--stats",
+                        help="LeRobot meta/stats.json of the training data")
+    native.add_argument("--cameras", nargs="+", default=["top", "wrist"])
+    native.add_argument("--views", type=int, default=3)
+    native.add_argument("--domain-id", type=int, default=0)
+    native.add_argument("--delta-dims", type=int, nargs="*", default=[])
+    native.add_argument("--steps", type=int, default=10)
     args = parser.parse_args()
 
     import numpy as np
-    policy = load_policy(args.checkpoint)
-    model, config = policy.model, policy.config
-    vision, encoder, step = Vision(model).eval(), Encoder(model).eval(), Step(
-        model).eval()
+    is_native = args.xvla_src is not None
+    if is_native:
+        model = NativeModel(load_native(args.xvla_src, args.checkpoint))
+        steps = args.steps
+    else:
+        policy = load_policy(args.checkpoint)
+        model, config = policy.model, policy.config
+        steps = config.num_denoising_steps
+    vision, encoder, step = Vision(model, is_native).eval(), Encoder(
+        model, is_native).eval(), Step(model).eval()
 
     if args.check:
         ref = np.load(args.check)
-        with torch.no_grad():
-            vlm, aux, action = run_chain(vision, encoder, step, ref,
-                                         config.num_denoising_steps)
-        gripper = list(model.action_space.gripper_idx)
-        action[:, gripper] = 1.0 / (1.0 + np.exp(-action[:, gripper]))
-        for name, ours, expected in (("encoder output", vlm,
-                                      ref["vlm_features"]),
-                                     ("aux view features", aux,
-                                      ref["aux_visual_inputs"]),
-                                     ("actions", action,
-                                      ref["model_actions"])):
-            print(
-                f"split {name} vs LeRobot: max|d| {np.abs(ours - expected).max():.3e} "
-                f"(|ref| max {np.abs(expected).max():.2f})")
+        samples = sorted(
+            int(k.rsplit("_", 1)[1])
+            for k in ref.files if k.startswith("input_ids_")) or [None]
+        for sample in samples:
+            suffix = "" if sample is None else f"_{sample}"
+            with torch.no_grad():
+                vlm, aux, action = run_chain(vision, encoder, step, ref, steps,
+                                             suffix)
+            gripper = list(model.action_space.gripper_idx)
+            action[:, gripper] = 1.0 / (1.0 + np.exp(-action[:, gripper]))
+            expected_actions = ref["model_actions" + suffix]
+            action = action[:, :expected_actions.shape[-1]]
+            for name, ours, expected in (("encoder output", vlm,
+                                          ref["vlm_features" + suffix]),
+                                         ("aux view features", aux,
+                                          ref["aux_visual_inputs" + suffix]),
+                                         ("actions", action,
+                                          expected_actions)):
+                print(
+                    f"{suffix or 'split'} {name} vs reference: max|d| {np.abs(ours - expected).max():.3e} "
+                    f"(|ref| max {np.abs(expected).max():.2f})")
 
     if args.out:
         os.makedirs(args.out, exist_ok=True)
-        # The saved tokenizer step pads to its own max_length, which is what the model sees.
-        length = int(tokenizer_config(args.checkpoint)["max_length"])
+        if is_native:
+            sys.path.insert(0, os.path.abspath(args.xvla_src))
+            from models.processing_xvla import XVLAProcessor
+            length = int(
+                XVLAProcessor.from_pretrained(
+                    args.checkpoint).language_max_length)
+            views = args.views
+        else:
+            # The saved tokenizer step pads to its own max_length, which is what the model sees.
+            length = int(tokenizer_config(args.checkpoint)["max_length"])
+            views = int(config.num_image_views or 1)
         dim = model.vlm.config.vision_config.projection_dim
         with torch.no_grad():
             tokens = vision(torch.zeros(1, 3, 224, 224)).shape[1]
@@ -216,7 +293,6 @@ def main():
         export(encoder, (torch.zeros(1, tokens, dim, dtype=f16),
                          torch.zeros(1, length, dtype=torch.int64)), "encoder",
                ["primary_features", "token_ids"], ["vlm_features"])
-        views = int(config.num_image_views or 1)
         chunk, dim_action = model.chunk_size, model.dim_action
         # Distinct example tensors: the exporter merges inputs that are the same object.
         export(step,
@@ -238,10 +314,55 @@ def main():
             apply_trt103_workarounds(os.path.join(args.out, f"{name}.onnx"))
             for name in ("vision", "encoder", "step")
         }
-        stage_runtime_assets(args.checkpoint, args.out, policy, tokens, length)
+        if is_native:
+            stage_native_assets(args, model, tokens, length)
+        else:
+            stage_runtime_assets(args.checkpoint, args.out, policy, tokens,
+                                 length)
         print(
             f"exported vision / encoder / step -> {args.out}; TensorRT 10.3 rewrites {rewrites}"
         )
+
+
+def stage_native_assets(args, model, tokens, length):
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
+    tokenizer.backend_tokenizer.save(os.path.join(args.out, "tokenizer.json"))
+    tokenizer.save_pretrained(os.path.join(args.out, "tokenizer"))
+    stats = json.load(open(args.stats))["action"]
+    json.dump(
+        {
+            "model_family": "xvla",
+            "cameras": args.cameras,
+            "num_views": args.views,
+            # Missing views are zero images marked present (the SO101 handler's third view), not masked out.
+            "pad_views": "zero_image",
+            "image_size": [224, 224],
+            "resize": "bicubic",
+            "image_tokens_per_view": tokens,
+            "max_tokens": length,
+            "padding_side": "right",
+            "pad_token_id": int(tokenizer.pad_token_id),
+            "chunk_size": int(model.chunk_size),
+            "action_dim": int(model.dim_action),
+            "proprio_dim": int(model.dim_proprio),
+            "real_action_dim": len(stats["min"]),
+            "state_dim": len(stats["min"]),
+            "gripper_idx": [],
+            "num_steps": args.steps,
+            "domain_id": args.domain_id,
+            "num_domains": int(model.config.num_domains),
+            "state_normalization": "MIN_MAX",
+            "action_normalization": "MIN_MAX",
+            "action_min": stats["min"],
+            "action_max": stats["max"],
+            "delta_dims": args.delta_dims,
+            # The official LeRobot v2.1 handlers feed action[t - 1] as the proprio.
+            "proprio_source": "previous_action",
+        },
+        open(os.path.join(args.out, "config.json"), "w"),
+        indent=1)
 
 
 def tokenizer_config(checkpoint):
