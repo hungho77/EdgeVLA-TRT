@@ -33,8 +33,10 @@ of the interleaved pairs, with the official position ids (the double-stream bloc
 tokens from 1, the single-stream ones from 2).
 
 **Real-time chunking.** The official RTC modes do not apply (`trained` needs a checkpoint trained for it, `guided`
-needs autograd), so the server uses GR00T's: the overlap rows start from the previous chunk's normalized rows and
-their velocity is scaled by 0 on the frozen rows, then by an exponential ramp.
+needs autograd), so the server uses GR00T's: the overlap rows start from the previous chunk's rows, kept in robot
+units and re-normalized at their new row index against the current state (RELATIVE groups have per-row ranges and add
+the state), and their velocity is scaled by 0 on the frozen rows, then by an exponential ramp. On the SO101 checkpoint
+the frozen rows reproduce the previous chunk to 0.003 deg after the arm moved 16 deg.
 
 **Frame history.** The server is stateless, as the official one: a request carries the past frames named
 `camera@offset` (`front_view@-6`, ...), and its `ready` line lists `frame_history`. A missing past frame takes the

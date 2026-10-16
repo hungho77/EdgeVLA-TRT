@@ -382,6 +382,22 @@ RldxChunk RldxPolicy::act(std::vector<RldxFrame> const& frames, std::vector<floa
         int32_t const frozen = std::min(rtc->frozenSteps, overlap);
         std::copy_n(mPrevious.begin() + static_cast<int64_t>(startRow) * mMaxActionDim,
             static_cast<int64_t>(overlap) * mMaxActionDim, x0.begin());
+        // RELATIVE ranges differ per row and are offset by the state: re-encode the previous absolute rows at their new
+        // row index against the current state.
+        int32_t const actionDims = actionDim();
+        for (int32_t row = 0; row < overlap; ++row)
+        {
+            for (int32_t d = 0; d < actionDims; ++d)
+            {
+                size_t const i = static_cast<size_t>(row) * actionDims + d;
+                int32_t const reference = mActionStateIndex[d];
+                float const value = mPreviousActions[static_cast<size_t>(startRow + row) * actionDims + d]
+                    - (reference >= 0 ? state[reference] : 0.0F);
+                float const span = mActionHigh[i] - mActionLow[i];
+                x0[static_cast<size_t>(row) * mMaxActionDim + d]
+                    = span > 0.0F ? std::clamp(2.0F * (value - mActionLow[i]) / span - 1.0F, -1.0F, 1.0F) : 0.0F;
+            }
+        }
         double const last = std::max(1.0 - std::exp(-static_cast<double>(rtc->rampRate)), 1e-8);
         for (int32_t row = 0; row < overlap; ++row)
         {
@@ -510,6 +526,7 @@ RldxChunk RldxPolicy::act(std::vector<RldxFrame> const& frames, std::vector<floa
                 + (reference >= 0 ? state[reference] : 0.0F);
         }
     }
+    mPreviousActions = chunk.actions;
     return chunk;
 }
 

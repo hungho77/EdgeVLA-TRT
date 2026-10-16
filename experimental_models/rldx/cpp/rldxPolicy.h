@@ -97,6 +97,7 @@ public:
     void resetEpisode() noexcept
     {
         mPrevious.clear();
+        mPreviousActions.clear();
     }
     void setNoiseSeed(uint64_t seed) noexcept
     {
@@ -169,12 +170,13 @@ private:
     rt::Tensor mCognitionFeatures;
     rt::Tensor mX[2]; //!< FP16 [1, horizon, maxActionDim] ping-pong
     rt::Tensor mVelocity;
-    rt::Tensor mTimes;            //!< FP16 t per step, then dt, one 256-byte slot each
-    rt::Tensor mState;            //!< FP16 [1, 1, maxStateDim]
-    rt::Tensor mStrength;         //!< FP16 [1, horizon, 1]
-    rt::Tensor mStageHost;        //!< pinned FP16: x0, state, strength
-    rt::Tensor mOutHost;          //!< pinned FP16 [horizon, maxActionDim]
-    std::vector<float> mPrevious; //!< last chunk, normalized [horizon, maxActionDim]
+    rt::Tensor mTimes;                   //!< FP16 t per step, then dt, one 256-byte slot each
+    rt::Tensor mState;                   //!< FP16 [1, 1, maxStateDim]
+    rt::Tensor mStrength;                //!< FP16 [1, horizon, 1]
+    rt::Tensor mStageHost;               //!< pinned FP16: x0, state, strength
+    rt::Tensor mOutHost;                 //!< pinned FP16 [horizon, maxActionDim]
+    std::vector<float> mPrevious;        //!< last chunk, normalized [horizon, maxActionDim]
+    std::vector<float> mPreviousActions; //!< last chunk in robot units [horizon, actionDim]
     std::mt19937_64 mNoiseGen{0};
     bool mUseCudaGraph{true};
     cudaGraphExec_t mGraph{nullptr};
