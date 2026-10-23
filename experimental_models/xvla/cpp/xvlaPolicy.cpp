@@ -16,6 +16,7 @@
  */
 
 #include "xvlaPolicy.h"
+#include "vlaImage.h"
 
 #include "common/checkMacros.h"
 
@@ -68,11 +69,14 @@ XvlaPolicy::XvlaPolicy(std::string const& engineDir, cudaStream_t stream)
 {
     Json const config = readJson(engineDir + "/config.json");
     ELLM_CHECK(config.at("model_family").get<std::string>() == "xvla", "XvlaPolicy: not an X-VLA engine dir");
-    ELLM_CHECK(config.at("state_normalization").get<std::string>() == "IDENTITY",
-        "XvlaPolicy: only identity state normalization is supported");
+    std::string const stateNormalization = config.at("state_normalization").get<std::string>();
+    ELLM_CHECK(stateNormalization == "IDENTITY" || stateNormalization == "MIN_MAX",
+        "XvlaPolicy: only identity or min-max state normalization is supported");
     mCameras = config.at("cameras").get<std::vector<std::string>>();
     // LeRobot pads to num_image_views with masked views, which includes the checkpoint's empty cameras.
     mNumViews = config.at("num_views").get<int32_t>();
+    mZeroImageViews = config.value("pad_views", "masked") == "zero_image";
+    mBicubic = config.value("resize", "pad") == "bicubic";
     ELLM_CHECK(static_cast<int32_t>(mCameras.size()) <= mNumViews, "XvlaPolicy: more cameras than views");
     auto const size = config.at("image_size").get<std::vector<int32_t>>();
     ELLM_CHECK(size.size() == 2 && size[0] == size[1], "XvlaPolicy: only square model images are supported");
@@ -94,6 +98,31 @@ XvlaPolicy::XvlaPolicy(std::string const& engineDir, cudaStream_t stream)
         mActionMean = config.at("action_mean").get<std::vector<float>>();
         mActionStd = config.at("action_std").get<std::vector<float>>();
     }
+    mOutputDim = mActionDim;
+    mStateDim = mProprioDim;
+    if (stateNormalization == "MIN_MAX")
+    {
+        ELLM_CHECK(config.at("action_normalization").get<std::string>() == "MIN_MAX",
+            "XvlaPolicy: min-max state normalization needs min-max actions");
+        mActionMin = config.at("action_min").get<std::vector<float>>();
+        auto const max = config.at("action_max").get<std::vector<float>>();
+        ELLM_CHECK(max.size() == mActionMin.size(), "XvlaPolicy: action_min / action_max differ in size");
+        for (size_t d = 0; d < max.size(); ++d)
+        {
+            float const span = max[d] - mActionMin[d];
+            mActionSpan.push_back(span < 1e-6F ? 1.0F : span);
+        }
+        mOutputDim = config.value("real_action_dim", static_cast<int32_t>(mActionMin.size()));
+        mStateDim = static_cast<int32_t>(mActionMin.size());
+        ELLM_CHECK(mOutputDim == mStateDim && mStateDim <= mProprioDim && mOutputDim <= mActionDim,
+            "XvlaPolicy: min-max statistics do not match the action / proprio dims");
+        mDeltaDims = config.value("delta_dims", std::vector<int32_t>{});
+        for (int32_t d : mDeltaDims)
+        {
+            ELLM_CHECK(d >= 0 && d < mOutputDim, "XvlaPolicy: delta dim outside the real action dims");
+        }
+    }
+    mProprioSource = config.value("proprio_source", std::string("state"));
 
     mTokenizer = std::make_unique<tokenizer::Tokenizer>();
     ELLM_CHECK(mTokenizer->loadFromHF(engineDir + "/tokenizer"), "XvlaPolicy: failed to load the tokenizer");
@@ -240,6 +269,13 @@ void normalizeResize(unsigned char const* rgb, int32_t height, int32_t width, in
 std::vector<float> XvlaPolicy::preprocessView(unsigned char const* rgb, int32_t height, int32_t width) const
 {
     std::vector<float> out(static_cast<size_t>(3) * mImageSize * mImageSize);
+    std::vector<unsigned char> resized;
+    if (mBicubic && (height != mImageSize || width != mImageSize))
+    {
+        resized = vla::resizeBicubicPil(rgb, height, width, mImageSize, mImageSize);
+        rgb = resized.data();
+        height = width = mImageSize;
+    }
     normalizeResize(rgb, height, width, mImageSize, out.data(), [](float v) { return v; });
     return out;
 }
@@ -326,11 +362,22 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
         ELLM_CHECK(present[i] == static_cast<int32_t>(i), "XvlaPolicy: cameras may only be missing at the end");
     }
     auto const numPresent = static_cast<int64_t>(present.size());
+    int64_t const numEncoded = mZeroImageViews ? static_cast<int64_t>(mNumViews) : numPresent;
+    std::fill(pixels + numPresent * viewSize, pixels + numEncoded * viewSize, __float2half(0.0F));
 
     // Views are independent: each is normalized and resized straight into its FP16 slice, concurrently.
     auto prepareView = [&](std::pair<XvlaView const*, __half*> const& job) {
-        normalizeResize(job.first->rgb, job.first->height, job.first->width, mImageSize, job.second,
-            [](float v) { return __float2half(v); });
+        unsigned char const* rgb = job.first->rgb;
+        int32_t height = job.first->height;
+        int32_t width = job.first->width;
+        std::vector<unsigned char> resized;
+        if (mBicubic && (height != mImageSize || width != mImageSize))
+        {
+            resized = vla::resizeBicubicPil(rgb, height, width, mImageSize, mImageSize);
+            rgb = resized.data();
+            height = width = mImageSize;
+        }
+        normalizeResize(rgb, height, width, mImageSize, job.second, [](float v) { return __float2half(v); });
     };
     std::vector<std::future<void>> pending;
     for (size_t j = 1; j < jobs.size(); ++j)
@@ -367,10 +414,21 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
         ELLM_CHECK(static_cast<int64_t>(noise.size()) == chunkElems, "XvlaPolicy: noise has the wrong size");
         std::transform(noise.begin(), noise.end(), stage, __float2half);
     }
-    for (int32_t d = 0; d < mProprioDim; ++d)
+    std::vector<float> proprio(static_cast<size_t>(mProprioDim), 0.0F);
+    if (mActionMin.empty())
     {
-        stage[chunkElems + d] = __float2half(d < static_cast<int32_t>(state.size()) ? state[d] : 0.0F);
+        std::copy_n(state.begin(), std::min(state.size(), proprio.size()), proprio.begin());
     }
+    else
+    {
+        ELLM_CHECK(static_cast<int32_t>(state.size()) == mStateDim,
+            "XvlaPolicy: expected a state of " + std::to_string(mStateDim) + " values");
+        for (int32_t d = 0; d < mStateDim; ++d)
+        {
+            proprio[d] = (state[d] - mActionMin[d]) / mActionSpan[d] * 2.0F - 1.0F;
+        }
+    }
+    std::transform(proprio.begin(), proprio.end(), stage + chunkElems, __float2half);
 
     *static_cast<int64_t*>(mRtcHost.rawPointer()) = mDomainId;
     auto* seed = static_cast<__half*>(mRtcHost.rawPointer()) + 4;
@@ -381,8 +439,15 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
         int32_t const startRow = rtc->startRow >= 0 ? rtc->startRow : mChunk - rtc->executionHorizon;
         ELLM_CHECK(startRow >= 0 && startRow <= mChunk, "XvlaPolicy: RTC start row outside the chunk");
         int32_t const leftover = mChunk - startRow;
-        std::transform(
-            mPrevious.begin() + static_cast<ptrdiff_t>(startRow) * mActionDim, mPrevious.end(), seed, __float2half);
+        std::vector<float> rows(mPrevious.begin() + static_cast<ptrdiff_t>(startRow) * mActionDim, mPrevious.end());
+        for (int32_t t = 0; t < leftover; ++t)
+        {
+            for (int32_t d : mDeltaDims)
+            {
+                rows[static_cast<size_t>(t) * mActionDim + d] -= proprio[d];
+            }
+        }
+        std::transform(rows.begin(), rows.end(), seed, __float2half);
         std::vector<float> const weights
             = prefixWeights(rtc->inferenceDelay, std::min(rtc->executionHorizon, leftover), mChunk);
         std::transform(weights.begin(), weights.end(), weight, __float2half);
@@ -390,7 +455,7 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
 
     size_t const featureBytes = static_cast<size_t>(mImageTokens) * mHidden * sizeof(__half);
     CUDA_CHECK(cudaMemcpyAsync(
-        mPixels.rawPointer(), pixels, numPresent * viewSize * sizeof(__half), cudaMemcpyHostToDevice, mStream));
+        mPixels.rawPointer(), pixels, numEncoded * viewSize * sizeof(__half), cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(
         mTokens.rawPointer(), mTokensHost.rawPointer(), mMaxTokens * sizeof(int64_t), cudaMemcpyHostToDevice, mStream));
     CUDA_CHECK(cudaMemcpyAsync(mX1.rawPointer(), stage, chunkElems * sizeof(__half), cudaMemcpyHostToDevice, mStream));
@@ -404,14 +469,14 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
     CUDA_CHECK(
         cudaMemcpyAsync(mRtcWeight.rawPointer(), weight, mChunk * sizeof(__half), cudaMemcpyHostToDevice, mStream));
     auto* features = static_cast<char*>(mFeatures.rawPointer());
-    int64_t const missing = static_cast<int64_t>(mNumViews) - numPresent;
+    int64_t const missing = static_cast<int64_t>(mNumViews) - numEncoded;
     if (missing > 0)
     {
-        CUDA_CHECK(cudaMemsetAsync(features + numPresent * featureBytes, 0, missing * featureBytes, mStream));
+        CUDA_CHECK(cudaMemsetAsync(features + numEncoded * featureBytes, 0, missing * featureBytes, mStream));
     }
 
     CUDA_CHECK(cudaEventRecord(mEvents[0], mStream));
-    mVision.setShape("images", {numPresent, 3, mImageSize, mImageSize});
+    mVision.setShape("images", {numEncoded, 3, mImageSize, mImageSize});
     mVision.bind("images", mPixels.rawPointer());
     mVision.bind("image_features", features);
     ELLM_CHECK(mVision.enqueue(mStream), "XvlaPolicy: vision enqueue failed");
@@ -451,12 +516,33 @@ XvlaChunk XvlaPolicy::act(std::vector<XvlaView> const& views, std::vector<float>
     cudaEventElapsedTime(&chunk.denoiseMs, mEvents[2], mEvents[3]);
 
     auto const* out = static_cast<__half const*>(mOutHost.rawPointer());
-    chunk.actions.resize(chunkElems);
+    mPrevious.resize(chunkElems);
     for (int64_t i = 0; i < chunkElems; ++i)
     {
-        chunk.actions[i] = __half2float(out[i]);
+        mPrevious[i] = __half2float(out[i]);
     }
-    mPrevious = chunk.actions;
+    for (int32_t t = 0; t < mChunk; ++t)
+    {
+        for (int32_t d : mDeltaDims)
+        {
+            mPrevious[static_cast<size_t>(t) * mActionDim + d] += proprio[d];
+        }
+    }
+    if (!mActionMin.empty())
+    {
+        chunk.actions.resize(static_cast<size_t>(mChunk) * mOutputDim);
+        for (int32_t t = 0; t < mChunk; ++t)
+        {
+            for (int32_t d = 0; d < mOutputDim; ++d)
+            {
+                float const v = mPrevious[static_cast<size_t>(t) * mActionDim + d];
+                chunk.actions[static_cast<size_t>(t) * mOutputDim + d]
+                    = (v + 1.0F) / 2.0F * mActionSpan[d] + mActionMin[d];
+            }
+        }
+        return chunk;
+    }
+    chunk.actions = mPrevious;
     for (int32_t t = 0; t < mChunk; ++t)
     {
         for (int32_t g : mGripper)

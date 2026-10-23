@@ -20,14 +20,16 @@
 //!
 //! Request:  {"frames": [{"name": "image", "height": H, "width": W, "bytes": N}, ...] + raw RGB bytes,
 //!              or "cameras": {"image": "top.png", ...},  frames keyed by the checkpoint's camera names
-//!            "state": [...],                           proprio state, zero-padded to the model's width
+//!            "state": [...],                           proprio (ready "proprio": "previous_action": the last
+//!                                                      commanded action), zero-padded to the model's width
 //!            "task": "pick the cube",
 //!            "rtc": {"delay": 4, "horizon": 20,        optional, real-time chunking from the previous reply
 //!                    "start_row": 10},
 //!            "seed": 0,                                optional, reseeds x1
 //!            "reset": true}                            optional, start of an episode
 //! Reply:    {"actions": [[...], ...], "timing_ms": {...}}  or {"error": "..."}
-//! Actions are the checkpoint's own: ee6d absolute targets with the gripper channels through a sigmoid.
+//! Actions are the checkpoint's own: ee6d absolute targets with the gripper channels through a sigmoid, or for an
+//! ``auto`` checkpoint its real action dims, min-max unnormalized, delta dims added to the proprio.
 
 #include "xvlaPolicy.h"
 
@@ -62,8 +64,8 @@ int main(int argc, char** argv)
     }
 
     Json const ready = {{"ready", true}, {"family", "xvla"}, {"cameras", policy.cameras()},
-        {"state_dim", policy.proprioDim()}, {"action_dim", policy.actionDim()}, {"chunk", policy.chunkSize()},
-        {"domain", policy.domainId()}, {"rtc", "delay_horizon"}};
+        {"state_dim", policy.stateDim()}, {"action_dim", policy.outputDim()}, {"chunk", policy.chunkSize()},
+        {"domain", policy.domainId()}, {"rtc", "delay_horizon"}, {"proprio", policy.proprioSource()}};
     vla::PolicyServer server(argc, argv);
     server.run(
         ready,
@@ -100,8 +102,8 @@ int main(int argc, char** argv)
             Json rows = Json::array();
             for (int32_t t = 0; t < policy.chunkSize(); ++t)
             {
-                rows.push_back(std::vector<float>(chunk.actions.begin() + static_cast<int64_t>(t) * policy.actionDim(),
-                    chunk.actions.begin() + static_cast<int64_t>(t + 1) * policy.actionDim()));
+                rows.push_back(std::vector<float>(chunk.actions.begin() + static_cast<int64_t>(t) * policy.outputDim(),
+                    chunk.actions.begin() + static_cast<int64_t>(t + 1) * policy.outputDim()));
             }
             Json reply;
             reply["actions"] = rows;

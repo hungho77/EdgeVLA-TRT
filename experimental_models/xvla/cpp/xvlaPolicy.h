@@ -45,7 +45,7 @@ struct XvlaView
 
 struct XvlaChunk
 {
-    std::vector<float> actions; //!< [chunk, actionDim] robot actions: grippers through the sigmoid, unnormalized
+    std::vector<float> actions; //!< [chunk, outputDim] robot actions: grippers through the sigmoid, unnormalized
     std::vector<int64_t> tokenIds;
     float visionMs{0.0F};
     float encoderMs{0.0F};
@@ -121,6 +121,21 @@ public:
     {
         return mActionDim;
     }
+    //! Columns of XvlaChunk::actions: the model's action dim, or the real dims of an ``auto`` checkpoint.
+    int32_t outputDim() const noexcept
+    {
+        return mOutputDim;
+    }
+    //! Length of the state act() expects (shorter states are zero-padded).
+    int32_t stateDim() const noexcept
+    {
+        return mStateDim;
+    }
+    //! "state", or "previous_action" when the checkpoint was trained with the last commanded action as proprio.
+    std::string const& proprioSource() const noexcept
+    {
+        return mProprioSource;
+    }
     //! The checkpoint's camera names, in the order LeRobot feeds them.
     std::vector<std::string> const& cameras() const noexcept
     {
@@ -148,7 +163,9 @@ private:
 
     std::vector<std::string> mCameras;
     int32_t mNumViews{0};
-    std::string mLastTask; //!< the task mLastTokens was tokenized from
+    bool mZeroImageViews{false}; //!< missing cameras are zero images through the vision engine, not zero features
+    bool mBicubic{false};        //!< PIL bicubic stretch to the model size, else LeRobot's resize_with_pad
+    std::string mLastTask;       //!< the task mLastTokens was tokenized from
     std::vector<int64_t> mLastTokens;
     int32_t mImageSize{224};
     int32_t mImageTokens{50};
@@ -163,6 +180,12 @@ private:
     int32_t mDomainId{0};
     int32_t mNumDomains{1};
     std::vector<float> mActionMean, mActionStd; //!< empty: the checkpoint has no action statistics (identity)
+    //! MIN_MAX: state and actions scaled to [-1, 1]; the delta dims are predicted relative to the normalized proprio.
+    std::vector<float> mActionMin, mActionSpan;
+    std::vector<int32_t> mDeltaDims;
+    int32_t mOutputDim{20};
+    int32_t mStateDim{20};
+    std::string mProprioSource{"state"};
 
     rt::Tensor mPixelsHost; //!< pinned FP16 [views, 3, size, size]
     rt::Tensor mPixels;
@@ -180,7 +203,7 @@ private:
     rt::Tensor mRtcSeed;          //!< FP16 [1, chunk, actionDim], model space
     rt::Tensor mRtcWeight;        //!< FP16 [1, chunk, 1]
     rt::Tensor mRtcHost;          //!< pinned staging: domain id (INT64), then seed and weights (FP16)
-    std::vector<float> mPrevious; //!< last chunk in model space (gripper logits, before unnormalization)
+    std::vector<float> mPrevious; //!< last chunk in model space (gripper logits, delta dims made absolute)
     std::mt19937_64 mNoiseGen{0};
     bool mUseCudaGraph{true};
     cudaGraphExec_t mGraph{nullptr};

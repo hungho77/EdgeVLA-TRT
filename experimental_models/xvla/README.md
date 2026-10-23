@@ -32,3 +32,31 @@ cp -r xvla_onnx/config.json xvla_onnx/tokenizer engines/
 xvla_policy_inference --engineDir engines --inputFile obs.json
 xvla_async_control --engineDir engines --inputFile obs.json [--domain ID] [--rtc 1]
 ```
+
+## Checkpoints fine-tuned in the official repository (SO101)
+
+`twanghcmut/X-VLA-SO101-LeftArm-Multitask` was fine-tuned with [2toinf/X-VLA](https://github.com/2toinf/X-VLA)
+(`6bc2513`, its SO101 handler in the checkpoint's `so101/`), not LeRobot. `--xvla-src` exports it from that
+repository's modules and `xvla_reference.py` takes the golden from its `XVLA.generate_actions`. The engine dir's
+config.json then selects that checkpoint's contract in `XvlaPolicy`:
+
+- `auto` action space: 6 real dims out of the model's 20, no gripper sigmoid;
+- `MIN_MAX`: the proprio and actions are scaled to [-1, 1] with the training data's `meta/stats.json` (for the
+  11 SO101 task datasets, the per-dataset min / max combined); joints 0-4 (`delta_dims`) are predicted relative to the
+  normalized proprio and RTC seeds them as absolute rows;
+- `proprio_source: previous_action`: the proprio is the last commanded action (`action[t - 1]`), not the measured
+  joints; the policy server advertises it as `"proprio"` in its ready line;
+- views resized with PIL bicubic (no padding), the missing third view a zero image through the vision engine.
+
+AGX Orin, against the official model in FP32 with the same x1 on two dataset frames: identical token ids, bit-identical
+views, actions max |Δ| 0.04 / 0.11 degrees; 166 ms per chunk (vision 32.9, encoder 2.9, 10 steps 130.2). Open loop on
+the model card's 11 trajectories (its `eval_so101_open_loop.py` protocol): MAE 2.384 (card 2.344).
+`xvla_async_control` at 30 Hz (overlap 20, frozen 8): planner lag 6 ticks, no stalls, switch jump 0.0056 with RTC
+(8.55 without).
+
+```bash
+python experimental_models/xvla/scripts/xvla_reference.py --xvla-src X-VLA --checkpoint X-VLA-SO101-LeftArm-Multitask \
+    --stats stats.json --obs obs.npz --out ref.npz                  # transformers 4.51.3, as X-VLA pins
+python experimental_models/xvla/scripts/export_xvla.py --xvla-src X-VLA --checkpoint X-VLA-SO101-LeftArm-Multitask \
+    --stats stats.json --domain-id 19 --delta-dims 0 1 2 3 4 --check ref.npz --out xvla_onnx
+```

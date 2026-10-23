@@ -115,7 +115,7 @@ int main(int argc, char** argv)
     policy.act(views, baseState, task);
     policy.resetEpisode();
     int32_t const horizon = policy.chunkSize();
-    int32_t const actionDim = policy.actionDim();
+    int32_t const actionDim = policy.outputDim();
 
     auto snapshot = [&](int64_t tick) {
         Observation observation;
