@@ -61,6 +61,50 @@ void appendRanges(Json const& groups, std::vector<float>& low, std::vector<float
     }
 }
 
+//! The action groups' ranges expanded to [horizon, dims]: a RELATIVE group carries one range per chunk row and the
+//! state dims it is relative to.
+void appendActionRanges(Json const& groups, Json const& stateGroups, int32_t horizon, std::vector<float>& low,
+    std::vector<float>& high, std::vector<int32_t>& stateIndex)
+{
+    std::map<std::string, int32_t> stateOffset;
+    int32_t offset = 0;
+    for (auto const& group : stateGroups)
+    {
+        stateOffset[group.at("key").get<std::string>()] = offset;
+        offset += static_cast<int32_t>(group.at("q01").size());
+    }
+    std::vector<std::vector<float>> rowsLow(horizon), rowsHigh(horizon);
+    for (auto const& group : groups)
+    {
+        bool const relative = group.value("rep", std::string("absolute")) == "relative";
+        int32_t dims = 0;
+        for (int32_t t = 0; t < horizon; ++t)
+        {
+            auto const lo = (relative ? group.at("q01").at(t) : group.at("q01")).get<std::vector<float>>();
+            auto const hi = (relative ? group.at("q99").at(t) : group.at("q99")).get<std::vector<float>>();
+            rowsLow[t].insert(rowsLow[t].end(), lo.begin(), lo.end());
+            rowsHigh[t].insert(rowsHigh[t].end(), hi.begin(), hi.end());
+            dims = static_cast<int32_t>(lo.size());
+        }
+        int32_t base = -1;
+        if (relative)
+        {
+            auto const key = group.at("state_key").get<std::string>();
+            ELLM_CHECK(stateOffset.count(key) != 0, "RldxPolicy: no state group " + key + " for a RELATIVE action");
+            base = stateOffset.at(key);
+        }
+        for (int32_t d = 0; d < dims; ++d)
+        {
+            stateIndex.push_back(relative ? base + d : -1);
+        }
+    }
+    for (int32_t t = 0; t < horizon; ++t)
+    {
+        low.insert(low.end(), rowsLow[t].begin(), rowsLow[t].end());
+        high.insert(high.end(), rowsHigh[t].begin(), rowsHigh[t].end());
+    }
+}
+
 int64_t profileMax(vla::TrtEngine const& engine, char const* name, int32_t dim)
 {
     return engine.engine().getProfileShape(name, 0, nvinfer1::OptProfileSelector::kMAX).d[dim];
@@ -94,7 +138,7 @@ RldxPolicy::RldxPolicy(std::string const& engineDir, cudaStream_t stream)
     auto const section = config.at("mrope_section").get<std::vector<int32_t>>();
     std::copy(section.begin(), section.end(), mGeometry.mropeSection);
     appendRanges(config.at("state"), mStateLow, mStateHigh);
-    appendRanges(config.at("action"), mActionLow, mActionHigh);
+    appendActionRanges(config.at("action"), config.at("state"), mHorizon, mActionLow, mActionHigh, mActionStateIndex);
 
     mTokenizer = std::make_unique<tokenizer::Tokenizer>();
     ELLM_CHECK(mTokenizer->loadFromHF(engineDir), "RldxPolicy: failed to load the tokenizer");
@@ -338,6 +382,22 @@ RldxChunk RldxPolicy::act(std::vector<RldxFrame> const& frames, std::vector<floa
         int32_t const frozen = std::min(rtc->frozenSteps, overlap);
         std::copy_n(mPrevious.begin() + static_cast<int64_t>(startRow) * mMaxActionDim,
             static_cast<int64_t>(overlap) * mMaxActionDim, x0.begin());
+        // RELATIVE ranges differ per row and are offset by the state: re-encode the previous absolute rows at their new
+        // row index against the current state.
+        int32_t const actionDims = actionDim();
+        for (int32_t row = 0; row < overlap; ++row)
+        {
+            for (int32_t d = 0; d < actionDims; ++d)
+            {
+                size_t const i = static_cast<size_t>(row) * actionDims + d;
+                int32_t const reference = mActionStateIndex[d];
+                float const value = mPreviousActions[static_cast<size_t>(startRow + row) * actionDims + d]
+                    - (reference >= 0 ? state[reference] : 0.0F);
+                float const span = mActionHigh[i] - mActionLow[i];
+                x0[static_cast<size_t>(row) * mMaxActionDim + d]
+                    = span > 0.0F ? std::clamp(2.0F * (value - mActionLow[i]) / span - 1.0F, -1.0F, 1.0F) : 0.0F;
+            }
+        }
         double const last = std::max(1.0 - std::exp(-static_cast<double>(rtc->rampRate)), 1e-8);
         for (int32_t row = 0; row < overlap; ++row)
         {
@@ -460,10 +520,13 @@ RldxChunk RldxPolicy::act(std::vector<RldxFrame> const& frames, std::vector<floa
         for (int32_t d = 0; d < actionDims; ++d)
         {
             float const v = std::clamp(chunk.normalized[static_cast<size_t>(t) * mMaxActionDim + d], -1.0F, 1.0F);
-            chunk.actions[static_cast<size_t>(t) * actionDims + d]
-                = (v + 1.0F) / 2.0F * (mActionHigh[d] - mActionLow[d]) + mActionLow[d];
+            size_t const i = static_cast<size_t>(t) * actionDims + d;
+            int32_t const reference = mActionStateIndex[d];
+            chunk.actions[i] = (v + 1.0F) / 2.0F * (mActionHigh[i] - mActionLow[i]) + mActionLow[i]
+                + (reference >= 0 ? state[reference] : 0.0F);
         }
     }
+    mPreviousActions = chunk.actions;
     return chunk;
 }
 

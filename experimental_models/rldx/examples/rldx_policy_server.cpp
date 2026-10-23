@@ -31,7 +31,7 @@
 //!            "normalized": true,                       optional, also return the normalized chunk
 //!            "reset": true}                            optional, start of an episode
 //! Reply:    {"actions": [[...], ...], "history_filled": n, "timing_ms": {...}}  or {"error": "..."}
-//! Actions are the checkpoint's: eef position / rotation deltas and gripper_close, unnormalized.
+//! Actions are the checkpoint's, unnormalized, RELATIVE groups added to the request's state.
 
 #include "rldxPolicy.h"
 
