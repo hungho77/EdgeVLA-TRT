@@ -71,6 +71,18 @@ LIBERO-Spatial, 10 tasks x 10 episodes, this harness's protocol (fixed initial s
 returned): **99%** (99 of 100; task 5 failed once at the step limit), and 100% with `--fp32-attention`. The checkpoint reports 98.4% over 50 episodes per task with LeRobot's `lerobot-eval`
 (per-episode seeds from 1000).
 
+**SO101.** [`twanghcmut/molmoact2-so101-left-arm-multitask`](https://huggingface.co/twanghcmut/molmoact2-so101-left-arm-multitask)
+(a full fine-tune of `allenai/MolmoAct2-SO100_101`: cameras `top` 360 x 640 and `wrist` 480 x 640, 6 joints, a
+30-row chunk, every dim quantile-normalized) builds with the same commands, `--hf` holding
+`allenai/MolmoAct2-SO100_101`'s small files. It was trained on LeRobot's main branch, whose config fields 0.6.1
+cannot parse: the reference and the export run with that checkout's `src` on `PYTHONPATH`, and the reference takes
+`--no-flip` (upright robot frames). Its processor left-pads the prompt by one attention-masked token, which the
+host prompt leaves out. The frames are resized to 378 x 378 without keeping the aspect ratio, as the official
+processor does. On two dataset observations against the official policy in FP32 the server's actions are within
+0.11 / 0.16 degrees on values up to 101. Open loop on the model card's 11 trajectories (episode 0 of each task, a
+call every 16 steps, the first 16 rows against the recorded actions, up to 400 steps): MAE 1.23 against the
+card's 1.25. A call takes about 360 ms.
+
 ```bash
 # Reference env: LeRobot 0.6.1 (lerobot.policies.molmoact2) on CPU; --hf holds MolmoAct2-LIBERO's config,
 # processor and tokenizer files, --fast the FAST tokenizer's (the LeRobot weights replace the base model's)

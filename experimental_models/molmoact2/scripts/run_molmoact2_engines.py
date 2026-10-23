@@ -44,8 +44,8 @@ class Engine:
         }
         keep = []
         for name, tensor in inputs.items():
-            tensor = torch.as_tensor(tensor).to(
-                dtypes[self.engine.get_tensor_dtype(name)]).cuda().contiguous()
+            tensor = torch.as_tensor(tensor).to(dtypes[
+                self.engine.get_tensor_dtype(name)]).cuda().contiguous()
             keep.append(tensor)
             self.context.set_input_shape(name, tuple(tensor.shape))
             self.context.set_tensor_address(name, tensor.data_ptr())
@@ -65,10 +65,11 @@ class Engine:
 
 def rel(expected, actual):
     expected = np.asarray(expected, np.float64)
-    actual = np.asarray(actual.float().cpu() if torch.is_tensor(actual) else
-                        actual, np.float64).reshape(expected.shape)
-    return float(np.sqrt(((expected - actual)**2).mean() /
-                         (expected**2).mean()))
+    actual = np.asarray(
+        actual.float().cpu() if torch.is_tensor(actual) else actual,
+        np.float64).reshape(expected.shape)
+    return float(
+        np.sqrt(((expected - actual)**2).mean() / (expected**2).mean()))
 
 
 def rope(length, head_dim, theta):
@@ -99,60 +100,77 @@ def main():
     ref = np.load(args.reference)
     count = len([k for k in ref.files if k.startswith("normalized_")])
     for i in range(count):
-        visual = engines["vision"]({
-            "patches": torch.from_numpy(ref[f"pixel_values_{i}"])
-        }, stream)["visual"]
-        ids = torch.from_numpy(ref[f"input_ids_{i}"][0])
-        flag = torch.from_numpy(ref[f"token_type_ids_{i}"][0]).float()
+        visual = engines["vision"](
+            {
+                "patches": torch.from_numpy(ref[f"pixel_values_{i}"])
+            }, stream)["visual"]
+        # Left padding (attention-masked, LeRobot after 0.6.1) is not part of the prompt the host builds.
+        keep = ref[f"attention_mask_{i}"][0].astype(bool) if f"attention_mask_{i}" in ref.files \
+            else np.ones(ref[f"input_ids_{i}"].shape[1], bool)
+        ids = torch.from_numpy(ref[f"input_ids_{i}"][0][keep])
+        flag = torch.from_numpy(ref[f"token_type_ids_{i}"][0][keep]).float()
         cos, sin = rope(ids.shape[0], config["head_dim"], config["rope_theta"])
 
         def prefix(features):
-            a = engines["prefix_a"](
-                {
-                    "input_ids": ids,
-                    "visual": features,
-                    "image_flag": flag,
-                    "cos": cos,
-                    "sin": sin
-                }, stream)
-            b = engines["prefix_b"](
-                {
-                    "hidden": a["hidden"],
-                    "image_flag": flag,
-                    "cos": cos,
-                    "sin": sin
-                }, stream)
-            return torch.cat([a["keys"], b["keys"]]), torch.cat(
-                [a["values"], b["values"]])
+            a = engines["prefix_a"]({
+                "input_ids": ids,
+                "visual": features,
+                "image_flag": flag,
+                "cos": cos,
+                "sin": sin
+            }, stream)
+            b = engines["prefix_b"]({
+                "hidden": a["hidden"],
+                "image_flag": flag,
+                "cos": cos,
+                "sin": sin
+            }, stream)
+            return torch.cat([a["keys"], b["keys"]
+                              ]), torch.cat([a["values"], b["values"]])
 
         keys, values = prefix(visual)
-        ref_keys, ref_values = ref[f"k_{i}"][:, 0], ref[f"v_{i}"][:, 0]
+        ref_keys, ref_values = ref[f"k_{i}"][:,
+                                             0][:,
+                                                keep], ref[f"v_{i}"][:,
+                                                                     0][:,
+                                                                        keep]
         ref_visual_keys, _ = prefix(torch.from_numpy(ref[f"visual_{i}"]))
-        print(f"sample {i}: visual rel {rel(ref[f'visual_{i}'], visual):.2e}; K rel on reference visual "
-              f"{rel(ref_keys, ref_visual_keys):.2e}, chained K {rel(ref_keys, keys):.2e} V {rel(ref_values, values):.2e}")
+        print(
+            f"sample {i}: visual rel {rel(ref[f'visual_{i}'], visual):.2e}; K rel on reference visual "
+            f"{rel(ref_keys, ref_visual_keys):.2e}, chained K {rel(ref_keys, keys):.2e} V {rel(ref_values, values):.2e}"
+        )
 
         def denoise(k, v):
             ctx = engines["context"]({"keys": k, "values": v}, stream)
             x = torch.from_numpy(ref[f"noise_{i}"])
             for step in range(config["flow_steps"]):
-                x = engines["step"](
-                    {
-                        "x": x,
-                        "step": torch.tensor([step]),
-                        "dt": torch.tensor([1.0 / config["flow_steps"]]),
-                        "context_k": ctx["context_k"],
-                        "context_v": ctx["context_v"],
-                        "encoder_mask": torch.from_numpy(
-                            ref[f"encoder_mask_{i}"]).float(),
-                        "strength": torch.ones(1, x.shape[1], 1)
-                    }, stream)["x_next"]
+                x = engines["step"]({
+                    "x":
+                    x,
+                    "step":
+                    torch.tensor([step]),
+                    "dt":
+                    torch.tensor([1.0 / config["flow_steps"]]),
+                    "context_k":
+                    ctx["context_k"],
+                    "context_v":
+                    ctx["context_v"],
+                    "encoder_mask":
+                    torch.from_numpy(ref[f"encoder_mask_{i}"][:,
+                                                              keep]).float(),
+                    "strength":
+                    torch.ones(1, x.shape[1], 1)
+                }, stream)["x_next"]
             return x[0, :, :config["action_dim"]].float().cpu().numpy()
 
         expected = ref[f"normalized_{i}"]
-        on_ref = denoise(torch.from_numpy(ref_keys), torch.from_numpy(ref_values))
+        on_ref = denoise(torch.from_numpy(ref_keys),
+                         torch.from_numpy(ref_values))
         chained = denoise(keys, values)
-        print(f"   normalized actions max|d|: context + step on reference K / V {np.abs(on_ref - expected).max():.4f}, "
-              f"chained {np.abs(chained - expected).max():.4f} (|ref| max {np.abs(expected).max():.2f})")
+        print(
+            f"   normalized actions max|d|: context + step on reference K / V {np.abs(on_ref - expected).max():.4f}, "
+            f"chained {np.abs(chained - expected).max():.4f} (|ref| max {np.abs(expected).max():.2f})"
+        )
 
 
 if __name__ == "__main__":
